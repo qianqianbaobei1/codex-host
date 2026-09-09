@@ -5,8 +5,8 @@ import type {
   RendererAgentAvailability,
 } from "./agent-selection-state.js";
 import type {
-  AccountBalanceSnapshot,
   AccountCreditsSnapshot,
+  CodexAccountSummary,
   HarnessCommandDescriptor,
   ThreadUsageSnapshot,
 } from "@codexhost/shared-contracts";
@@ -35,8 +35,6 @@ import {
 import {
   mountRendererCreditsControl,
   renderRendererCreditsControl,
-  type RendererAntigravityQuotaGroup,
-  type RendererCreditsAvailability,
   type RendererCreditsControl,
 } from "./renderer-credits-control.js";
 import {
@@ -606,6 +604,8 @@ export function mountComposerAgentControl(
   enabledAgents: readonly RendererAgent[],
   onSelect: (agent: RendererAgent) => void,
   onDownload: (agent: ExternalRendererAgent) => void,
+  onSelectCodexAccount: (accountId: string) => Promise<void> | void,
+  onOpenProviderPicker: () => void,
   onSelectModel: (modelId: string) => void,
   onSelectThinking: (thinkingOptionId: string) => void,
   onSelectPermissionMode: (permissionModeId: string) => void,
@@ -621,7 +621,14 @@ export function mountComposerAgentControl(
   const nativePermissionModeControlVerified =
     semanticNativePermissionModeControl !== null &&
     nativePermissionModeControlForComposer(composer) === semanticNativePermissionModeControl;
-  const picker = mountRendererAgentPicker(composerId, enabledAgents, onSelect, onDownload);
+  const picker = mountRendererAgentPicker(
+    composerId,
+    enabledAgents,
+    onSelect,
+    onDownload,
+    onSelectCodexAccount,
+    onOpenProviderPicker,
+  );
   const modelPicker = mountRendererModelPicker(composerId, onSelectModel, onSelectThinking);
   const permissionModePicker = mountRendererPermissionModePicker(
     composerId,
@@ -677,9 +684,9 @@ export function renderComposerAgentControl(
   permissionModeView: RendererPermissionModeControlView = { status: "idle" },
   usage: ThreadUsageSnapshot | null = null,
   accountCredits: AccountCreditsSnapshot | null = null,
-  accountCreditsAvailability: RendererCreditsAvailability = "unknown",
-  accountBalance: AccountBalanceSnapshot | null = null,
   locale: RendererSettingsLocale = "en",
+  codexAccounts: readonly CodexAccountSummary[] = [],
+  ownershipError = false,
 ): void {
   if (control.usage === null) {
     control.usage = mountRendererUsageControl(control.composerId, locale);
@@ -704,7 +711,7 @@ export function renderComposerAgentControl(
     (!isPermissionModeControlReady(permissionModeView) ||
       (permissionModeView.status !== "unsupported" &&
         !control.nativePermissionModeControlVerified));
-  const submissionBlocked = switching || modelBlocked || permissionModeBlocked;
+  const submissionBlocked = switching || ownershipError || modelBlocked || permissionModeBlocked;
   if (submissionBlocked && control.sendDisabledBeforeSwitch === null) {
     control.sendDisabledBeforeSwitch = control.sendButton.disabled;
     control.sendButton.disabled = true;
@@ -718,6 +725,8 @@ export function renderComposerAgentControl(
     adapterState,
     switching,
     availability,
+    codexAccounts,
+    ownershipError,
   );
   reconcileComposerNativeControls(
     control,
@@ -737,32 +746,23 @@ export function renderComposerAgentControl(
     permissionModeVisible,
     locale,
   );
-  if (control.usage) renderRendererUsageControl(control.usage, usage, locale);
+  const selectedCodexAccount =
+    state.agent === "codex" && !ownershipError
+      ? codexAccounts.find((account) => account.active)
+      : undefined;
+  if (control.usage) {
+    renderRendererUsageControl(
+      control.usage,
+      usage,
+      locale,
+      selectedCodexAccount?.email ?? selectedCodexAccount?.label ?? null,
+    );
+  }
   control.harnessCommands.setLocale(locale);
   control.harnessCommands.root.hidden = state.agent === "codex";
   control.harnessCommands.root.style.display = state.agent === "codex" ? "none" : "inline-flex";
   if (state.agent === "codex") control.harnessCommands.close();
-  const modelName = selectedCatalogModel?.resolvedModelLabel ?? selectedCatalogModel?.label ?? "";
-  const selectedQuotaGroup: RendererAntigravityQuotaGroup | undefined =
-    state.agent === "antigravity"
-      ? /gemini/iu.test(modelName)
-        ? "gemini"
-        : /claude|gpt|3p/iu.test(modelName)
-          ? "other"
-          : undefined
-      : undefined;
-  const isDeepSeekModel = /deepseek/iu.test(modelName);
-  const visibleAccountBalance = isDeepSeekModel ? accountBalance : null;
-  if (state.agent === "codex" || (state.agent === "pi" && !isDeepSeekModel)) {
-    accountCreditsAvailability = "hidden";
-  }
-  renderRendererCreditsControl(
-    control.credits,
-    accountCredits,
-    selectedQuotaGroup,
-    accountCreditsAvailability,
-    visibleAccountBalance,
-  );
+  renderRendererCreditsControl(control.credits, accountCredits, locale);
 }
 
 export function disposeComposerAgentControl(control: ComposerAgentControl): void {

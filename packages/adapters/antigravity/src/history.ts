@@ -109,8 +109,9 @@ export function mergeAntigravityHistoryTurns(
 }
 
 function nativeTurnIndex(turn: HostTurnSnapshot): number {
-  const match = /:turn:(\d+)$/u.exec(turn.nativeTurnRef.nativeTurnKey);
-  return match ? Number.parseInt(match[1], 10) : Number.MAX_SAFE_INTEGER;
+  const match = /:turn:(\d+)$/u.exec(turn.nativeTurnRef.nativeTurnKey ?? "");
+  const index = match?.[1];
+  return index ? Number.parseInt(index, 10) : Number.MAX_SAFE_INTEGER;
 }
 
 export async function loadAntigravitySnapshot(

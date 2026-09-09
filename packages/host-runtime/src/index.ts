@@ -15,11 +15,9 @@ export { HarnessPluginRegistry } from "./harness-plugin-registry.js";
 export { installedHarnessPluginOptions } from "./installed-harness-plugins.js";
 export {
   AppServerHost,
-  CODEXHOST_ENABLE_UNTRUSTED_CODEX_APP_TOOLS_ENV,
   classifyCreateRequestRoute,
   officialAccountEnvironment,
   officialEnvironment,
-  sanitizeOfficialAppServerArguments,
 } from "./app-server-host.js";
 export type { AppServerHostOptions } from "./app-server-host.js";
 export {
