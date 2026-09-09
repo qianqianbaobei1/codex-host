@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -143,24 +144,30 @@ export async function runHostRuntime(input: {
   hostRuntimeUrl?: string;
   updateCoordinator?: HostUpdateCoordinator;
 }): Promise<number> {
-  const { stockCodexPath, defaultAgent } = requiredRuntimeConfiguration(input.environment);
+  const hostHome = input.environment.HOME?.trim() || os.homedir();
+  const defaultDeliveryRoot = path.join(hostHome, "PycharmProjects", "codex");
+  const hostEnvironment: NodeJS.ProcessEnv = {
+    CODEX_DELIVERY_ROOT: input.environment.CODEX_DELIVERY_ROOT?.trim() || defaultDeliveryRoot,
+    ...input.environment,
+  };
+  const { stockCodexPath, defaultAgent } = requiredRuntimeConfiguration(hostEnvironment);
   const hostRuntimePath = input.hostRuntimeUrl ? fileURLToPath(input.hostRuntimeUrl) : undefined;
   const updateCoordinator =
     input.updateCoordinator ??
-    (hostRuntimePath && hasLauncherManagedUpdateRuntime(input.environment, hostRuntimePath)
+    (hostRuntimePath && hasLauncherManagedUpdateRuntime(hostEnvironment, hostRuntimePath)
       ? createHostUpdateCoordinator({
           hostRuntimePath,
-          environment: input.environment,
+          environment: hostEnvironment,
         })
       : undefined);
 
   if (!isRemoteUnixListenerInvocation(input.arguments)) {
     const remoteControlPlan = createRemoteControlAppServerPlan({
       arguments: input.arguments,
-      environment: input.environment,
+      environment: hostEnvironment,
       ...(hostRuntimePath ? { hostRuntimePath } : {}),
     });
-    const environment = remoteControlPlan?.environment ?? input.environment;
+    const environment = remoteControlPlan?.environment ?? hostEnvironment;
     if (!remoteControlPlan) {
       return prepareDelegationRuntime({
         environment,
@@ -172,6 +179,7 @@ export async function runHostRuntime(input: {
             environment: delegationEnvironment,
             ...installedHarnessPluginOptions(delegationEnvironment, false, input.hostRuntimeUrl),
             onDelegationApi,
+            normalizeThreadTitles: true,
             ...(updateCoordinator ? { updateCoordinator } : {}),
           });
           return host.run();
@@ -207,6 +215,7 @@ export async function runHostRuntime(input: {
           closeMappingStoreOnExit: false,
           createOfficialConnection,
           onDelegationApi,
+          normalizeThreadTitles: true,
           ...(updateCoordinator ? { updateCoordinator } : {}),
         });
         const listener = createRemoteAppServerWebSocketListener({
@@ -226,6 +235,7 @@ export async function runHostRuntime(input: {
               closeMappingStoreOnExit: false,
               createOfficialConnection,
               onDelegationApi: (api) => registry.register(api),
+              normalizeThreadTitles: true,
               ...(updateCoordinator ? { updateCoordinator } : {}),
             });
           },
@@ -292,6 +302,7 @@ export async function runHostRuntime(input: {
             createOfficialConnection: () =>
               createRemoteOfficialAppServerConnection(officialPlan.socketPath),
             onDelegationApi: (api) => registry.register(api),
+            normalizeThreadTitles: true,
             ...(updateCoordinator ? { updateCoordinator } : {}),
           });
         },

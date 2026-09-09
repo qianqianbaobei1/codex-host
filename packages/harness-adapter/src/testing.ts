@@ -60,6 +60,7 @@ import type {
   ModelSelectCommand,
   ModelSelectCompleted,
   OpenSessionInput,
+  ResumeSessionInput,
   PermissionModeSelectCommand,
   PermissionModeSelectCompleted,
   ThinkingSelectCommand,
@@ -1018,6 +1019,12 @@ export class FakeHarnessAdapter implements HarnessAdapter {
     this.supportsForkAcrossCwd = supportsForkAcrossCwd;
     this.supportsRollbackLastTurn = supportsRollbackLastTurn;
     this.permissionModeScope = permissionModeScope;
+  }
+
+  async readCachedSnapshot(
+    _input: ResumeSessionInput,
+  ): Promise<HarnessResult<HostThreadSnapshot | null>> {
+    return { ok: true, value: null };
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {

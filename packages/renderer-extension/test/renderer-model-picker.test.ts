@@ -13,6 +13,7 @@ import {
 
 import {
   isRendererModelPickerDisabled,
+  compactRendererModelLabel,
   rendererModelPickerPresentation,
   shouldCloseRendererModelPicker,
   syncRendererLabelText,
@@ -40,6 +41,12 @@ function catalog(levels: readonly string[]) {
 }
 
 describe("Renderer combined Model and Thinking picker presentation", () => {
+  it("keeps model chrome short while preserving the full label for metadata", () => {
+    expect(compactRendererModelLabel("deepseek / deepseek-v4-flash-vision")).toBe(
+      "v4 flash vision",
+    );
+    expect(compactRendererModelLabel("provider / model")).toBe("model");
+  });
   it("anchors the main menu's right edge to the model trigger", () => {
     expect(
       rendererModelPickerMainMenuPlacement(

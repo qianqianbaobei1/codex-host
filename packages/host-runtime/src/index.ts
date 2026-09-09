@@ -15,11 +15,44 @@ export { HarnessPluginRegistry } from "./harness-plugin-registry.js";
 export { installedHarnessPluginOptions } from "./installed-harness-plugins.js";
 export {
   AppServerHost,
+  CODEXHOST_ENABLE_UNTRUSTED_CODEX_APP_TOOLS_ENV,
   classifyCreateRequestRoute,
   officialAccountEnvironment,
   officialEnvironment,
+  sanitizeOfficialAppServerArguments,
 } from "./app-server-host.js";
 export type { AppServerHostOptions } from "./app-server-host.js";
+export {
+  GOAL_COMMAND,
+  GOAL_CONTINUE_PROMPT,
+  GOAL_DONE_MARKER,
+  GOAL_MAX_LOOP_TURNS,
+  GOAL_MAX_OBJECTIVE_LENGTH,
+  GOAL_STALL_THRESHOLD,
+  advanceGoalLoop,
+  createGoalLoop,
+  fromStoredGoal,
+  goalContinuePrompt,
+  goalSeedPrompt,
+  hasTurnProgress,
+  isGoalDone,
+  lastAgentMessageText,
+  parseGoalDecision,
+  parseGoalCommand,
+  setGoalStatus,
+  toStoredGoal,
+  toThreadGoal,
+  updateGoalActiveTime,
+} from "./goal-loop.js";
+export type {
+  GoalDecisionKind,
+  GoalLoopState,
+  GoalLoopStatus,
+  GoalStopReason,
+  GoalTurnDecision,
+  ThreadGoal,
+  ThreadGoalStatus,
+} from "./goal-loop.js";
 export { AccountRepository } from "./account/account-repository.js";
 export type { AccountRepositoryLike, CodexAccount } from "./account/account-repository.js";
 export { ThreadAccountStore } from "./account/thread-account-store.js";

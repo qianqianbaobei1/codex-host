@@ -10,9 +10,11 @@ import {
   type CreateProvisionalThreadInput,
   type DelegationStatus,
   type FindRecentDelegationInput,
+  type HandoverHarnessInput,
   type ReplaceReadySessionAfterLastTurnInput,
   type ReplaceReadySessionInput,
   type StoredDelegationRecordV1,
+  type StoredExternalGoalV1,
   type StoredThreadRecordV1,
   type StoredTurnMappingV1,
 } from "@codexhost/mapping-store";
@@ -31,6 +33,13 @@ export interface ExternalThreadStore {
   getThread(hostThreadId: HostThreadId): Promise<StoredThreadRecordV1 | null>;
   listThreads(): Promise<StoredThreadRecordV1[]>;
   getThreadByCreateRequest(createRequestId: string): Promise<StoredThreadRecordV1 | null>;
+  getThreadGoal(hostThreadId: HostThreadId): Promise<StoredExternalGoalV1 | null>;
+  setThreadGoal(
+    hostThreadId: HostThreadId,
+    goal: StoredExternalGoalV1,
+    expectedRevision?: number,
+  ): Promise<StoredThreadRecordV1>;
+  clearThreadGoal(hostThreadId: HostThreadId, expectedRevision?: number): Promise<StoredThreadRecordV1>;
   getDelegation(delegationId: HostThreadId): Promise<StoredDelegationRecordV1 | null>;
   getDelegationByChild(childHostThreadId: HostThreadId): Promise<StoredDelegationRecordV1 | null>;
   findDelegationByRequest(requestId: string): Promise<StoredDelegationRecordV1 | null>;
@@ -61,6 +70,7 @@ export interface ExternalThreadStore {
     hostThreadId: HostThreadId,
     transportModelId: string,
   ): Promise<StoredThreadRecordV1>;
+  handoverHarness(input: HandoverHarnessInput): Promise<StoredThreadRecordV1>;
   setArchived(hostThreadId: HostThreadId, archived: boolean): Promise<StoredThreadRecordV1>;
   removeProvisional(hostThreadId: HostThreadId): Promise<void>;
   removeThread(hostThreadId: HostThreadId): Promise<void>;
@@ -116,6 +126,22 @@ export class ExternalThreadRepository {
 
   findByCreateRequest(createRequestId: string): Promise<StoredThreadRecordV1 | null> {
     return this.store.getThreadByCreateRequest(createRequestId);
+  }
+
+  getGoal(hostThreadId: HostThreadId): Promise<StoredExternalGoalV1 | null> {
+    return this.store.getThreadGoal(hostThreadId);
+  }
+
+  setGoal(
+    hostThreadId: HostThreadId,
+    goal: StoredExternalGoalV1,
+    expectedRevision?: number,
+  ): Promise<StoredThreadRecordV1> {
+    return this.store.setThreadGoal(hostThreadId, goal, expectedRevision);
+  }
+
+  clearGoal(hostThreadId: HostThreadId, expectedRevision?: number): Promise<StoredThreadRecordV1> {
+    return this.store.clearThreadGoal(hostThreadId, expectedRevision);
   }
 
   getDelegation(delegationId: HostThreadId): Promise<StoredDelegationRecordV1 | null> {
@@ -174,6 +200,10 @@ export class ExternalThreadRepository {
     transportModelId: string,
   ): Promise<StoredThreadRecordV1> {
     return this.store.setTransportModelId(hostThreadId, transportModelId);
+  }
+
+  handoverHarness(input: HandoverHarnessInput): Promise<StoredThreadRecordV1> {
+    return this.store.handoverHarness(input);
   }
 
   setArchived(hostThreadId: HostThreadId, archived: boolean): Promise<StoredThreadRecordV1> {
@@ -406,6 +436,7 @@ export class ExternalThreadRepository {
   async alignSnapshot(
     record: StoredThreadRecordV1,
     snapshot: HostThreadSnapshot,
+    priorTurns: readonly JsonObject[] = [],
   ): Promise<AlignedExternalSnapshot> {
     const nativeSessionRef = record.nativeSessionRef;
     if (!nativeSessionRef || record.state !== "ready") {
@@ -447,7 +478,13 @@ export class ExternalThreadRepository {
       };
     });
 
-    const orderedMappings = aligned.map(({ mapping }) => mapping);
+    const previousFromOtherSessions = record.turnMappings.filter(
+      (m) => m.nativeTurnRef.nativeSessionId !== nativeSessionRef.nativeSessionId,
+    );
+    const orderedMappings = [
+      ...previousFromOtherSessions,
+      ...aligned.map(({ mapping }) => mapping),
+    ];
     const mappingsChanged =
       orderedMappings.length !== record.turnMappings.length ||
       orderedMappings.some((mapping, index) => {
@@ -459,9 +496,12 @@ export class ExternalThreadRepository {
       : record;
     return {
       record: nextRecord,
-      turns: aligned.map(({ mapping, snapshot: turn }) =>
-        projectHistoricalTurn({ turnId: mapping.hostTurnId, cwd: record.cwd, snapshot: turn }),
-      ),
+      turns: [
+        ...priorTurns,
+        ...aligned.map(({ mapping, snapshot: turn }) =>
+          projectHistoricalTurn({ turnId: mapping.hostTurnId, cwd: record.cwd, snapshot: turn }),
+        ),
+      ],
     };
   }
 }
@@ -559,6 +599,9 @@ export function externalThreadValue(input: {
           : { type: "idle" },
     turns: input.turns,
     preview: previewText,
+    // `projectId` is required by the current Codex Desktop Thread contract.
+    // External Harness sessions do not have a Codex project assignment.
+    projectId: null,
     name: record.title || null,
     gitInfo: null,
     forkedFromId: record.forkSource?.hostThreadId ?? null,

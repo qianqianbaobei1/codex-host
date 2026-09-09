@@ -23,7 +23,6 @@ export interface AntigravityQuotaBucket {
  * which the Host strips before validating.
  */
 export interface AntigravityQuotaSnapshot {
-  label: string;
   usedPercent: number;
   periodType: "weekly" | "five_hour" | "unknown";
   resetsAt?: string;
@@ -116,16 +115,18 @@ export function parseAntigravityUsageCommand(
   const buckets = parseBuckets(groups);
   const leading = leadingBucket(buckets);
   if (!leading) return null;
-  const others = buckets.filter((bucket) => bucket !== leading);
+  // Keep every bucket. The leading bucket is only a backwards-compatible
+  // summary; dropping its group made the Renderer treat another group's
+  // usage as the currently selected Model's quota.
+  const allBuckets = buckets;
   return {
-    label: leading.product,
     usedPercent: leading.usagePercent,
     periodType: periodTypeFrom(leading.window),
     fetchedAt,
     ...(leading.resetsAt ? { resetsAt: leading.resetsAt } : {}),
-    ...(others.length > 0
+    ...(allBuckets.length > 0
       ? {
-          productUsage: others.map(({ product, usagePercent, resetsAt }) => ({
+          productUsage: allBuckets.map(({ product, usagePercent, resetsAt }) => ({
             product,
             usagePercent,
             ...(resetsAt ? { resetsAt } : {}),

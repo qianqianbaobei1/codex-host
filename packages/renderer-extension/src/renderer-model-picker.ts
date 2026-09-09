@@ -27,7 +27,7 @@ const OPTION_CLASSES =
   "flex w-full cursor-interaction items-center gap-2 rounded-lg px-2 py-2 text-left text-sm text-token-foreground outline-none enabled:hover:bg-token-list-hover-background enabled:active:bg-token-foreground/15 disabled:cursor-not-allowed disabled:opacity-40";
 
 const HEADING_CLASSES = "px-2 pb-1 pt-1.5 text-sm text-token-text-tertiary";
-const MODEL_TRIGGER_MAX_WIDTH = "min(200px, 26vw)";
+const MODEL_TRIGGER_MAX_WIDTH = "min(156px, 24vw)";
 const MODEL_SCROLLBAR_STYLE_ATTRIBUTE = "data-codexhost-model-picker-scrollbar";
 
 export interface RendererModelControlView {
@@ -75,6 +75,17 @@ export interface RendererModelPickerControl {
   thinkingOptions: Map<string, ThinkingOptionControl>;
   close(): void;
   dispose(): void;
+}
+
+/** Keep provider/model IDs available in titles and search, but make the chrome quiet. */
+export function compactRendererModelLabel(label: string): string {
+  const modelName =
+    label
+      .split(/\s+\/\s+/u)
+      .at(-1)
+      ?.trim() ?? label.trim();
+  const withoutDeepSeekPrefix = modelName.replace(/^deepseek[-_ ]*/iu, "");
+  return withoutDeepSeekPrefix.replace(/[-_]+/gu, " ").replace(/\s+/gu, " ").trim() || label;
 }
 
 function popoverOpen(menu: HTMLElement): boolean {
@@ -592,7 +603,7 @@ function rebuildOptions(control: RendererModelPickerControl, view: RendererModel
   }
 
   const modelText = document.createElement("span");
-  modelText.textContent = presentation.modelLabel;
+  modelText.textContent = compactRendererModelLabel(presentation.modelLabel);
   modelText.className = "min-w-0 flex-1 truncate";
   modelText.title = presentation.modelLabel;
   const modelChevron = document.createElement("span");
@@ -610,7 +621,7 @@ function rebuildOptions(control: RendererModelPickerControl, view: RendererModel
     button.className = OPTION_CLASSES;
 
     const text = document.createElement("span");
-    text.textContent = model.label;
+    text.textContent = compactRendererModelLabel(model.label);
     text.className = "min-w-0 flex-1 truncate";
     text.title = model.label;
     const check = createCheck();
@@ -661,7 +672,7 @@ export function renderRendererModelPicker(
     control.root.dataset.catalogSignature = catalogSignature;
   }
 
-  syncRendererLabelText(control.label, presentation.modelLabel);
+  syncRendererLabelText(control.label, compactRendererModelLabel(presentation.modelLabel));
   control.label.title = presentation.modelLabel;
   const secondaryLabel = presentation.thinkingLabel ?? presentation.resolvedModelLabel;
   syncRendererLabelText(control.thinkingLabel, secondaryLabel ?? "");

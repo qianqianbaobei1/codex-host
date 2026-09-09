@@ -1,147 +1,220 @@
-/**
- * Projects `agy models` output into a Host Model Catalog.
- *
- * The Antigravity CLI bakes reasoning effort into the Model ID it lists
- * (`gemini-3.7-flash-high`), but it also accepts the base ID paired with a
- * separate `--effort` flag and rejects the two forms when they are combined:
- *
- *   --model gemini-3.1-pro                 -> requires --effort (available: low, high)
- *   --model gemini-3.1-pro --effort low    -> gemini-3.1-pro-low
- *   --model gemini-3.1-pro-low --effort high -> conflicts with --effort=high
- *   --model gpt-oss-120b --effort high     -> invalid, only medium exists
- *   --model claude-sonnet-4-6 --effort high -> invalid, no effort variants
- *
- * Efforts are therefore a real second axis, but a per-Model one: each base
- * Model allows its own subset, and some allow none. That is exactly what
- * `HarnessModel.supportedThinkingOptionIds` expresses, so the listed IDs are
- * grouped by base Model and the effort suffix becomes a Thinking option.
- */
 import {
   harnessModelCatalogSchema,
   harnessModelRefSchema,
   harnessThinkingOptionIdSchema,
-  type HarnessModel,
+  harnessThinkingOptionSchema,
   type HarnessModelCatalog,
   type HarnessModelRef,
   type HarnessThinkingOption,
   type HarnessThinkingOptionId,
 } from "@codexhost/shared-contracts";
 
-/** Effort suffixes the CLI uses, ordered from least to most reasoning. */
-const EFFORT_LABELS = new Map<string, string>([
-  ["low", "Low"],
-  ["medium", "Medium"],
-  ["high", "High"],
-]);
-
-const EFFORT_SUFFIX_PATTERN = /^(?<base>.+)-(?<effort>low|medium|high)$/u;
-
-/** Trailing effort in the CLI's display label, e.g. `Gemini 3.1 Pro (Low)`. */
-const EFFORT_LABEL_SUFFIX_PATTERN = /\s*\((?:low|medium|high)\)$/iu;
-
-interface ListedModel {
-  readonly baseId: string;
-  readonly baseLabel: string;
-  readonly effort: string | null;
+export interface AntigravityNativeModel {
+  slug: string;
+  label: string;
+  supportedThinkingOptionIds?: HarnessThinkingOptionId[];
 }
 
-function listedModel(line: string): ListedModel | null {
-  const separator = line.indexOf("\t");
-  if (separator <= 0) return null;
-  const id = line.slice(0, separator).trim();
-  const label = line.slice(separator + 1).trim();
-  if (!id || !label) return null;
-  const match = EFFORT_SUFFIX_PATTERN.exec(id);
-  if (!match?.groups) return { baseId: id, baseLabel: label, effort: null };
-  return {
-    baseId: match.groups.base as string,
-    baseLabel: label.replace(EFFORT_LABEL_SUFFIX_PATTERN, "").trim() || label,
-    effort: match.groups.effort as string,
-  };
+const ANTIGRAVITY_MODEL_REF_PREFIX = "antigravity-model-v1.";
+const EFFORT_SLUG_PATTERN = /^(.+)-(low|medium|high)$/i;
+const EFFORT_LABEL_PATTERN = /\s*\((Low|Medium|High)\)\s*$/i;
+
+export const ANTIGRAVITY_THINKING_OPTION_IDS: readonly HarnessThinkingOptionId[] = [
+  harnessThinkingOptionIdSchema.parse("low"),
+  harnessThinkingOptionIdSchema.parse("medium"),
+  harnessThinkingOptionIdSchema.parse("high"),
+];
+
+export const ANTIGRAVITY_THINKING_LABELS: Readonly<Record<string, string>> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+
+export const DEFAULT_ANTIGRAVITY_THINKING_OPTION_ID: HarnessThinkingOptionId =
+  harnessThinkingOptionIdSchema.parse("medium");
+
+function assertModelPart(value: string, name: string): void {
+  if (value.trim().length === 0) throw new Error(`Antigravity ${name} must not be empty`);
 }
 
-export function parseAntigravityModels(output: string): HarnessModelCatalog {
-  const grouped = new Map<string, { label: string; efforts: HarnessThinkingOptionId[] }>();
-  for (const line of output.split(/\r?\n/u)) {
-    const listed = listedModel(line.trim());
-    if (!listed) continue;
-    if (!harnessModelRefSchema.safeParse({ id: listed.baseId }).success) continue;
-    const entry = grouped.get(listed.baseId) ?? { label: listed.baseLabel, efforts: [] };
-    if (listed.effort) {
-      const effortId = harnessThinkingOptionIdSchema.safeParse(listed.effort);
-      if (effortId.success && !entry.efforts.includes(effortId.data)) {
-        entry.efforts.push(effortId.data);
-      }
+export function encodeAntigravityModelRef(model: AntigravityNativeModel | string): HarnessModelRef {
+  const slug = typeof model === "string" ? model : model.slug;
+  assertModelPart(slug, "Model slug");
+  const encoded = Buffer.from(slug, "utf8").toString("base64url");
+  return harnessModelRefSchema.parse({ id: `${ANTIGRAVITY_MODEL_REF_PREFIX}${encoded}` });
+}
+
+export function decodeAntigravityModelRef(ref: HarnessModelRef): string {
+  const parsed = harnessModelRefSchema.parse(ref);
+  if (!parsed.id.startsWith(ANTIGRAVITY_MODEL_REF_PREFIX)) {
+    throw new Error("Model Ref does not belong to AntigravityAdapter");
+  }
+  const encoded = parsed.id.slice(ANTIGRAVITY_MODEL_REF_PREFIX.length);
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64url").toString("utf8");
+  } catch {
+    throw new Error("Antigravity Model Ref is malformed");
+  }
+  assertModelPart(decoded, "Model slug");
+  if (encodeAntigravityModelRef(decoded).id !== parsed.id) {
+    throw new Error("Antigravity Model Ref is not canonical");
+  }
+  return decoded;
+}
+
+interface MutableGroup {
+  slug: string;
+  label: string;
+  efforts: Set<HarnessThinkingOptionId>;
+}
+
+export function parseAntigravityModelsOutput(output: string): AntigravityNativeModel[] {
+  const groups = new Map<string, MutableGroup>();
+  for (const rawLine of output.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.toLowerCase().startsWith("fetching") || line.toLowerCase().startsWith("available")) {
+      continue;
     }
-    grouped.set(listed.baseId, entry);
+    const [rawSlug, ...labelParts] = line.split("\t");
+    if (!rawSlug) continue;
+    const rawLabel = labelParts.join("\t").trim() || rawSlug;
+
+    const effortMatch = rawSlug.match(EFFORT_SLUG_PATTERN);
+    let baseSlug = rawSlug;
+    let effort: HarnessThinkingOptionId | undefined;
+    let baseLabel = rawLabel;
+
+    if (effortMatch && effortMatch[1] && effortMatch[2]) {
+      baseSlug = effortMatch[1];
+      effort = harnessThinkingOptionIdSchema.parse(effortMatch[2].toLowerCase());
+      baseLabel = rawLabel.replace(EFFORT_LABEL_PATTERN, "").trim() || baseSlug;
+    } else {
+      baseLabel = rawLabel.replace(/\s*\(Thinking\)\s*$/i, "").trim() || baseSlug;
+    }
+
+    let existing = groups.get(baseSlug);
+    if (!existing) {
+      existing = { slug: baseSlug, label: baseLabel, efforts: new Set() };
+      groups.set(baseSlug, existing);
+    }
+    if (effort) {
+      existing.efforts.add(effort);
+    }
   }
 
-  const models: HarnessModel[] = [];
-  const thinkingOptions = new Map<HarnessThinkingOptionId, HarnessThinkingOption>();
-  for (const [id, { label, efforts }] of grouped) {
-    const ordered = [...EFFORT_LABELS.keys()].flatMap((effort) => {
-      const match = efforts.find((candidate) => candidate === effort);
-      return match ? [match] : [];
-    });
-    for (const effort of ordered) {
-      thinkingOptions.set(effort, { id: effort, label: EFFORT_LABELS.get(effort) as string });
-    }
-    models.push({
-      ref: harnessModelRefSchema.parse({ id }),
-      label,
-      resolvedModelLabel: label,
-      ...(ordered.length > 0 ? { supportedThinkingOptionIds: ordered } : {}),
+  const result: AntigravityNativeModel[] = [];
+  for (const group of groups.values()) {
+    const supported = ANTIGRAVITY_THINKING_OPTION_IDS.filter((id) => group.efforts.has(id));
+    result.push({
+      slug: group.slug,
+      label: group.label,
+      ...(supported.length > 0 ? { supportedThinkingOptionIds: supported } : {}),
     });
   }
-  if (models.length === 0) throw new Error("Antigravity CLI returned no usable Models");
+  return result;
+}
 
-  // The CLI's own default is the strongest effort of its default Model
-  // (observed: `Gemini 3.7 Flash (High)`), so lead with the strongest listed.
-  const options = [...EFFORT_LABELS.keys()].flatMap((effort) => {
-    const option = thinkingOptions.get(effort as HarnessThinkingOptionId);
-    return option ? [option] : [];
-  });
-  const defaultThinkingOptionId = options.at(-1)?.id;
+export function normalizeAntigravityModelCatalog(
+  nativeModels: readonly AntigravityNativeModel[],
+  effectiveModel?: string,
+  effectiveThinkingOptionId?: HarnessThinkingOptionId,
+): HarnessModelCatalog {
+  const models = nativeModels.map((model) => ({
+    ref: encodeAntigravityModelRef(model),
+    label: model.label,
+    resolvedModelLabel: model.slug,
+    ...(model.supportedThinkingOptionIds && model.supportedThinkingOptionIds.length > 0
+      ? { supportedThinkingOptionIds: model.supportedThinkingOptionIds }
+      : {}),
+  }));
+  if (models.length === 0) throw new Error("Antigravity did not report any available models");
+
+  const normalizedEffectiveSlug = effectiveModel?.replace(EFFORT_SLUG_PATTERN, "$1");
+  const defaultModelObj =
+    (normalizedEffectiveSlug
+      ? models.find((m) => decodeAntigravityModelRef(m.ref) === normalizedEffectiveSlug)
+      : undefined) ??
+    (effectiveModel
+      ? models.find((m) => decodeAntigravityModelRef(m.ref) === effectiveModel)
+      : undefined) ??
+    models[0];
+  if (!defaultModelObj) throw new Error("Antigravity did not report a default Model");
+
+  const defaultModel = defaultModelObj.ref;
+
+  const matchedNative = nativeModels.find(
+    (m) => m.slug === decodeAntigravityModelRef(defaultModel),
+  );
+  const supportedOptions = matchedNative?.supportedThinkingOptionIds;
+  // agy requires an explicit --effort for Models that have effort variants and
+  // its own default is the strongest variant, so the catalog default leads with
+  // the strongest listed option (upstream-aligned) unless one was requested.
+  const catalogDefaultThinking =
+    supportedOptions && supportedOptions.length > 0
+      ? supportedOptions[supportedOptions.length - 1]
+      : undefined;
+  const defaultThinking =
+    effectiveThinkingOptionId &&
+    supportedOptions &&
+    supportedOptions.includes(effectiveThinkingOptionId)
+      ? effectiveThinkingOptionId
+      : catalogDefaultThinking;
+
+  const thinkingOptions = ANTIGRAVITY_THINKING_OPTION_IDS.map((id) =>
+    harnessThinkingOptionSchema.parse({
+      id,
+      label: ANTIGRAVITY_THINKING_LABELS[id] ?? id,
+    }),
+  );
+
   return harnessModelCatalogSchema.parse({
     models,
-    defaultModel: models[0]?.ref,
-    thinkingOptions: options,
-    ...(defaultThinkingOptionId ? { defaultThinkingOptionId } : {}),
+    defaultModel,
+    thinkingOptions,
+    ...(defaultThinking ? { defaultThinkingOptionId: defaultThinking } : {}),
   });
+}
+
+export function modelBySlug(
+  models: readonly AntigravityNativeModel[],
+  slug: string,
+): AntigravityNativeModel | undefined {
+  const exact = models.find((model) => model.slug === slug);
+  if (exact) return exact;
+  const baseSlug = slug.replace(EFFORT_SLUG_PATTERN, "$1");
+  return models.find((model) => model.slug === baseSlug);
 }
 
 /**
- * Builds the `--model` / `--effort` arguments for a launch.
- *
- * A Model Ref that still carries an effort suffix comes from a Thread stored
- * before efforts were split out; the CLI accepts it as long as `--effort` is
- * left off, so those Threads keep resuming unchanged.
+ * The Thinking options the given Model actually accepts (upstream-aligned).
+ * Models without effort variants expose none.
  */
-export function antigravityModelArguments(
-  model: HarnessModelRef | undefined,
-  thinkingOptionId: HarnessThinkingOptionId | undefined,
-): string[] {
-  if (!model) return [];
-  const arguments_ = ["--model", model.id];
-  if (thinkingOptionId && !EFFORT_SUFFIX_PATTERN.test(model.id)) {
-    arguments_.push("--effort", thinkingOptionId);
+export function antigravityAvailableThinkingOptions(
+  model: AntigravityNativeModel | undefined,
+): readonly HarnessThinkingOption[] {
+  const supported = model?.supportedThinkingOptionIds;
+  if (!supported || supported.length === 0) {
+    return [];
   }
-  return arguments_;
+  return ANTIGRAVITY_THINKING_OPTION_IDS.filter((id) => supported.includes(id)).map((id) =>
+    harnessThinkingOptionSchema.parse({
+      id,
+      label: ANTIGRAVITY_THINKING_LABELS[id] ?? id,
+    }),
+  );
 }
 
-/** Thinking options the given Model actually accepts, or undefined when none. */
-export function antigravityAvailableThinkingOptions(
-  catalog: HarnessModelCatalog | undefined,
-  model: HarnessModelRef | undefined,
-): HarnessThinkingOption[] | undefined {
-  if (!catalog || !model) return undefined;
-  const supported = catalog.models.find(
-    ({ ref }) => ref.id === model.id,
-  )?.supportedThinkingOptionIds;
-  if (!supported) return undefined;
-  const options = supported.flatMap((id) => {
-    const option = catalog.thinkingOptions.find((candidate) => candidate.id === id);
-    return option ? [option] : [];
-  });
-  return options.length > 0 ? options : undefined;
+/** Whether the Model accepts the given effort; false when it has no effort variants. */
+export function modelAcceptsThinking(
+  model: AntigravityNativeModel | undefined,
+  thinkingOptionId: HarnessThinkingOptionId | undefined,
+): boolean {
+  if (!thinkingOptionId) return true;
+  if (!model?.supportedThinkingOptionIds || model.supportedThinkingOptionIds.length === 0) {
+    return false;
+  }
+  return model.supportedThinkingOptionIds.includes(thinkingOptionId);
 }

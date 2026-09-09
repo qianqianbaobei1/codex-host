@@ -1,56 +1,78 @@
-import { packageMetadata as harnessAdapter } from "@codexhost/harness-adapter";
-import { WORKSPACE_CONTRACT_VERSION } from "@codexhost/shared-contracts";
-
+export { AntigravityAdapter } from "./antigravity-adapter.js";
+export { ANTIGRAVITY_COMMAND_ENV, resolveAntigravityExecutable } from "./command.js";
 export {
-  ANTIGRAVITY_WORKSPACE_FILE_INSTRUCTION,
-  AntigravityAdapter,
-  formatAntigravityTurnPrompt,
-  parseAntigravityContextUsage,
-  permissionDeniedTurnError,
-  resolveAntigravityContextWindow,
-} from "./antigravity-adapter.js";
-export type { AntigravityAdapterOptions } from "./antigravity-adapter.js";
-export { resolveAntigravityExecutable } from "./command.js";
-export {
+  decodeAntigravityModelRef,
+  encodeAntigravityModelRef,
+  normalizeAntigravityModelCatalog,
+  parseAntigravityModelsOutput,
   antigravityAvailableThinkingOptions,
-  antigravityModelArguments,
-  parseAntigravityModels,
+  modelAcceptsThinking,
+  ANTIGRAVITY_THINKING_OPTION_IDS,
+  ANTIGRAVITY_THINKING_LABELS,
+  DEFAULT_ANTIGRAVITY_THINKING_OPTION_ID,
 } from "./model-catalog.js";
+export {
+  parseAntigravityContextUsage,
+  pollAntigravityContextUsage,
+  antigravityHttpsPort,
+} from "./context-usage.js";
+export { projectAntigravityFileChange } from "./file-change.js";
+export { loadAntigravitySnapshot, mapAntigravitySnapshot } from "./history.js";
+export {
+  readAntigravityTranscript,
+  resolveAntigravityTranscriptPath,
+  parseTranscriptTurns,
+} from "./transcript.js";
+export { AntigravityCliTransport, AntigravityTransportError } from "./transport.js";
+export {
+  DEFAULT_ANTIGRAVITY_STATUSLINE_RAW_PATH,
+  DEFAULT_ANTIGRAVITY_QUOTA_SNAPSHOT_PATH,
+  projectAntigravityRawQuota,
+  projectAntigravitySnapshotQuota,
+  parseAntigravityQuotaPayload,
+  readAntigravityCreditsSync,
+  readAntigravityCredits,
+  refreshAntigravityCredits,
+} from "./credits.js";
 export { fetchAntigravityQuota, parseAntigravityUsageCommand } from "./quota.js";
+export {
+  composePluginBridgePrompt,
+  enabledPluginIdsFromConfig,
+  pluginBridgeRootsExist,
+  readCodexRules,
+  readSelectedPluginSkillPrompt,
+} from "./plugin-bridge.js";
+export type { PluginBridgeSkill } from "./plugin-bridge.js";
 export type {
   AntigravityCommandRunner,
   AntigravityQuotaBucket,
   AntigravityQuotaSnapshot,
 } from "./quota.js";
 export {
+  ANTIGRAVITY_DEFAULT_PERMISSION_MODE_ID,
+  ANTIGRAVITY_PERMISSION_MODE_CATALOG,
+  decodeAntigravityPermissionModeId,
+} from "./permission-modes.js";
+export type { AntigravityPermissionMode } from "./permission-modes.js";
+export {
   antigravityToolErrorMessage,
   isAntigravityPermissionDenial,
   parseAntigravityStreamLine,
 } from "./stream-events.js";
-export type { AntigravityStreamEvent } from "./stream-events.js";
-export {
-  codeActionFileChange,
-  parseAntigravityCodeActions,
-  requestAntigravityTrajectorySteps,
-} from "./code-action-diff.js";
-export type { AntigravityCodeAction } from "./code-action-diff.js";
-export {
-  compactToolName,
-  completeAntigravityToolItem,
-  displayPath,
-  isAntigravityFileMutatingTool,
-  startAntigravityToolItem,
-  synthesizeAntigravityCommand,
-  toolTargetFile,
-} from "./tool-projection.js";
-export {
-  ANTIGRAVITY_COMMAND_CATALOG,
-  findAntigravityCommandDescriptor,
-  parseAndFormatAntigravityCommand,
-} from "./slash-commands.js";
+export type { AntigravityCreditsProductUsage, AntigravityCreditsPathOptions } from "./credits.js";
+export type {
+  AntigravityAdapterDependencies,
+  AntigravityAdapterOptions,
+  AntigravityCliTransportLike,
+  AntigravityModelsResult,
+} from "./antigravity-adapter.js";
+export type {
+  AntigravityInitEvent,
+  AntigravityResultEvent,
+  AntigravityStepUpdate,
+  AntigravityTransportOptions,
+} from "./transport.js";
 
 export const packageMetadata = {
   name: "@codexhost/adapter-antigravity",
-  contractVersion: WORKSPACE_CONTRACT_VERSION,
-  adapterContract: harnessAdapter.name,
 } as const;

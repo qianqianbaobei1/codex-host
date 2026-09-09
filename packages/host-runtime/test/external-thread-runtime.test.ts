@@ -4,6 +4,7 @@ import type {
   OpenSessionInput,
 } from "@codexhost/harness-adapter";
 import { FakeHarnessAdapter, FakeHarnessSession } from "@codexhost/harness-adapter/testing";
+import type { HostThreadSnapshot } from "@codexhost/harness-adapter";
 import type { StoredThreadRecordV1 } from "@codexhost/mapping-store";
 import {
   harnessIdSchema,
@@ -53,6 +54,67 @@ function record(): StoredThreadRecordV1 {
 }
 
 describe("ExternalThreadRuntime register", () => {
+  it("projects a cached external history before opening the native Session", async () => {
+    const antigravity = harnessIdSchema.parse("antigravity");
+    const nativeRef = nativeSessionRefSchema.parse({
+      harnessId: antigravity,
+      nativeSessionId: "cached-native-session",
+      formatVersion: 1,
+    });
+    const stored: StoredThreadRecordV1 = {
+      ...record(),
+      harnessId: antigravity,
+      nativeSessionRef: nativeRef,
+      title: "Cached Gemini Thread",
+      transportModelId: "codexhost/antigravity-native",
+    };
+    const cachedSnapshot = {
+      turns: [
+        {
+          nativeTurnRef: {
+            harnessId: antigravity,
+            nativeSessionId: nativeRef.nativeSessionId,
+            nativeTurnKey: "cached-native-session:turn:1",
+            formatVersion: 1,
+          },
+          input: [{ type: "text", text: "cached prompt" }],
+          items: [],
+          outcome: { status: "succeeded" as const },
+        },
+      ],
+    } satisfies HostThreadSnapshot;
+    const adapter = new FakeHarnessAdapter(antigravity);
+    const readCachedSnapshot = vi.fn(
+      async (input: Parameters<NonNullable<typeof adapter.readCachedSnapshot>>[0]) => {
+        expect(input.environment?.CODEXHOST_THREAD_ID).toBe(stored.hostThreadId);
+        return { ok: true as const, value: cachedSnapshot };
+      },
+    );
+    adapter.readCachedSnapshot = readCachedSnapshot;
+    const projectedTurns = [{ id: "host-cached-turn" }];
+    const repository = {
+      alignSnapshot: vi.fn(async () => ({ record: stored, turns: projectedTurns })),
+      sessionTreeId: vi.fn(async () => stored.hostThreadId),
+    } as unknown as ExternalThreadRepository;
+    const runtime = new ExternalThreadRuntime({
+      adapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["antigravity", adapter]]),
+      environment: { CODEXHOST_DATA_DIR: "/synthetic-data" },
+      repository,
+      consumeOutputs: async () => undefined,
+      diagnose: () => undefined,
+    });
+
+    const cached = await runtime.readCached({ kind: "external", record: stored, thread: null });
+
+    expect(cached).toMatchObject({
+      record: stored,
+      turns: projectedTurns,
+      thread: { id: stored.hostThreadId, turns: projectedTurns },
+    });
+    expect(readCachedSnapshot).toHaveBeenCalledOnce();
+    expect(runtime.get(stored.hostThreadId)).toBeUndefined();
+  });
+
   it("exposes the requested create Model before the Session publishes state", async () => {
     const adapter = new FakeHarnessAdapter(harnessId);
     const model = adapter.catalog.models[1]?.ref;

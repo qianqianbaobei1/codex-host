@@ -485,6 +485,16 @@ describe("Renderer draft prewarm policy", () => {
       ephemeral: true,
       model: "gpt-5",
     });
+
+    await bridge.sendRequest("turn/start", {
+      threadId: "thread-1",
+      input: [{ type: "text", text: "hello" }],
+    });
+    expect(sendRequest).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "thread-1",
+      input: [{ type: "text", text: "hello" }],
+      model: "codexhost/pi-native",
+    });
   });
 
   it("routes a draft Codex Account without changing the default Account", async () => {
@@ -993,5 +1003,71 @@ describe("Renderer draft prewarm policy", () => {
     await expect(installRendererDraftPrewarmPolicy(inspector, 17)).rejects.toThrow(
       "Renderer draft prewarm policy returned an invalid status",
     );
+  });
+
+  it("does not hijack an official Thread's turn/start with the selected draft Model", async () => {
+    const manager = requestManagerFixture();
+    const sendRequest = vi.fn<RendererHostRequestBridge["sendRequest"]>(async (method, parameters) => {
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: "official-thread-1",
+            modelProvider: "openai",
+            cliVersion: "0.1.0",
+          },
+        };
+      }
+      return {};
+    });
+    const prewarmThreadStart = vi.fn(async (parameters: unknown) => parameters);
+    const bridge = requestBridgeFixture({ sendRequest, prewarmThreadStart });
+    const target: DraftPrewarmPolicyTarget = {};
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const policy = target.__codexhostDraftPrewarmPolicyV1 as {
+      select(model: string | null, threadId?: string): boolean;
+    };
+
+    // User selected Gemini/Antigravity in draft
+    policy.select("codexhost/antigravity-flash");
+
+    // Existing official thread is read
+    await bridge.sendRequest("thread/read", { threadId: "official-thread-1" });
+
+    // User sends a turn in the official thread
+    await bridge.sendRequest("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "hello" }],
+    });
+
+    // turn/start must NOT have model hijacked to codexhost/antigravity-flash!
+    expect(sendRequest).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "hello" }],
+    });
+
+    // Now user explicitly switches this thread to external model
+    policy.select("codexhost/antigravity-flash", "official-thread-1");
+    await bridge.sendRequest("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "hello with gemini" }],
+    });
+    expect(sendRequest).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "hello with gemini" }],
+      model: "codexhost/antigravity-flash",
+    });
+
+    // Now user switches back to Codex native model for this thread
+    policy.select(null, "official-thread-1");
+    await bridge.sendRequest("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "back to codex" }],
+    });
+    expect(sendRequest).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "official-thread-1",
+      input: [{ type: "text", text: "back to codex" }],
+    });
   });
 });

@@ -1,1316 +1,877 @@
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type { HarnessOutput, HostEvent } from "@codexhost/harness-adapter";
+import { describe, expect, it, vi } from "vitest";
+import type { HarnessOutput, HarnessSession, TurnStartCommand } from "@codexhost/harness-adapter";
 import {
-  accountCreditsSnapshotSchema,
-  harnessModelRefSchema,
+  harnessIdSchema,
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostTurnIdSchema,
 } from "@codexhost/shared-contracts";
-import { describe, expect, it } from "vitest";
+import type { NativeSessionRef } from "@codexhost/shared-contracts";
 
-import {
-  ANTIGRAVITY_WORKSPACE_FILE_INSTRUCTION,
-  AntigravityAdapter,
-  antigravityAvailableThinkingOptions,
-  antigravityModelArguments,
-  antigravityToolErrorMessage,
-  fetchAntigravityQuota,
-  formatAntigravityTurnPrompt,
-  isAntigravityPermissionDenial,
-  parseAntigravityContextUsage,
-  parseAntigravityModels,
-  parseAntigravityStreamLine,
-  parseAntigravityUsageCommand,
-  permissionDeniedTurnError,
-  resolveAntigravityContextWindow,
-} from "../src/index.js";
+import type {
+  AntigravityCliTransportLike,
+  AntigravityModelsResult,
+} from "../src/antigravity-adapter.js";
+import { AntigravityAdapter } from "../src/antigravity-adapter.js";
+import type {
+  AntigravityInitEvent,
+  AntigravityResultEvent,
+  AntigravityStepUpdate,
+} from "../src/transport.js";
+import { encodeAntigravityModelRef } from "../src/model-catalog.js";
+import { resolveAntigravityProxyEnvironment } from "../src/command.js";
 
-const FETCHED_AT = "2026-08-31T14:40:00.000Z";
+const MODEL = "gemini-3.7-flash";
+const MODEL_LABEL = "Gemini 3.7 Flash";
 
-/** Captured from `agy --print=/usage --output-format stream-json` (CLI v1.1.22). */
-const USAGE_COMMAND = {
-  name: "usage",
-  data: {
-    description: "Within each group, models share a weekly limit and a 5-hour limit.",
-    groups: [
-      {
-        name: "Gemini Models",
-        description: "Models within this group: Gemini Flash, Gemini Pro",
-        buckets: [
-          {
-            id: "gemini-weekly",
-            name: "Weekly Limit Remaining",
-            window: "weekly",
-            remaining_fraction: 0.9735029339790344,
-            reset_time: "2026-09-01T03:17:57Z",
-          },
-          {
-            id: "gemini-5h",
-            name: "Five Hour Limit Remaining",
-            window: "5h",
-            remaining_fraction: 1,
-            reset_time: "2026-08-31T19:38:13Z",
-          },
-        ],
-      },
-      {
-        name: "Claude and GPT models",
-        description: "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
-        buckets: [
-          {
-            id: "3p-weekly",
-            name: "Weekly Limit Remaining",
-            window: "weekly",
-            remaining_fraction: 1,
-            reset_time: "2026-09-07T14:38:13Z",
-          },
-        ],
-      },
-    ],
-  },
-} as const;
-
-/**
- * Writes a stand-in for `agy models` so `open()` can be exercised without the
- * real CLI. `commandInvocation` wraps `.cmd` through cmd.exe on Windows, so a
- * batch shim is executable there and a shell script elsewhere.
- */
-async function fakeAgy(lines: readonly string[]): Promise<{
-  command: string;
-  cwd: string;
-  cleanup(): Promise<void>;
-}> {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-"));
-  // The Session's cwd stays outside the shim directory; Windows keeps a handle
-  // on a directory it has executed from and cleanup would hit EBUSY.
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-cwd-"));
-  const cleanup = async (): Promise<void> => {
-    for (const target of [directory, cwd]) {
-      await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    }
+function fakeTransportFactory(
+  conversationId: string,
+  initialModel?: string,
+): {
+  create(): AntigravityCliTransportLike;
+  lastModel(): string | undefined;
+  lastEffort(): string | undefined;
+  hibernateCalls(): number;
+} {
+  let currentModel: string | undefined = initialModel;
+  let currentEffort: string | undefined;
+  let hibernateCount = 0;
+  return {
+    create() {
+      return {
+        get conversationId() {
+          return conversationId;
+        },
+        get effort() {
+          return currentEffort;
+        },
+        get logPath() {
+          return null;
+        },
+        async start(): Promise<AntigravityInitEvent> {
+          return { conversationId, cwd: process.cwd(), model: currentModel ?? MODEL };
+        },
+        async setModel(model: string, effort?: string): Promise<AntigravityInitEvent> {
+          currentModel = model;
+          if (arguments.length > 1) {
+            currentEffort = effort;
+          }
+          return { conversationId, cwd: process.cwd(), model };
+        },
+        async setEffort(effort: string | undefined): Promise<AntigravityInitEvent> {
+          currentEffort = effort;
+          return { conversationId, cwd: process.cwd(), model: currentModel ?? MODEL };
+        },
+        async setPermissionMode(): Promise<AntigravityInitEvent> {
+          return { conversationId, cwd: process.cwd(), model: currentModel ?? MODEL };
+        },
+        async runTurn(
+          _text: string,
+          onStep: (step: AntigravityStepUpdate) => void,
+        ): Promise<AntigravityResultEvent> {
+          onStep({
+            stepType: "agent_response",
+            state: "DONE",
+            textDelta: "hello from Gemini\n",
+          });
+          return {
+            conversationId,
+            status: "SUCCESS",
+            response: "hello from Gemini\n",
+            numTurns: 1,
+            usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+          };
+        },
+        async cancel(): Promise<void> {},
+        async hibernate(): Promise<void> {
+          hibernateCount += 1;
+        },
+        async close(): Promise<void> {},
+      };
+    },
+    lastModel() {
+      return currentModel;
+    },
+    lastEffort() {
+      return currentEffort;
+    },
+    hibernateCalls() {
+      return hibernateCount;
+    },
   };
-  if (process.platform === "win32") {
-    const command = path.join(directory, "agy.cmd");
-    await writeFile(
-      command,
-      `@echo off\r\n${lines.map((line) => `echo ${line}`).join("\r\n")}\r\n`,
-    );
-    return { command, cwd, cleanup };
-  }
-  const command = path.join(directory, "agy");
-  await writeFile(command, `#!/bin/sh\ncat <<'MODELS'\n${lines.join("\n")}\nMODELS\n`);
-  await chmod(command, 0o755);
-  return { command, cwd, cleanup };
 }
 
-// Labels stay free of parentheses so the batch shim does not need escaping;
-// the label-suffix handling is covered by the Catalog tests above.
-const FAKE_MODELS = [
-  "gemini-3.1-pro-high\tGemini 3.1 Pro High",
-  "gemini-3.1-pro-low\tGemini 3.1 Pro Low",
-  "claude-sonnet-4-6\tClaude Sonnet 4.6 Thinking",
-] as const;
-
-describe("Antigravity Adapter", () => {
-  it("reads account quota without a Thread and hides it after native authentication stops returning data", async () => {
-    const fixture = await fakeAgy([
-      JSON.stringify({ event: "command_result", command: USAGE_COMMAND }),
-    ]);
-    const adapter = new AntigravityAdapter({ command: fixture.command, environment: process.env });
-    try {
-      expect(await adapter.inspectAccount()).toMatchObject({
-        credits: { label: "Gemini Models · Weekly window", usedPercent: 2.65 },
-      });
-      expect(adapter.credits()).not.toBeNull();
-      await writeFile(
-        fixture.command,
-        process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n",
-      );
-      expect(await adapter.inspectAccount()).toBeNull();
-    } finally {
-      await adapter.close();
-      await fixture.cleanup();
+async function waitForTurnIterator(
+  iterator: AsyncIterator<HarnessOutput>,
+): Promise<HarnessOutput[]> {
+  const values: HarnessOutput[] = [];
+  while (true) {
+    const result = await iterator.next();
+    if (result.done) break;
+    const value = result.value;
+    values.push(value);
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "kind" in value &&
+      value.kind === "event" &&
+      "event" in value &&
+      typeof value.event === "object" &&
+      value.event !== null &&
+      "type" in value.event &&
+      value.event.type === "turn.completed"
+    ) {
+      break;
     }
-  });
-  it("refuses Desktop approval execution when the native CLI cannot confirm the Hook configuration", async () => {
-    const { command, cwd, cleanup } = await fakeAgy(FAKE_MODELS);
-    const adapter = new AntigravityAdapter({ command });
-    try {
-      const opened = await adapter.open({
-        kind: "create",
-        cwd,
-        permissionModeId: harnessPermissionModeIdSchema.parse("desktop-approvals"),
-      });
-      if (!opened.ok) throw new Error(opened.error.message);
-      const iterator = opened.value.outputs[Symbol.asyncIterator]();
-      expect(
-        await opened.value.execute({
-          type: "turn.start",
-          turnId: hostTurnIdSchema.parse("missing-approval-hook"),
-          input: [{ type: "text", text: "Do not execute without an approval Hook" }],
-        }),
-      ).toMatchObject({
-        ok: false,
-        error: {
-          message: expect.stringContaining("no tools were started"),
-        },
-      });
-      await opened.value.close();
-      expect((await iterator.next()).done).toBe(true);
-    } finally {
-      await adapter.close();
-      await cleanup();
-    }
-  });
+  }
+  return values;
+}
 
-  it("parses the CLI Model catalog", () => {
-    expect(
-      parseAntigravityModels(
-        [
-          "gemini-3.7-flash-high\tGemini 3.7 Flash (High)",
-          "gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)",
-          "gemini-3.7-flash-low\tGemini 3.7 Flash (Low)",
-          "gemini-3.1-pro-high\tGemini 3.1 Pro (High)",
-          "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)",
-          "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)",
-          "",
-        ].join("\n"),
-      ),
-    ).toMatchObject({
-      models: [
-        {
-          ref: { id: "gemini-3.7-flash" },
-          label: "Gemini 3.7 Flash",
-          supportedThinkingOptionIds: ["low", "medium", "high"],
-        },
-        // The CLI rejects `--effort medium` for Pro, so it must not be offered.
-        {
-          ref: { id: "gemini-3.1-pro" },
-          label: "Gemini 3.1 Pro",
-          supportedThinkingOptionIds: ["low", "high"],
-        },
-        { ref: { id: "claude-sonnet-4-6" }, label: "Claude Sonnet 4.6 (Thinking)" },
-      ],
-      defaultModel: { id: "gemini-3.7-flash" },
-      thinkingOptions: [
-        { id: "low", label: "Low" },
-        { id: "medium", label: "Medium" },
-        { id: "high", label: "High" },
-      ],
-      defaultThinkingOptionId: "high",
-    });
-  });
+async function waitForTurn(session: HarnessSession): Promise<HarnessOutput[]> {
+  return waitForTurnIterator(session.outputs[Symbol.asyncIterator]());
+}
 
-  it("leaves Models without effort variants free of Thinking options", () => {
-    const catalog = parseAntigravityModels(
-      "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\nclaude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n",
+describe("AntigravityAdapter", () => {
+  it("coalesces concurrent model inspections for the same working directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-inspect-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let listCalls = 0;
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      listCalls += 1;
+      await Promise.resolve();
+      return { stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" };
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => fakeTransportFactory("inspect").create(), listModels },
     );
-    // `-thinking` is not an effort suffix, so the ID must stay intact.
-    expect(catalog.models.map(({ ref }) => ref.id)).toEqual([
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-    ]);
-    expect(catalog.models.every((model) => !model.supportedThinkingOptionIds)).toBe(true);
-    expect(catalog.thinkingOptions).toEqual([]);
-    expect(catalog.defaultThinkingOptionId).toBeUndefined();
-  });
-
-  it("passes effort as its own flag and never alongside a suffixed Model ID", () => {
-    const ref = (id: string) => harnessModelRefSchema.parse({ id });
-    const effort = (id: string) => harnessThinkingOptionIdSchema.parse(id);
-    expect(antigravityModelArguments(ref("gemini-3.1-pro"), effort("low"))).toEqual([
-      "--model",
-      "gemini-3.1-pro",
-      "--effort",
-      "low",
-    ]);
-    // A Thread stored before efforts were split keeps its suffixed ID, and the
-    // CLI fails that ID outright when `--effort` is also present.
-    expect(antigravityModelArguments(ref("gemini-3.1-pro-low"), effort("high"))).toEqual([
-      "--model",
-      "gemini-3.1-pro-low",
-    ]);
-    expect(antigravityModelArguments(ref("claude-sonnet-4-6"), undefined)).toEqual([
-      "--model",
-      "claude-sonnet-4-6",
-    ]);
-    expect(antigravityModelArguments(undefined, effort("high"))).toEqual([]);
-  });
-
-  it("refuses an initial effort the Model does not accept", async () => {
-    const { command, cwd, cleanup } = await fakeAgy(FAKE_MODELS);
-    const adapter = new AntigravityAdapter({ command });
     try {
-      // `thread/start` reaches open() directly, so refusing here is what keeps
-      // the CLI from failing on `--effort` only once the first Turn runs.
-      const opened = await adapter.open({
-        kind: "create",
-        cwd,
-        model: harnessModelRefSchema.parse({ id: "claude-sonnet-4-6" }),
-        thinkingOptionId: harnessThinkingOptionIdSchema.parse("high"),
-      });
-      expect(opened.ok).toBe(false);
-      if (opened.ok) return;
-      expect(opened.error.code).toBe("invalidRequest");
-      expect(opened.error.message).toContain("high");
+      const [first, second] = await Promise.all([
+        adapter.inspect({ cwd: root }),
+        adapter.inspect({ cwd: root }),
+      ]);
+      expect(first.status).toBe("ready");
+      expect(second.status).toBe("ready");
+      expect(listCalls).toBe(1);
     } finally {
       await adapter.close();
-      await cleanup();
+      await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("opens with an effort the Model accepts and reports it as effective", async () => {
-    const { command, cwd, cleanup } = await fakeAgy(FAKE_MODELS);
-    const adapter = new AntigravityAdapter({ command });
+  it("uses the CLI model catalog, streams a Turn, and persists a resumable ledger", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const first = fakeTransportFactory("conversation-1");
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      {
+        createTransport: () => first.create(),
+        listModels,
+      },
+    );
+    try {
+      const inspection = await adapter.inspect({ cwd: root });
+      expect(inspection).toMatchObject({
+        status: "ready",
+        catalog: { defaultModel: encodeAntigravityModelRef(MODEL) },
+      });
+      if (inspection.status !== "ready") throw new Error("synthetic inspection failed");
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      expect(session.initialState.nativeRef).toMatchObject({
+        locator: { skipPermissions: true },
+      });
+      const outputs = waitForTurn(session);
+      const command: TurnStartCommand = {
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("host-turn-1"),
+        input: [{ type: "text", text: "Say hello" }],
+      };
+      const accepted = await session.execute(command);
+      expect(accepted).toEqual({ ok: true, value: { turnId: "host-turn-1" } });
+      const events = await outputs;
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "event",
+            event: expect.objectContaining({ type: "session.usage.changed" }),
+          }),
+          expect.objectContaining({
+            kind: "event",
+            event: expect.objectContaining({
+              type: "turn.completed",
+              nativeTurnRef: expect.objectContaining({
+                nativeSessionId: "conversation-1",
+                nativeTurnKey: "conversation-1:turn:1",
+              }),
+            }),
+          }),
+        ]),
+      );
+      const nativeRef = session.initialState.nativeRef;
+      if (!nativeRef) throw new Error("synthetic Session did not publish a Native Ref");
+      await session.close();
+
+      const second = fakeTransportFactory("conversation-1");
+      const resumed = await new AntigravityAdapter(
+        { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+        { createTransport: () => second.create(), listModels },
+      ).open({
+        kind: "resume",
+        cwd: root,
+        environment,
+        nativeRef,
+        knownTurnRefs: [
+          {
+            harnessId: harnessIdSchema.parse("antigravity"),
+            nativeSessionId: "conversation-1",
+            nativeTurnKey: "conversation-1:turn:1",
+            formatVersion: 1,
+          },
+        ],
+      });
+      expect(resumed.ok).toBe(true);
+      if (!resumed.ok) throw new Error(resumed.error.message);
+      expect(resumed.value.initialState.nativeRef).toMatchObject({
+        locator: { skipPermissions: true },
+      });
+      const snapshot = await resumed.value.readSnapshot();
+      expect(snapshot).toMatchObject({
+        ok: true,
+        value: {
+          turns: [
+            {
+              input: [{ type: "text", text: "Say hello" }],
+              items: [{ item: { type: "agentMessage", text: "hello from Gemini\n" } }],
+            },
+          ],
+        },
+      });
+      await resumed.value.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("streams reasoning items when thinkingDelta arrives", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-reasoning-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transport: AntigravityCliTransportLike = {
+      conversationId: "conv-reasoning-1",
+      logPath: null,
+      async start() {
+        return { conversationId: "conv-reasoning-1", cwd: root, model: MODEL };
+      },
+      async setModel(model: string) {
+        return { conversationId: "conv-reasoning-1", cwd: root, model };
+      },
+      async setEffort() {
+        return { conversationId: "conv-reasoning-1", cwd: root, model: MODEL };
+      },
+      async setPermissionMode() {
+        return { conversationId: "conv-reasoning-1", cwd: root, model: MODEL };
+      },
+      async runTurn(_text, onStep) {
+        onStep({ stepType: "thinking", thinkingDelta: "Analyzing problem..." });
+        onStep({ stepType: "thinking", thinkingDelta: " Found solution." });
+        onStep({ stepType: "agent_response", textDelta: "Here is the answer." });
+        return {
+          conversationId: "conv-reasoning-1",
+          status: "SUCCESS",
+          response: "Here is the answer.",
+          numTurns: 1,
+        };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport, listModels },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const outputs = waitForTurn(session);
+      const command: TurnStartCommand = {
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("turn-reasoning-1"),
+        input: [{ type: "text", text: "Think and answer" }],
+      };
+      await session.execute(command);
+      const events = await outputs;
+      const reasoningStarted = events.some(
+        (e) =>
+          e.kind === "event" &&
+          e.event.type === "item.started" &&
+          e.event.item.type === "reasoning",
+      );
+      const reasoningUpdated = events.some(
+        (e) =>
+          e.kind === "event" &&
+          e.event.type === "item.updated" &&
+          e.event.update.type === "text.append" &&
+          e.event.update.text === " Found solution.",
+      );
+      expect(reasoningStarted).toBe(true);
+      expect(reasoningUpdated).toBe(true);
+      await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("supports thinking.select and updates effectiveThinkingOptionId", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-thinking-test-"));
+    const environment = { ANTIGRAVITY_APP_DATA_DIR: root };
+    const transportFactory = fakeTransportFactory("conv-thinking-select-1");
+    // The CLI lists effort variants as separate rows; the Model catalog then
+    // exposes them as Thinking options (upstream-aligned parsing).
+    const effortRows = ["low", "medium", "high"]
+      .map((effort) => `${MODEL}-${effort}\t${MODEL_LABEL} (${effort})\n`)
+      .join("");
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n${effortRows}`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transportFactory.create(), listModels },
+    );
     try {
       const opened = await adapter.open({
         kind: "create",
-        cwd,
-        model: harnessModelRefSchema.parse({ id: "gemini-3.1-pro" }),
+        cwd: root,
+        environment,
         thinkingOptionId: harnessThinkingOptionIdSchema.parse("low"),
       });
       expect(opened.ok).toBe(true);
-      if (!opened.ok) return;
-      // No inspect() ran first, so the Catalog had to be fetched inside open().
-      expect(opened.value.initialState.effectiveThinkingOptionId).toBe("low");
-      expect(opened.value.initialState.availableThinkingOptions).toEqual([
-        { id: "low", label: "Low" },
-        { id: "high", label: "High" },
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+
+      const snapshotBefore = await session.readSnapshot();
+      expect(snapshotBefore.ok).toBe(true);
+      if (!snapshotBefore.ok || !snapshotBefore.value.state) {
+        throw new Error(snapshotBefore.ok ? "Missing state" : snapshotBefore.error.message);
+      }
+      expect(snapshotBefore.value.state.effectiveThinkingOptionId).toBe("low");
+      expect(snapshotBefore.value.state.availableThinkingOptions?.map((o) => o.id)).toEqual([
+        "low",
+        "medium",
+        "high",
       ]);
-      await opened.value.close();
+
+      const selectResult = await session.execute({
+        type: "thinking.select",
+        thinkingOptionId: harnessThinkingOptionIdSchema.parse("high"),
+      });
+      expect(selectResult.ok).toBe(true);
+      expect(transportFactory.lastEffort()).toBe("high");
+
+      const snapshotAfter = await session.readSnapshot();
+      expect(snapshotAfter.ok).toBe(true);
+      if (!snapshotAfter.ok || !snapshotAfter.value.state) {
+        throw new Error(snapshotAfter.ok ? "Missing state" : snapshotAfter.error.message);
+      }
+      expect(snapshotAfter.value.state.effectiveThinkingOptionId).toBe("high");
+
+      await session.close();
     } finally {
       await adapter.close();
-      await cleanup();
+      await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("reports only the efforts the selected Model accepts", () => {
-    const catalog = parseAntigravityModels(
-      [
-        "gemini-3.1-pro-high\tGemini 3.1 Pro (High)",
-        "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)",
-        "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)",
-      ].join("\n"),
+  it("hibernates an idle Session and allows the next Turn to restart it", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-session-idle-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transportFactory = fakeTransportFactory("conv-session-idle-1");
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      {
+        command: path.join(os.homedir(), ".local/bin/agy"),
+        environment,
+        sessionIdleTimeoutMs: 100,
+      },
+      { createTransport: () => transportFactory.create(), listModels },
     );
-    expect(
-      antigravityAvailableThinkingOptions(
-        catalog,
-        harnessModelRefSchema.parse({ id: "gemini-3.1-pro" }),
-      ),
-    ).toEqual([
-      { id: "low", label: "Low" },
-      { id: "high", label: "High" },
-    ]);
-    expect(
-      antigravityAvailableThinkingOptions(
-        catalog,
-        harnessModelRefSchema.parse({ id: "claude-sonnet-4-6" }),
-      ),
-    ).toBeUndefined();
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+
+      const outputIterator = session.outputs[Symbol.asyncIterator]();
+      const firstTurn = waitForTurnIterator(outputIterator);
+      await session.execute({
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("idle-turn-1"),
+        input: [{ type: "text", text: "first" }],
+      });
+      await firstTurn;
+      expect(transportFactory.hibernateCalls()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(101);
+      expect(transportFactory.hibernateCalls()).toBe(1);
+
+      const secondTurn = waitForTurnIterator(outputIterator);
+      await session.execute({
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("idle-turn-2"),
+        input: [{ type: "text", text: "second" }],
+      });
+      await secondTurn;
+      expect(transportFactory.hibernateCalls()).toBe(1);
+    } finally {
+      await adapter.close();
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
-  it("accepts typed stream events and ignores terminal noise", () => {
-    expect(
-      parseAntigravityStreamLine(
-        '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"hi"}}',
-      ),
-    ).toMatchObject({ event: "step_update", step_update: { text_delta: "hi" } });
-    expect(parseAntigravityStreamLine("permission warning")).toBeNull();
+  it("caches inspect results and only refreshes when refresh is requested", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-cache-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let listCalls = 0;
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      listCalls += 1;
+      return { stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" };
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => fakeTransportFactory("inspect-cache").create(), listModels },
+    );
+    try {
+      const first = await adapter.inspect({ cwd: root });
+      expect(first.status).toBe("ready");
+      expect(listCalls).toBe(1);
+
+      // Subsequent inspect returns from cache without running listModels
+      const second = await adapter.inspect({ cwd: root });
+      expect(second.status).toBe("ready");
+      expect(listCalls).toBe(1);
+
+      // open() also reuses cache
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      expect(listCalls).toBe(1);
+      if (opened.ok) await opened.value.close();
+
+      // With refresh: true, it re-queries
+      const refreshed = await adapter.inspect({ cwd: root, refresh: true });
+      expect(refreshed.status).toBe("ready");
+      expect(listCalls).toBe(2);
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
-  it("parses real Language Server context metadata", () => {
-    const metadata = {
-      trajectory: {
-        generatorMetadata: [
+  it("reads the local history cache without starting AGY", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-fast-history-"));
+    const threadId = "cached-thread";
+    const conversationId = "cached-conversation";
+    const environment = {
+      HOME: root,
+      CODEXHOST_DATA_DIR: root,
+      CODEXHOST_THREAD_ID: threadId,
+      PATH: "/synthetic",
+    };
+    const nativeRef: NativeSessionRef = {
+      harnessId: harnessIdSchema.parse("antigravity"),
+      nativeSessionId: conversationId,
+      locator: { model: MODEL },
+      formatVersion: 1,
+    };
+    const nativeTurnRef = {
+      harnessId: "antigravity",
+      nativeSessionId: conversationId,
+      nativeTurnKey: `${conversationId}:turn:1`,
+      formatVersion: 1,
+    };
+    await mkdir(path.join(root, "antigravity-history"), { recursive: true });
+    await writeFile(
+      path.join(root, "antigravity-history", `${threadId}.json`),
+      `${JSON.stringify({
+        formatVersion: 1,
+        nativeSessionId: conversationId,
+        turns: [
           {
-            chatModel: {
-              chatStartMetadata: {
-                contextWindowMetadata: {
-                  estimatedTokensUsed: 19_505,
-                  maxContextTokens: 256_000,
-                  tokenBreakdown: { totalTokens: 19_505 },
-                },
-              },
-            },
+            nativeTurnRef,
+            input: [{ type: "text", text: "cached prompt" }],
+            items: [],
+            outcome: { status: "succeeded" },
           },
         ],
-      },
-    };
-    expect(parseAntigravityContextUsage(metadata)).toEqual({
-      contextUsedTokens: 19_505,
-      contextWindowTokens: 1_048_576,
-    });
-    expect(parseAntigravityContextUsage(metadata, "gemini-3.7-flash-high")).toEqual({
-      contextUsedTokens: 19_505,
-      contextWindowTokens: 1_048_576,
-    });
-    expect(parseAntigravityContextUsage(metadata, "claude-sonnet-4-6")).toEqual({
-      contextUsedTokens: 19_505,
-      contextWindowTokens: 200_000,
-    });
-    const chunkMetadata = {
-      trajectory: {
-        generatorMetadata: [
-          {
-            chatModel: {
-              chatStartMetadata: {
-                contextWindowMetadata: {
-                  estimatedTokensUsed: 12_000,
-                  maxContextTokens: 128_000,
-                },
-              },
+      })}\n`,
+      "utf8",
+    );
+    let transportStarts = 0;
+    const factory = fakeTransportFactory(conversationId);
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      {
+        createTransport: () => {
+          const transport = factory.create();
+          const start = transport.start;
+          return {
+            ...transport,
+            async start() {
+              transportStarts += 1;
+              return start();
             },
-          },
-        ],
-      },
-    };
-    expect(parseAntigravityContextUsage(chunkMetadata, "gemini-2.5-flash")).toEqual({
-      contextUsedTokens: 12_000,
-      contextWindowTokens: 1_048_576,
-    });
-    expect(parseAntigravityContextUsage(chunkMetadata)).toEqual({
-      contextUsedTokens: 12_000,
-      contextWindowTokens: 1_048_576,
-    });
-    expect(parseAntigravityContextUsage(chunkMetadata, "claude-3-7-sonnet")).toEqual({
-      contextUsedTokens: 12_000,
-      contextWindowTokens: 200_000,
-    });
-    expect(parseAntigravityContextUsage({ generatorMetadata: [] })).toBeNull();
-  });
-
-  it("resolves context window sizes by model family with 1M Gemini default", () => {
-    expect(resolveAntigravityContextWindow()).toBe(1_048_576);
-    expect(resolveAntigravityContextWindow("gemini-3.7-flash-high")).toBe(1_048_576);
-    expect(resolveAntigravityContextWindow("gemini-1.5-pro", 128_000)).toBe(1_048_576);
-    expect(resolveAntigravityContextWindow("claude-sonnet-4-6")).toBe(200_000);
-    expect(resolveAntigravityContextWindow("claude-3-5-sonnet", 128_000)).toBe(200_000);
-    expect(resolveAntigravityContextWindow("gpt-oss-120b", 128_000)).toBe(128_000);
-    expect(resolveAntigravityContextWindow("gpt-oss-120b")).toBe(1_048_576);
-  });
-
-  it("projects the CLI /usage command into an account credits snapshot", () => {
-    const snapshot = parseAntigravityUsageCommand(USAGE_COMMAND, FETCHED_AT);
-    // The Gemini weekly bucket is the most consumed, so it leads the pill.
-    // Labels come from the window, not the CLI's "… Remaining" naming, because
-    // the values are consumed percentages.
-    expect(snapshot).toEqual({
-      label: "Gemini Models · Weekly window",
-      usedPercent: 2.65,
-      periodType: "weekly",
-      resetsAt: "2026-09-01T03:17:57Z",
-      fetchedAt: FETCHED_AT,
-      productUsage: [
-        {
-          product: "Gemini Models · 5-hour window",
-          usagePercent: 0,
-          resetsAt: "2026-08-31T19:38:13Z",
+          };
         },
-        {
-          product: "Claude and GPT models · Weekly window",
-          usagePercent: 0,
-          resetsAt: "2026-09-07T14:38:13Z",
+      },
+    );
+    try {
+      const result = await adapter.readCachedSnapshot({
+        kind: "resume",
+        cwd: root,
+        environment,
+        nativeRef,
+      });
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok || !result.value) throw new Error("Cached history was not returned");
+      expect(result.value.turns).toHaveLength(1);
+      expect(result.value.turns[0]?.input[0]?.text).toBe("cached prompt");
+      expect(transportStarts).toBe(0);
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prewarms create sessions even when a Permission Mode is selected", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-prewarm-mode-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transportFactory = fakeTransportFactory("prewarm-mode");
+    let startsBeforeCatalog = 0;
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      startsBeforeCatalog = transportStarts;
+      return {
+        stdout: `${MODEL}\t${MODEL_LABEL}\n${MODEL}-low\t${MODEL_LABEL} (Low)\n`,
+        stderr: "",
+      };
+    };
+    let transportStarts = 0;
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      {
+        createTransport: () => {
+          const transport = transportFactory.create();
+          const start = transport.start;
+          return {
+            ...transport,
+            async start() {
+              transportStarts += 1;
+              return start();
+            },
+          };
         },
-      ],
-    });
-  });
-
-  it("never labels a consumed percentage as remaining", () => {
-    const snapshot = parseAntigravityUsageCommand(USAGE_COMMAND, FETCHED_AT);
-    const labels = (snapshot?.productUsage ?? []).map(({ product }) => product);
-    expect(labels).not.toHaveLength(0);
-    for (const label of labels) expect(label).not.toMatch(/remaining/iu);
-  });
-
-  it("keeps the quota snapshot valid against the Host credits contract", () => {
-    const snapshot = parseAntigravityUsageCommand(USAGE_COMMAND, FETCHED_AT);
-    expect(snapshot).not.toBeNull();
-    // The Host strips `fetchedAt` before validating against the strict schema.
-    const rest: Record<string, unknown> = { ...(snapshot as NonNullable<typeof snapshot>) };
-    delete rest.fetchedAt;
-    expect(accountCreditsSnapshotSchema.safeParse(rest).success).toBe(true);
-  });
-
-  it("rejects payloads that are not a /usage command result", () => {
-    expect(parseAntigravityUsageCommand({ name: "credits", data: {} })).toBeNull();
-    expect(parseAntigravityUsageCommand({ name: "usage", data: { groups: [] } })).toBeNull();
-    expect(
-      parseAntigravityUsageCommand({ name: "usage", data: { groups: [{ buckets: [{}] }] } }),
-    ).toBeNull();
-  });
-
-  it("reads quota from the dedicated --print=/usage invocation", async () => {
-    const calls: string[][] = [];
-    const stdout = [
-      JSON.stringify({ event: "command_result", command: USAGE_COMMAND }),
-      JSON.stringify({
-        event: "result",
-        result: { conversation_id: "", status: "SUCCESS", num_turns: 0 },
-      }),
-    ].join("\n");
-    const snapshot = await fetchAntigravityQuota((arguments_) => {
-      calls.push([...arguments_]);
-      return Promise.resolve(stdout);
-    }, new Date(FETCHED_AT));
-    expect(calls).toEqual([["--print=/usage", "--output-format", "stream-json"]]);
-    expect(snapshot).toMatchObject({ usedPercent: 2.65, periodType: "weekly" });
-  });
-
-  it("degrades to null when the CLI cannot answer /usage", async () => {
-    await expect(
-      fetchAntigravityQuota(() => Promise.reject(new Error("agy is not installed"))),
-    ).resolves.toBeNull();
-    await expect(fetchAntigravityQuota(() => Promise.resolve("not json"))).resolves.toBeNull();
-  });
-
-  it("recognises the headless permission denial the CLI reports as a tool error", () => {
-    const denial =
-      'permission check failed for command "Get-Location": user denied permission to run command:\nGet-Location';
-    expect(antigravityToolErrorMessage({ type: "TOOL_ERROR", message: denial })).toBe(denial);
-    expect(isAntigravityPermissionDenial(denial)).toBe(true);
-    expect(antigravityToolErrorMessage({ type: "TOOL_ERROR" })).toBeNull();
-    expect(isAntigravityPermissionDenial("file not found")).toBe(false);
-  });
-
-  it("redacts credentials echoed by the denied command line", () => {
-    const denial =
-      "permission check failed for command \"curl -H 'Authorization: Bearer sk-live-abc123' https://api.example.com\": " +
-      "user denied permission to run command";
-    const error = permissionDeniedTurnError("request-review", denial);
-    // The exact redaction shape belongs to sanitizeDiagnosticTail's own tests;
-    // what matters here is that the Adapter routes the denial through it.
-    expect(error.diagnostic).not.toContain("sk-live-abc123");
-    expect(error.diagnostic).toContain("[redacted]");
-    expect(error.message).toContain("'request-review'");
-    expect(error.retryable).toBe(false);
-  });
-
-  describe("Session Lifecycle & Tool Streaming", () => {
-    async function fakeStreamingAgy(streamLines: readonly string[]): Promise<{
-      command: string;
-      cwd: string;
-      cleanup(): Promise<void>;
-    }> {
-      const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-stream-"));
-      const cwd = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-stream-cwd-"));
-      const cleanup = async (): Promise<void> => {
-        for (const target of [directory, cwd]) {
-          await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-        }
-      };
-      const scriptContent = `
-const lines = ${JSON.stringify(streamLines)};
-if (process.argv.includes("models")) {
-  process.stdout.write("gemini-3.7-flash-high\\tGemini 3.7 Flash High\\n");
-  process.exit(0);
-}
-for (const line of lines) {
-  process.stdout.write(line + "\\n");
-}
-`;
-      const jsPath = path.join(directory, "agy.cjs");
-      await writeFile(jsPath, scriptContent);
-      if (process.platform === "win32") {
-        const command = path.join(directory, "agy.cmd");
-        await writeFile(command, `@node "${jsPath}" %*\r\n`);
-        return { command, cwd, cleanup };
-      }
-      const command = path.join(directory, "agy");
-      await writeFile(command, `#!/usr/bin/env node\n${scriptContent}`);
-      await chmod(command, 0o755);
-      return { command, cwd, cleanup };
+        listModels,
+      },
+    );
+    try {
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: root,
+        environment,
+        model: encodeAntigravityModelRef(MODEL),
+        thinkingOptionId: harnessThinkingOptionIdSchema.parse("low"),
+        permissionModeId: harnessPermissionModeIdSchema.parse("configured"),
+      });
+      expect(opened.ok).toBe(true);
+      expect(startsBeforeCatalog).toBe(1);
+      expect(transportStarts).toBe(1);
+      if (opened.ok) await opened.value.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
     }
+  });
 
-    async function nextEvent(iterator: AsyncIterator<HarnessOutput>): Promise<HostEvent> {
-      const result = await iterator.next();
-      if (result.done) throw new Error("Output stream ended unexpectedly");
-      if (result.value.kind !== "event") throw new Error("Expected an event output");
-      return result.value.event;
+  it("classifies authentication and login failures as authenticationRequired", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-auth-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      throw new Error("Authentication required: please run 'agy login' or sign in to continue");
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => fakeTransportFactory("inspect-auth").create(), listModels },
+    );
+    try {
+      const result = await adapter.inspect({ cwd: root });
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe("authenticationRequired");
+      }
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
     }
+  });
 
-    it("executes a turn projecting write_to_file, run_command, and agentMessage", async () => {
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "dangerously-skip-permissions" },
-          conversation_id: "conv-123",
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-123",
-            step_index: 1,
-            state: "ACTIVE",
-            step_type: "tool",
-            tool_name: "write_to_file",
-            tool_info: {
-              parameters: {
-                TargetFile: "test.ts",
-                CodeContent: "export const x = 42;\n",
-              },
-            },
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-123",
-            step_index: 1,
-            state: "DONE",
-            step_type: "tool",
-            duration_seconds: 0.2,
-            tool_info: { output: "File written" },
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-123",
-            step_index: 2,
-            state: "ACTIVE",
-            step_type: "tool",
-            tool_name: "run_command",
-            tool_info: {
-              parameters: {
-                CommandLine: "npm test",
-                Cwd: "/workspace",
-              },
-            },
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-123",
-            step_index: 2,
-            state: "DONE",
-            step_type: "tool",
-            duration_seconds: 1.5,
-            tool_info: { output: "PASS test.ts\n" },
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-123",
-            step_index: 3,
-            state: "ACTIVE",
-            step_type: "agent_response",
-            text_delta: "All tests passed!",
-          },
-        }),
-        JSON.stringify({
-          event: "result",
-          result: {
-            conversation_id: "conv-123",
-            status: "SUCCESS",
-            num_turns: 1,
-            response: "All tests passed!",
-          },
-        }),
-      ];
+  it("cools down repeated inspection failures until an explicit refresh", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "codexhost-antigravity-inspect-failure-cache-"),
+    );
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let listCalls = 0;
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      listCalls += 1;
+      throw new Error("Authentication required: please sign in to continue");
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => fakeTransportFactory("inspect-failure-cache").create(), listModels },
+    );
+    try {
+      await expect(adapter.inspect({ cwd: root })).resolves.toMatchObject({ status: "error" });
+      await expect(adapter.inspect({ cwd: root })).resolves.toMatchObject({ status: "error" });
+      expect(listCalls).toBe(1);
 
-      const { command, cwd, cleanup } = await fakeStreamingAgy(streamLines);
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
+      await expect(adapter.inspect({ cwd: root, refresh: true })).resolves.toMatchObject({
+        status: "error",
+      });
+      expect(listCalls).toBe(2);
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-1");
-
-        const executed = await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "Please create test.ts and run it" }],
-        });
-        expect(executed.ok).toBe(true);
-
-        // Event 1: turn.started
-        const turnStarted = await nextEvent(iterator);
-        expect(turnStarted).toEqual({ type: "turn.started", turnId });
-
-        // Event 2: session.state.changed (from init)
-        const stateChanged = await nextEvent(iterator);
-        expect(stateChanged.type).toBe("session.state.changed");
-
-        // Event 3: item.started for write_to_file. Without a reachable agy
-        // Language Server the applied patch is unknowable, so the step stays a
-        // Tool Execution instead of becoming an empty File Change card.
-        const fileStarted = await nextEvent(iterator);
-        expect(fileStarted).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: { type: "toolExecution", toolName: "write_to_file" },
-        });
-
-        // Event 4: item.completed for write_to_file
-        const fileCompleted = await nextEvent(iterator);
-        expect(fileCompleted).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: { type: "toolExecution", toolName: "write_to_file" },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        // Event 5: item.started for run_command (commandExecution)
-        const cmdStarted = await nextEvent(iterator);
-        expect(cmdStarted).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: {
-            type: "commandExecution",
-            command: "npm test",
-            cwd: "/workspace",
-          },
-        });
-
-        // Event 6: item.completed for run_command
-        const cmdCompleted = await nextEvent(iterator);
-        expect(cmdCompleted).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: {
-              type: "commandExecution",
-              command: "npm test",
-              output: "PASS test.ts\n",
-              exitCode: 0,
-              durationMs: 1500,
-            },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        // Event 7: item.started for agent response
-        const agentStarted = await nextEvent(iterator);
-        expect(agentStarted).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: {
-            type: "agentMessage",
-            text: "All tests passed!",
-          },
-        });
-
-        // Event 8: item.completed for agent response
-        const agentCompleted = await nextEvent(iterator);
-        expect(agentCompleted).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: {
-              type: "agentMessage",
-              text: "All tests passed!",
-            },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        // Event 9: turn.completed with succeeded
-        const turnCompleted = await nextEvent(iterator);
-        expect(turnCompleted).toMatchObject({
-          type: "turn.completed",
-          turnId,
-          outcome: { status: "succeeded" },
-        });
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
+  it("resumes session gracefully when active model differs from locator", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-resume-model-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transport = fakeTransportFactory("resume-model-diff", "gemini-flash");
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\ngemini-flash\tGemini Flash\n`,
+      stderr: "",
     });
-
-    it("emits turn.completed with failed outcome on CLI error", async () => {
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "default" },
-          conversation_id: "conv-err",
-        }),
-        JSON.stringify({
-          event: "result",
-          result: {
-            conversation_id: "conv-err",
-            status: "ERROR",
-            num_turns: 1,
-          },
-        }),
-      ];
-
-      const { command, cwd, cleanup } = await fakeStreamingAgy(streamLines);
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-err");
-
-        await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "trigger error" }],
-        });
-
-        const started = await nextEvent(iterator);
-        expect(started.type).toBe("turn.started");
-
-        const stateChanged = await nextEvent(iterator);
-        expect(stateChanged.type).toBe("session.state.changed");
-
-        const completed = await nextEvent(iterator);
-        expect(completed).toMatchObject({
-          type: "turn.completed",
-          turnId,
-          outcome: { status: "failed" },
-        });
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
-    });
-
-    it("emits turn.completed with cancelled outcome on session close while active", async () => {
-      // Stream that does not emit result immediately (simulates long turn)
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "default" },
-          conversation_id: "conv-close",
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-close",
-            step_index: 1,
-            state: "ACTIVE",
-            step_type: "agent_response",
-            text_delta: "Working on it...",
-          },
-        }),
-      ];
-
-      const { command, cwd, cleanup } = await fakeStreamingAgy(streamLines);
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-close");
-
-        await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "long running" }],
-        });
-
-        expect((await nextEvent(iterator)).type).toBe("turn.started");
-        expect((await nextEvent(iterator)).type).toBe("session.state.changed");
-        expect((await nextEvent(iterator)).type).toBe("item.started");
-
-        // Close session while active
-        await session.close();
-
-        const itemCompleted = await nextEvent(iterator);
-        expect(itemCompleted).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: { outcome: { status: "cancelled", reason: "Session closed" } },
-        });
-
-        const turnCompleted = await nextEvent(iterator);
-        expect(turnCompleted).toMatchObject({
-          type: "turn.completed",
-          turnId,
-          outcome: { status: "cancelled", reason: "Session closed" },
-        });
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
-    });
-
-    it("correctly handles cumulative text snapshots without duplicating text", async () => {
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "default" },
-          conversation_id: "conv-cumulative",
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-cumulative",
-            step_index: 1,
-            state: "ACTIVE",
-            step_type: "agent_response",
-            text: "Hello",
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-cumulative",
-            step_index: 2,
-            state: "DONE",
-            step_type: "agent_response",
-            text: "Hello world",
-          },
-        }),
-        JSON.stringify({
-          event: "result",
-          result: {
-            conversation_id: "conv-cumulative",
-            status: "SUCCESS",
-            num_turns: 1,
-            response: "Hello world!",
-          },
-        }),
-      ];
-
-      const { command, cwd, cleanup } = await fakeStreamingAgy(streamLines);
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-cumul");
-
-        await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "hi" }],
-        });
-
-        expect((await nextEvent(iterator)).type).toBe("turn.started");
-        expect((await nextEvent(iterator)).type).toBe("session.state.changed");
-
-        // Step 1: started with "Hello"
-        const started = await nextEvent(iterator);
-        expect(started).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: { type: "agentMessage", text: "Hello" },
-        });
-
-        // Step 2: updated with cumulative delta " world"
-        const updated1 = await nextEvent(iterator);
-        expect(updated1).toMatchObject({
-          type: "item.updated",
-          turnId,
-          update: { type: "text.append", text: " world" },
-        });
-
-        // Result: updated with cumulative delta "!"
-        const updated2 = await nextEvent(iterator);
-        expect(updated2).toMatchObject({
-          type: "item.updated",
-          turnId,
-          update: { type: "text.append", text: "!" },
-        });
-
-        // Completed item has final full text "Hello world!"
-        const completed = await nextEvent(iterator);
-        expect(completed).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: { type: "agentMessage", text: "Hello world!" },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
-    });
-
-    it("passes --add-dir <cwd> and strictly binds child process cwd to thread project directory", async () => {
-      const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-inspect-"));
-      const projectCwd = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-proj-"));
-      const capturedArgsFile = path.join(directory, "captured_args.json");
-      const cleanup = async (): Promise<void> => {
-        for (const target of [directory, projectCwd]) {
-          await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-        }
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport.create(), listModels },
+    );
+    try {
+      const nativeRef: NativeSessionRef = {
+        harnessId: harnessIdSchema.parse("antigravity"),
+        nativeSessionId: "resume-model-diff",
+        locator: { model: MODEL },
+        formatVersion: 1,
       };
+      const resumed = await adapter.open({
+        kind: "resume",
+        cwd: root,
+        environment,
+        nativeRef,
+      });
+      expect(resumed.ok).toBe(true);
+      if (!resumed.ok) throw new Error(resumed.error.message);
+      expect(resumed.value.initialState.nativeRef).toMatchObject({
+        locator: { skipPermissions: true },
+      });
+      expect(resumed.value.initialState.effectiveModel).toEqual(
+        encodeAntigravityModelRef("gemini-flash"),
+      );
+      await resumed.value.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "dangerously-skip-permissions" },
-          conversation_id: "conv-inspect-cwd",
-        }),
-        JSON.stringify({
-          event: "result",
-          result: {
-            conversation_id: "conv-inspect-cwd",
-            status: "SUCCESS",
-            num_turns: 1,
-            response: "done",
-          },
-        }),
-      ];
+  it("injects localhost and IPv6 loopback into NO_PROXY when proxy is present in environment", () => {
+    const envWithProxy = {
+      HTTP_PROXY: "http://proxy.internal:8080",
+      NO_PROXY: "corp.internal",
+    };
+    const resolved = resolveAntigravityProxyEnvironment(envWithProxy, "linux");
+    expect(resolved.NO_PROXY).toContain("corp.internal");
+    expect(resolved.NO_PROXY).toContain("127.0.0.1");
+    expect(resolved.NO_PROXY).toContain("localhost");
+    expect(resolved.NO_PROXY).toContain("::1");
+    expect(resolved.no_proxy).toEqual(resolved.NO_PROXY);
+  });
 
-      const scriptContent = `
-const fs = require("node:fs");
-const lines = ${JSON.stringify(streamLines)};
-if (process.argv.includes("models")) {
-  process.stdout.write("gemini-3.7-flash-high\\tGemini 3.7 Flash High\\n");
-  process.exit(0);
-}
-if (process.argv.some(a => a === "--print=/usage" || a.startsWith("--print=/"))) {
-  process.stdout.write(JSON.stringify({
-    event: "command_result",
-    command: { name: "usage", data: { groups: [] } }
-  }) + "\\n");
-  process.stdout.write(JSON.stringify({
-    event: "result",
-    result: { conversation_id: "conv-usage", status: "SUCCESS", num_turns: 0 }
-  }) + "\\n");
-  process.exit(0);
-}
-fs.writeFileSync(${JSON.stringify(capturedArgsFile)}, JSON.stringify({
-  argv: process.argv,
-  cwd: process.cwd(),
-}));
-for (const line of lines) {
-  process.stdout.write(line + "\\n");
-}
-setTimeout(() => { process.exit(0); }, 50);
-`;
-      const jsPath = path.join(directory, "agy.cjs");
-      await writeFile(jsPath, scriptContent);
-      let command: string;
-      if (process.platform === "win32") {
-        command = path.join(directory, "agy.cmd");
-        await writeFile(command, `@node "${jsPath}" %*\r\n`);
-      } else {
-        command = path.join(directory, "agy");
-        await writeFile(command, `#!/usr/bin/env node\n${scriptContent}`);
-        await chmod(command, 0o755);
+  it("handles model selection gracefully when transport normalizes model to alias", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-select-model-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transportFactory = fakeTransportFactory("select-model-test", MODEL);
+    const transport = transportFactory.create();
+    // Simulate CLI normalising "gemini-flash" to "gemini-3.7-flash"
+    transport.setModel = async () => ({
+      conversationId: "select-model-test",
+      cwd: root,
+      model: MODEL,
+    });
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\ngemini-flash\tGemini Flash\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport, listModels },
+    );
+    try {
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: root,
+        environment,
+        model: encodeAntigravityModelRef(MODEL),
+      });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+
+      // Select "gemini-flash", which CLI responds with canonical MODEL
+      const result = await session.execute({
+        type: "model.select",
+        model: encodeAntigravityModelRef("gemini-flash"),
+      });
+      expect(result.ok).toBe(true);
+
+      const snapshot = await session.readSnapshot();
+      expect(snapshot.ok).toBe(true);
+      if (snapshot.ok && snapshot.value.state) {
+        expect(snapshot.value.state.effectiveModel).toEqual(encodeAntigravityModelRef(MODEL));
       }
+      await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd: projectCwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-inspect-add-dir");
-        await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "inspect args" }],
-        });
-
-        expect((await nextEvent(iterator)).type).toBe("turn.started");
-        expect((await nextEvent(iterator)).type).toBe("session.state.changed");
-
-        const captured = JSON.parse(await readFile(capturedArgsFile, "utf8")) as {
-          argv: string[];
-          cwd: string;
+  it("preserves or defaults effort when switching models mid-session", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-switch-effort-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let capturedModel: string | undefined;
+    let capturedEffort: string | undefined;
+    const transport: AntigravityCliTransportLike = {
+      conversationId: "conv-switch-1",
+      logPath: null,
+      async start() {
+        return { conversationId: "conv-switch-1", cwd: root, model: "gemini-2.5-flash" };
+      },
+      async setModel(model: string, effort?: string) {
+        capturedModel = model;
+        capturedEffort = effort;
+        return { conversationId: "conv-switch-1", cwd: root, model };
+      },
+      async setEffort(effort: string | undefined) {
+        capturedEffort = effort;
+        return {
+          conversationId: "conv-switch-1",
+          cwd: root,
+          model: capturedModel ?? "gemini-2.5-flash",
         };
-
-        const addDirIndex = captured.argv.indexOf("--add-dir");
-        expect(addDirIndex).toBeGreaterThan(-1);
-        expect(captured.argv[addDirIndex + 1]).toBe(projectCwd);
-
-        // macOS exposes its temporary directory through `/var`, while a child
-        // process can report the same directory through the `/private/var`
-        // symlink target. Compare canonical filesystem paths rather than the
-        // two valid spellings.
-        const expectedResolvedCwd = (await realpath(projectCwd)).toLowerCase();
-        const actualResolvedCwd = (await realpath(captured.cwd)).toLowerCase();
-        expect(actualResolvedCwd).toBe(expectedResolvedCwd);
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
+      },
+      async setPermissionMode() {
+        return {
+          conversationId: "conv-switch-1",
+          cwd: root,
+          model: capturedModel ?? "gemini-2.5-flash",
+        };
+      },
+      async runTurn(_text, onStep) {
+        onStep({ stepType: "agent_response", textDelta: "ok" });
+        return { conversationId: "conv-switch-1", status: "SUCCESS", response: "ok", numTurns: 1 };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout:
+        "gemini-2.5-flash\tGemini 2.5 Flash\n" +
+        "gemini-3.7-flash-low\tGemini 3.7 Flash (Low)\n" +
+        "gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)\n" +
+        "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n" +
+        "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n" +
+        "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n" +
+        "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n",
+      stderr: "",
     });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport, listModels },
+    );
+    try {
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: root,
+        environment,
+        model: encodeAntigravityModelRef("gemini-3.8-flash"),
+        thinkingOptionId: harnessThinkingOptionIdSchema.parse("medium"),
+      });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
 
-    it("projects file steps as Tool Executions when the applied patch cannot be read", async () => {
-      const streamLines = [
-        JSON.stringify({
-          event: "init",
-          init: { permission_mode: "dangerously-skip-permissions" },
-          conversation_id: "conv-multi-diff",
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-multi-diff",
-            step_index: 1,
-            state: "DONE",
-            step_type: "tool",
-            tool_name: "write_to_file",
-            tool_info: {
-              parameters: {
-                TargetFile: "src/file1.ts",
-                CodeContent: "export const a = 1;\nexport const b = 2;\n",
-              },
-            },
-          },
-        }),
-        JSON.stringify({
-          event: "step_update",
-          step_update: {
-            conversation_id: "conv-multi-diff",
-            step_index: 2,
-            state: "DONE",
-            step_type: "tool",
-            tool_name: "replace_file_content",
-            tool_info: {
-              parameters: {
-                TargetFile: "src/file2.ts",
-                TargetContent: "old line 1\nold line 2\n",
-                ReplacementContent: "new line 1\nnew line 2\nnew line 3\n",
-              },
-            },
-          },
-        }),
-        JSON.stringify({
-          event: "result",
-          result: {
-            conversation_id: "conv-multi-diff",
-            status: "SUCCESS",
-            num_turns: 1,
-            response: "Files created and modified successfully.",
-          },
-        }),
-      ];
+      // Switch to gemini-3.7-flash: should retain "medium" effort
+      const res1 = await session.execute({
+        type: "model.select",
+        model: encodeAntigravityModelRef("gemini-3.7-flash"),
+      });
+      expect(res1.ok).toBe(true);
+      expect(capturedModel).toBe("gemini-3.7-flash");
+      expect(capturedEffort).toBe("medium");
 
-      const { command, cwd, cleanup } = await fakeStreamingAgy(streamLines);
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({ kind: "create", cwd });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
-        const turnId = hostTurnIdSchema.parse("turn-multi-diff");
-
-        await session.execute({
-          type: "turn.start",
-          turnId,
-          input: [{ type: "text", text: "modify multiple files" }],
-        });
-
-        expect((await nextEvent(iterator)).type).toBe("turn.started");
-        expect((await nextEvent(iterator)).type).toBe("session.state.changed");
-
-        // agy's stream never carries file content, so with no Language Server
-        // to read the applied patch from there is no diff to show — and the
-        // Adapter must not invent one.
-        const fc1Started = await nextEvent(iterator);
-        expect(fc1Started).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: { type: "toolExecution", toolName: "write_to_file" },
-        });
-        const fc1Completed = await nextEvent(iterator);
-        expect(fc1Completed).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: { type: "toolExecution", toolName: "write_to_file" },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        const fc2Started = await nextEvent(iterator);
-        expect(fc2Started).toMatchObject({
-          type: "item.started",
-          turnId,
-          item: { type: "toolExecution", toolName: "replace_file_content" },
-        });
-        const fc2Completed = await nextEvent(iterator);
-        expect(fc2Completed).toMatchObject({
-          type: "item.completed",
-          turnId,
-          snapshot: {
-            item: { type: "toolExecution", toolName: "replace_file_content" },
-            outcome: { status: "succeeded" },
-          },
-        });
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
-    });
-
-    it("dynamically switches between Gemini (1M) and Claude (200k) models within the same session", async () => {
-      const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-model-switch-"));
-      const cwd = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-model-switch-cwd-"));
-      const cleanup = async (): Promise<void> => {
-        for (const target of [directory, cwd]) {
-          await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-        }
-      };
-      const runsDir = path.join(directory, "runs");
-      const jsPath = path.join(directory, "agy.cjs");
-      const scriptContent = `
-const fs = require('fs');
-const path = require('path');
-if (process.argv.includes("models")) {
-  process.stdout.write("gemini-3.7-flash-high\\tGemini 3.7 Flash High\\nclaude-3-7-sonnet\\tClaude 3.7 Sonnet\\n");
-  process.exit(0);
-}
-const runsDir = ${JSON.stringify(runsDir)};
-fs.mkdirSync(runsDir, { recursive: true });
-const count = fs.readdirSync(runsDir).length;
-fs.writeFileSync(path.join(runsDir, "run-" + count + ".txt"), "");
-
-if (count === 0) {
-  process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 1, response: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120 } } }) + "\\n");
-} else if (count === 1) {
-  process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 2, response: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290 } } }) + "\\n");
-} else {
-  process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 3, state: "DONE", step_type: "agent_response", text_delta: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 3, response: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350 } } }) + "\\n");
-}
-`;
-      await writeFile(jsPath, scriptContent);
-      let command: string;
-      if (process.platform === "win32") {
-        command = path.join(directory, "agy.cmd");
-        await writeFile(command, `@node "${jsPath}" %*\r\n`);
-      } else {
-        command = path.join(directory, "agy");
-        await writeFile(command, `#!/usr/bin/env node\n${scriptContent}`);
-        await chmod(command, 0o755);
+      const snap1 = await session.readSnapshot();
+      expect(snap1.ok).toBe(true);
+      if (snap1.ok && snap1.value.state) {
+        expect(snap1.value.state.effectiveModel).toEqual(
+          encodeAntigravityModelRef("gemini-3.7-flash"),
+        );
+        expect(snap1.value.state.effectiveThinkingOptionId).toBe("medium");
       }
 
-      const adapter = new AntigravityAdapter({ command });
-      try {
-        const opened = await adapter.open({
-          kind: "create",
-          cwd,
-          model: harnessModelRefSchema.parse({ id: "gemini-3.7-flash-high" }),
-        });
-        expect(opened.ok).toBe(true);
-        if (!opened.ok) return;
-        const session = opened.value;
-        const iterator = session.outputs[Symbol.asyncIterator]();
+      // Now switch to gemini-2.5-flash (which does not support effort)
+      const res2 = await session.execute({
+        type: "model.select",
+        model: encodeAntigravityModelRef("gemini-2.5-flash"),
+      });
+      expect(res2.ok).toBe(true);
+      expect(capturedModel).toBe("gemini-2.5-flash");
+      expect(capturedEffort).toBeUndefined();
 
-        // Turn 1: Gemini (1M window)
-        const turn1Id = hostTurnIdSchema.parse("turn-switch-1");
-        await session.execute({
-          type: "turn.start",
-          turnId: turn1Id,
-          input: [{ type: "text", text: "hi gemini" }],
-        });
+      // Now switch back to gemini-3.7-flash: should default to strongest effort ("high")
+      const res3 = await session.execute({
+        type: "model.select",
+        model: encodeAntigravityModelRef("gemini-3.7-flash"),
+      });
+      expect(res3.ok).toBe(true);
+      expect(capturedModel).toBe("gemini-3.7-flash");
+      expect(capturedEffort).toBe("high");
 
-        let turn1Usage: Record<string, unknown> | null = null;
-        while (true) {
-          const ev = await nextEvent(iterator);
-          if (ev.type === "session.usage.changed") turn1Usage = ev.usage as Record<string, unknown>;
-          if (ev.type === "turn.completed") break;
-        }
-        expect(turn1Usage).not.toBeNull();
-        expect(turn1Usage?.contextWindowTokens).toBe(1_048_576);
-        expect(turn1Usage).not.toHaveProperty("cachedInputTokens");
-        expect(turn1Usage).not.toHaveProperty("cacheHitRatePercent");
-
-        // Switch to Claude (200k window)
-        const selectClaude = await session.execute({
-          type: "model.select",
-          model: harnessModelRefSchema.parse({ id: "claude-3-7-sonnet" }),
-        });
-        expect(selectClaude.ok).toBe(true);
-
-        // Turn 2: Claude
-        const turn2Id = hostTurnIdSchema.parse("turn-switch-2");
-        await session.execute({
-          type: "turn.start",
-          turnId: turn2Id,
-          input: [{ type: "text", text: "hi claude" }],
-        });
-
-        let turn2Usage: Record<string, unknown> | null = null;
-        while (true) {
-          const ev = await nextEvent(iterator);
-          if (ev.type === "session.usage.changed") turn2Usage = ev.usage as Record<string, unknown>;
-          if (ev.type === "turn.completed") break;
-        }
-        expect(turn2Usage).not.toBeNull();
-        expect(turn2Usage?.contextWindowTokens).toBe(200_000);
-
-        // Switch back to Gemini
-        const selectGemini = await session.execute({
-          type: "model.select",
-          model: harnessModelRefSchema.parse({ id: "gemini-3.7-flash-high" }),
-        });
-        expect(selectGemini.ok).toBe(true);
-
-        // Turn 3: Gemini
-        const turn3Id = hostTurnIdSchema.parse("turn-switch-3");
-        await session.execute({
-          type: "turn.start",
-          turnId: turn3Id,
-          input: [{ type: "text", text: "back to gemini" }],
-        });
-
-        let turn3Usage: Record<string, unknown> | null = null;
-        while (true) {
-          const ev = await nextEvent(iterator);
-          if (ev.type === "session.usage.changed") turn3Usage = ev.usage as Record<string, unknown>;
-          if (ev.type === "turn.completed") break;
-        }
-        expect(turn3Usage).not.toBeNull();
-        expect(turn3Usage?.contextWindowTokens).toBe(1_048_576);
-
-        await session.close();
-      } finally {
-        await adapter.close();
-        await cleanup();
-      }
-    });
-
-    it("formats turn prompt with workspace file instructions and leaves slash commands untouched", () => {
-      const normalPrompt = "Create a hello world python file";
-      const formatted = formatAntigravityTurnPrompt(normalPrompt);
-      expect(formatted).toBe(`${ANTIGRAVITY_WORKSPACE_FILE_INSTRUCTION}${normalPrompt}`);
-
-      const slashCommand = "/plan refactor authentication";
-      expect(formatAntigravityTurnPrompt(slashCommand)).toBe(slashCommand);
-
-      // Idempotency: does not double-inject if instruction already present
-      expect(formatAntigravityTurnPrompt(formatted)).toBe(formatted);
-    });
+      await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

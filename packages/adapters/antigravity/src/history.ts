@@ -1,379 +1,147 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-
-import type { HostSubagentState, HostThreadSnapshot } from "@codexhost/harness-adapter";
+import type {
+  HistoricalTurnOutcome,
+  HostAgentMessageItem,
+  HostItemOutcome,
+  HostThreadSnapshot,
+  HostTurnSnapshot,
+  HarnessSessionState,
+} from "@codexhost/harness-adapter";
 import {
-  harnessModelRefSchema,
-  harnessThinkingOptionIdSchema,
+  harnessIdSchema,
   hostItemIdSchema,
-  jsonValueSchema,
   nativeCheckpointRefSchema,
   nativeTurnRefSchema,
-  type HarnessModelRef,
-  type HarnessThinkingOptionId,
-  type JsonValue,
-  type NativeCheckpointRef,
-  type NativeTurnRef,
+  type HarnessId,
 } from "@codexhost/shared-contracts";
-import { z } from "zod";
 
-const HISTORY_VERSION = 1;
-const THREAD_ID_ENV = "CODEXHOST_THREAD_ID";
+import type { AntigravityLedgerData, AntigravityLedgerTurn } from "./ledger.js";
+import { encodeAntigravityModelRef } from "./model-catalog.js";
+import {
+  readAntigravityTranscript,
+  resolveAntigravityTranscriptPath,
+} from "./transcript.js";
 
-const harnessErrorSchema = z.strictObject({
-  code: z.string(),
-  message: z.string(),
-  retryable: z.boolean(),
-  diagnostic: z.string().optional(),
-  stage: z.string().optional(),
-  durationMs: z.number().optional(),
-  stderrTail: z.string().optional(),
-});
+const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
 
-const itemOutcomeSchema = z.union([
-  z.strictObject({ status: z.literal("succeeded") }),
-  z.strictObject({ status: z.literal("failed"), error: harnessErrorSchema }),
-  z.strictObject({ status: z.literal("cancelled"), reason: z.string().optional() }),
-]);
-
-const textContentSchema = z.strictObject({ type: z.literal("text"), text: z.string() });
-const imageContentSchema = z.strictObject({
-  type: z.literal("image"),
-  mimeType: z.string(),
-  base64Data: z.string(),
-});
-const hostItemSchema = z.discriminatedUnion("type", [
-  z.strictObject({ type: z.literal("agentMessage"), itemId: hostItemIdSchema, text: z.string() }),
-  z.strictObject({ type: z.literal("reasoning"), itemId: hostItemIdSchema, text: z.string() }),
-  z.strictObject({ type: z.literal("contextCompaction"), itemId: hostItemIdSchema }),
-  z.strictObject({
-    type: z.literal("commandExecution"),
-    itemId: hostItemIdSchema,
-    command: z.string(),
-    cwd: z.string().optional(),
-    output: z.string().optional(),
-    outputTruncated: z.boolean().optional(),
-    exitCode: z.number().nullable().optional(),
-    durationMs: z.number().optional(),
-  }),
-  z.strictObject({
-    type: z.literal("toolExecution"),
-    itemId: hostItemIdSchema,
-    toolName: z.string(),
-    namespace: z.string().optional(),
-    arguments: jsonValueSchema,
-    output: z
-      .strictObject({
-        content: z.array(z.union([textContentSchema, imageContentSchema])),
-        truncated: z.boolean().optional(),
-      })
-      .optional(),
-    durationMs: z.number().optional(),
-  }),
-  z.strictObject({
-    type: z.literal("fileChange"),
-    itemId: hostItemIdSchema,
-    changes: z.array(
-      z.strictObject({
-        path: z.string(),
-        kind: z.enum(["add", "update", "delete"]),
-        unifiedDiff: z.string(),
-      }),
-    ),
-  }),
-  z.strictObject({
-    type: z.literal("subagentDelegation"),
-    itemId: hostItemIdSchema,
-    operation: z.enum(["spawn", "send"]),
-    prompt: z.string().optional(),
-    subagents: z.array(
-      z.strictObject({
-        subagentId: z.string(),
-        nativeSubagentId: z.string().optional(),
-        description: z.string(),
-        role: z.string().optional(),
-        background: z.boolean(),
-        status: z.enum(["pending", "running", "completed", "failed", "interrupted"]),
-        resultSummary: z.string().optional(),
-      }),
-    ),
-  }),
-]);
-
-const turnOutcomeSchema = z.union([
-  z.strictObject({ status: z.literal("succeeded") }),
-  z.strictObject({ status: z.literal("failed"), error: harnessErrorSchema }),
-  z.strictObject({ status: z.literal("cancelled"), reason: z.string().optional() }),
-  z.strictObject({ status: z.literal("unknown"), reason: z.string() }),
-]);
-
-const turnSchema = z.strictObject({
-  nativeTurnRef: nativeTurnRefSchema,
-  checkpoint: nativeCheckpointRefSchema.optional(),
-  input: z.array(z.strictObject({ type: z.literal("text"), text: z.string() })),
-  items: z.array(z.strictObject({ item: hostItemSchema, outcome: itemOutcomeSchema })),
-  outcome: turnOutcomeSchema,
-  model: harnessModelRefSchema.optional(),
-});
-
-const historySchema = z.strictObject({
-  formatVersion: z.literal(HISTORY_VERSION),
-  nativeSessionId: z.string().min(1),
-  turns: z.array(turnSchema),
-  model: harnessModelRefSchema.optional(),
-  thinkingOptionId: harnessThinkingOptionIdSchema.optional(),
-});
-
-export type AntigravityTurn = HostThreadSnapshot["turns"][number];
-
-function historyRoot(environment: NodeJS.ProcessEnv): string {
-  const dataDirectory = environment.CODEXHOST_DATA_DIR;
-  return path.join(
-    dataDirectory ? path.resolve(dataDirectory) : path.join(os.homedir(), ".codexhost"),
-    "antigravity-history",
-  );
+function outcomeForTurn(turn: AntigravityLedgerTurn): HistoricalTurnOutcome {
+  if (turn.status === "succeeded") return { status: "succeeded" };
+  if (turn.status === "cancelled") {
+    return { status: "cancelled", reason: turn.error ?? "Cancelled by user" };
+  }
+  return {
+    status: "failed",
+    error: {
+      code: "nativeFailure",
+      message: turn.error ?? "Antigravity Turn failed",
+      retryable: false,
+    },
+  };
 }
 
-function safeThreadId(environment: NodeJS.ProcessEnv): string | null {
-  const threadId = (
-    environment[THREAD_ID_ENV] ?? environment.CODEXHOST_DELEGATION_THREAD_ID
-  )?.trim();
-  return threadId && /^[A-Za-z0-9._-]+$/u.test(threadId) ? threadId : null;
+function itemOutcome(outcome: HistoricalTurnOutcome): HostItemOutcome {
+  if (outcome.status === "failed") return { status: "failed", error: outcome.error };
+  if (outcome.status === "cancelled") {
+    return { status: "cancelled", ...(outcome.reason ? { reason: outcome.reason } : {}) };
+  }
+  return { status: "succeeded" };
 }
 
-function historyPath(environment: NodeJS.ProcessEnv): string | null {
-  const threadId = safeThreadId(environment);
-  return threadId ? path.join(historyRoot(environment), `${threadId}.json`) : null;
-}
-
-function jsonTurn(turn: AntigravityTurn): JsonValue {
-  return JSON.parse(JSON.stringify(turn)) as JsonValue;
-}
-
-export class AntigravityHistory {
-  readonly #file: string | null;
-  #nativeSessionId: string | null;
-  #turns: AntigravityTurn[];
-  #model: HarnessModelRef | undefined;
-  #thinkingOptionId: HarnessThinkingOptionId | undefined;
-  #write: Promise<void> = Promise.resolve();
-
-  private constructor(input: {
-    file: string | null;
-    nativeSessionId: string | null;
-    turns: AntigravityTurn[];
-    model?: HarnessModelRef;
-    thinkingOptionId?: HarnessThinkingOptionId;
-  }) {
-    this.#file = input.file;
-    this.#nativeSessionId = input.nativeSessionId;
-    this.#turns = input.turns;
-    this.#model = input.model;
-    this.#thinkingOptionId = input.thinkingOptionId;
-  }
-
-  static async open(input: {
-    environment: NodeJS.ProcessEnv;
-    nativeSessionId?: string;
-    knownTurnRefs?: NativeTurnRef[];
-  }): Promise<AntigravityHistory> {
-    const file = historyPath(input.environment);
-    const nativeSessionId = input.nativeSessionId ?? null;
-    let turns: AntigravityTurn[] = [];
-    let model: HarnessModelRef | undefined;
-    let thinkingOptionId: HarnessThinkingOptionId | undefined;
-    if (file && nativeSessionId) {
-      try {
-        const parsed = historySchema.safeParse(JSON.parse(await readFile(file, "utf8")));
-        if (parsed.success && parsed.data.nativeSessionId === nativeSessionId) {
-          turns = parsed.data.turns as AntigravityTurn[];
-          model = parsed.data.model;
-          thinkingOptionId = parsed.data.thinkingOptionId;
-        }
-      } catch {
-        // A missing or corrupt sidecar cannot safely be treated as Native history.
-      }
-    }
-    if (turns.length === 0 && input.knownTurnRefs) {
-      turns = input.knownTurnRefs.map((nativeTurnRef) => ({
-        nativeTurnRef,
-        input: [],
-        items: [],
-        outcome: {
-          status: "unknown",
-          reason: "Antigravity CLI does not expose persisted assistant history to headless clients",
-        },
-      }));
-    }
-    return new AntigravityHistory({
-      file,
-      nativeSessionId,
-      turns,
-      ...(model ? { model } : {}),
-      ...(thinkingOptionId ? { thinkingOptionId } : {}),
-    });
-  }
-
-  static async createDerived(input: {
-    environment: NodeJS.ProcessEnv;
-    nativeSessionId: string;
-    turns: AntigravityTurn[];
-    model?: HarnessModelRef;
-    thinkingOptionId?: HarnessThinkingOptionId;
-  }): Promise<AntigravityHistory> {
-    const file = historyPath(input.environment);
-    const history = new AntigravityHistory({
-      file,
-      nativeSessionId: input.nativeSessionId,
-      turns: input.turns,
-      ...(input.model ? { model: input.model } : {}),
-      ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
-    });
-    history.#queueWrite();
-    await history.flush();
-    return history;
-  }
-
-  static async findByNativeSessionId(
-    environment: NodeJS.ProcessEnv,
-    nativeSessionId: string,
-  ): Promise<AntigravityHistory | null> {
-    const root = historyRoot(environment);
-    let entries: string[];
-    try {
-      entries = await readdir(root);
-    } catch {
-      return null;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith(".json")) continue;
-      const file = path.join(root, entry);
-      try {
-        const parsed = historySchema.safeParse(JSON.parse(await readFile(file, "utf8")));
-        if (parsed.success && parsed.data.nativeSessionId === nativeSessionId) {
-          return new AntigravityHistory({
-            file,
-            nativeSessionId: parsed.data.nativeSessionId,
-            turns: parsed.data.turns as AntigravityTurn[],
-            ...(parsed.data.model ? { model: parsed.data.model } : {}),
-            ...(parsed.data.thinkingOptionId
-              ? { thinkingOptionId: parsed.data.thinkingOptionId }
-              : {}),
-          });
-        }
-      } catch {
-        // A missing or corrupt sidecar cannot safely be treated as Native history.
-      }
-    }
-    return null;
-  }
-
-  get model(): HarnessModelRef | undefined {
-    return this.#model;
-  }
-
-  get thinkingOptionId(): HarnessThinkingOptionId | undefined {
-    return this.#thinkingOptionId;
-  }
-
-  snapshot(): AntigravityTurn[] {
-    return [...this.#turns];
-  }
-
-  updateSubagent(state: HostSubagentState): void {
-    let changed = false;
-    this.#turns = this.#turns.map((turn) => ({
-      ...turn,
-      items: turn.items.map((snapshot) => {
-        if (snapshot.item.type !== "subagentDelegation") return snapshot;
-        const subagents = snapshot.item.subagents.map((previous) => {
-          if (previous.nativeSubagentId !== state.nativeSubagentId) return previous;
-          if (JSON.stringify(previous) === JSON.stringify(state)) return previous;
-          changed = true;
-          return state;
-        });
-        return { ...snapshot, item: { ...snapshot.item, subagents } };
-      }),
-    }));
-    if (changed) this.#queueWrite();
-  }
-
-  bindNativeSession(nativeSessionId: string): void {
-    if (this.#nativeSessionId && this.#nativeSessionId !== nativeSessionId) {
-      this.#turns = [];
-    }
-    this.#nativeSessionId = nativeSessionId;
-    this.#queueWrite();
-  }
-
-  setSelection(
-    model: HarnessModelRef | undefined,
-    thinkingOptionId: HarnessThinkingOptionId | undefined,
-  ): void {
-    this.#model = model;
-    this.#thinkingOptionId = thinkingOptionId;
-    this.#queueWrite();
-  }
-
-  append(input: {
-    nativeTurnRef: NativeTurnRef;
-    checkpoint?: NativeCheckpointRef;
-    turnInput: AntigravityTurn["input"];
-    items: AntigravityTurn["items"];
-    outcome: AntigravityTurn["outcome"];
-    model?: HarnessModelRef;
-  }): void {
-    const turn: AntigravityTurn = {
-      nativeTurnRef: input.nativeTurnRef,
-      ...(input.checkpoint ? { checkpoint: input.checkpoint } : {}),
-      input: input.turnInput,
-      items: input.items,
-      outcome: input.outcome,
-      ...(input.model ? { model: input.model } : {}),
+function turnSnapshot(sessionId: string, turn: AntigravityLedgerTurn): HostTurnSnapshot {
+  const nativeTurnRef = nativeTurnRefSchema.parse({
+    harnessId: antigravityHarnessId,
+    nativeSessionId: sessionId,
+    nativeTurnKey: turn.nativeTurnKey,
+    formatVersion: 1,
+  });
+  const checkpoint = nativeCheckpointRefSchema.parse({
+    harnessId: antigravityHarnessId,
+    nativeSessionId: sessionId,
+    checkpointId: turn.nativeTurnKey,
+    formatVersion: 1,
+  });
+  const outcome = outcomeForTurn(turn);
+  const items: HostTurnSnapshot["items"] = [];
+  if (turn.response.length > 0) {
+    const item: HostAgentMessageItem = {
+      type: "agentMessage",
+      itemId: hostItemIdSchema.parse(`antigravity:${turn.nativeTurnKey}:agent`),
+      text: turn.response,
     };
-    const index = this.#turns.findIndex(
-      ({ nativeTurnRef }) => nativeTurnRef.nativeTurnKey === input.nativeTurnRef.nativeTurnKey,
-    );
-    if (index >= 0) this.#turns[index] = turn;
-    else this.#turns.push(turn);
-    this.#queueWrite();
+    items.push({ item, outcome: itemOutcome(outcome) });
   }
+  return {
+    nativeTurnRef,
+    checkpoint,
+    input: [{ type: "text", text: turn.input }],
+    items,
+    outcome,
+    ...(turn.modelSlug ? { model: encodeAntigravityModelRef(turn.modelSlug) } : {}),
+  };
+}
 
-  async flush(): Promise<void> {
-    await this.#write;
-  }
+export function mapAntigravitySnapshot(
+  data: AntigravityLedgerData,
+  state: HarnessSessionState,
+): HostThreadSnapshot {
+  return {
+    turns: data.turns.map((turn) => turnSnapshot(data.conversationId, turn)),
+    state,
+  };
+}
 
-  #queueWrite(): void {
-    if (!this.#file || !this.#nativeSessionId) return;
-    const file = this.#file;
-    const nativeSessionId = this.#nativeSessionId;
-    const turns = this.#turns.map(jsonTurn);
-    const model = this.#model;
-    const thinkingOptionId = this.#thinkingOptionId;
-    this.#write = this.#write
-      .catch(() => undefined)
-      .then(async () => {
-        const directory = path.dirname(file);
-        await mkdir(directory, { recursive: true, mode: 0o700 });
-        const temporary = path.join(directory, `.${path.basename(file)}.${randomUUID()}.tmp`);
-        try {
-          await writeFile(
-            temporary,
-            `${JSON.stringify({
-              formatVersion: HISTORY_VERSION,
-              nativeSessionId,
-              turns,
-              ...(model ? { model } : {}),
-              ...(thinkingOptionId ? { thinkingOptionId } : {}),
-            })}\n`,
-            { mode: 0o600 },
-          );
-          await rename(temporary, file);
-        } finally {
-          await rm(temporary, { force: true }).catch(() => undefined);
-        }
-      });
+export function mergeAntigravityHistoryTurns(
+  nativeTurns: readonly HostTurnSnapshot[],
+  sidecarTurns: readonly HostTurnSnapshot[],
+): HostTurnSnapshot[] {
+  if (nativeTurns.length === 0) return [...sidecarTurns];
+  const byKey = new Map<string, HostTurnSnapshot>();
+  for (const turn of nativeTurns) byKey.set(turn.nativeTurnRef.nativeTurnKey, turn);
+  for (const turn of sidecarTurns) {
+    const key = turn.nativeTurnRef.nativeTurnKey;
+    if (!byKey.has(key)) byKey.set(key, turn);
   }
+  return [...byKey.values()].sort((a, b) => {
+    const indexA = nativeTurnIndex(a);
+    const indexB = nativeTurnIndex(b);
+    if (indexA !== indexB) return indexA - indexB;
+    return a.nativeTurnRef.nativeTurnKey.localeCompare(b.nativeTurnRef.nativeTurnKey);
+  });
+}
+
+function nativeTurnIndex(turn: HostTurnSnapshot): number {
+  const match = /:turn:(\d+)$/u.exec(turn.nativeTurnRef.nativeTurnKey);
+  return match ? Number.parseInt(match[1], 10) : Number.MAX_SAFE_INTEGER;
+}
+
+export async function loadAntigravitySnapshot(
+  conversationId: string,
+  state: HarnessSessionState,
+  options: {
+    cwd?: string;
+    environment?: NodeJS.ProcessEnv;
+    fallbackLedger?: () => Promise<AntigravityLedgerData | null>;
+  } = {},
+): Promise<HostThreadSnapshot | null> {
+  const transcriptPath = resolveAntigravityTranscriptPath(
+    conversationId,
+    options.environment ?? process.env,
+  );
+  const transcriptTurns = await readAntigravityTranscript(
+    transcriptPath,
+    conversationId,
+    options.cwd,
+  );
+  if (transcriptTurns && transcriptTurns.length > 0) {
+    return {
+      turns: transcriptTurns,
+      state,
+    };
+  }
+  if (options.fallbackLedger) {
+    const ledgerData = await options.fallbackLedger();
+    if (ledgerData) {
+      return mapAntigravitySnapshot(ledgerData, state);
+    }
+  }
+  return null;
 }

@@ -4,23 +4,16 @@
   "private": true,
   "type": "module",
   "files": [
-    "dist",
-    "manifest.json",
-    "assets"
+    "dist"
   ],
   "exports": {
-    "./plugin": {
-      "types": "./dist/plugin.d.ts",
-      "import": "./dist/plugin.js"
-    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
   "scripts": {
-    "build": "tsc -b",
-    "test": "vitest run test"
+    "build": "tsc -b"
   },
   "dependencies": {
     "@codexhost/harness-adapter": "0.0.0",

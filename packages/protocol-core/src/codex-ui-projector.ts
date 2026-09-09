@@ -623,6 +623,7 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
         id: `${turnId}-user`,
         type: "userMessage",
         clientId: null,
+        // Desktop reads text_elements when restoring user messages, even for plain text.
         content: snapshot.input.map(({ text }) => ({ type: "text", text, text_elements: [] })),
       },
       ...snapshot.items.flatMap(({ item, outcome }) => {
@@ -1105,12 +1106,100 @@ export class CodexTurnProjector {
   }
 
   #completeTurn(event: TurnCompletedEvent, completedAtMs: number): CodexTurnProjection {
-    this.#requireStarted();
-    if (this.#interactions.size > 0) {
-      throw new Error("Host Turn completed with pending Interactions");
+    const isAborted = event.outcome.status === "failed" || event.outcome.status === "cancelled";
+    const messages: JsonObject[] = [];
+
+    if (!this.#started) {
+      if (isAborted) {
+        messages.push(...this.#startTurn().messages);
+      } else {
+        this.#requireStarted();
+      }
     }
+
+    if (this.#interactions.size > 0) {
+      if (!isAborted) {
+        throw new Error("Host Turn completed with pending Interactions");
+      }
+      for (const [, interaction] of this.#interactions) {
+        if (interaction.type === "question" && interaction.syntheticItem) {
+          const projected = this.#activeItem(interaction.itemId);
+          projected.outcome = { status: "cancelled", reason: "Turn aborted" };
+          const startedAtMs = projected.startedAtMs ?? completedAtMs;
+          const durationMs = resolvedItemDurationMs(projected.item, startedAtMs, completedAtMs);
+          projected.item = withResolvedDuration(projected.item, durationMs);
+          projected.durationMs = durationMs;
+          if (projected.wireStarted) {
+            messages.push({
+              method: "item/completed",
+              emittedAtMs: completedAtMs,
+              params: {
+                threadId: this.#threadId,
+                turnId: this.#turnId,
+                startedAtMs,
+                completedAtMs,
+                item: projectItem(projected.item, projected.outcome, this.#cwd, false, this.#threadId),
+              },
+            });
+          }
+        }
+      }
+      this.#interactions.clear();
+    }
+
     const active = [...this.#items.values()].filter(({ outcome }) => outcome === null);
-    if (active.length > 0) throw new Error("Host Turn completed with active Items");
+    if (active.length > 0) {
+      if (!isAborted) {
+        throw new Error("Host Turn completed with active Items");
+      }
+      for (const projected of active) {
+        const startedAtMs = projected.startedAtMs ?? completedAtMs;
+        const durationMs = resolvedItemDurationMs(projected.item, startedAtMs, completedAtMs);
+        projected.item = withResolvedDuration(projected.item, durationMs);
+        projected.outcome =
+          event.outcome.status === "cancelled"
+            ? { status: "cancelled", reason: event.outcome.reason ?? "Turn interrupted" }
+            : event.outcome.status === "failed"
+              ? { status: "failed", error: event.outcome.error }
+              : { status: "cancelled", reason: "Turn interrupted" };
+        projected.durationMs = durationMs;
+        if (projected.wireStarted) {
+          const fileItem = wireFileChangeItem(projected);
+          messages.push({
+            method: "item/completed",
+            emittedAtMs: completedAtMs,
+            params: {
+              threadId: this.#threadId,
+              turnId: this.#turnId,
+              startedAtMs,
+              completedAtMs,
+              item: projectItem(
+                fileItem ?? projected.item,
+                projected.outcome,
+                this.#cwd,
+                !projected.streamedCommandOutput,
+                this.#threadId,
+              ),
+            },
+          });
+          if (projected.item.type === "reasoning") {
+            const reasoning = projected.item;
+            messages.push({
+              method: "item/completed",
+              emittedAtMs: completedAtMs,
+              params: {
+                threadId: this.#threadId,
+                turnId: this.#turnId,
+                startedAtMs,
+                completedAtMs,
+                item: projectReasoningTranscriptItem(reasoning, projected.outcome, this.#cwd, durationMs),
+              },
+            });
+          }
+        }
+      }
+    }
+
     this.#completed = true;
     const completedAt = Math.floor(completedAtMs / 1000);
     const error = turnError(event.outcome);
@@ -1152,6 +1241,7 @@ export class CodexTurnProjector {
     return {
       completedTurn: turn,
       messages: [
+        ...messages,
         ...(error
           ? [
               {

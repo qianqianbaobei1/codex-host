@@ -1,39 +1,32 @@
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink } from "node:fs/promises";
-import https from "node:https";
-import os from "node:os";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
-import readline from "node:readline";
-import type { Readable, Writable } from "node:stream";
 
 import {
   HarnessOutputChannel,
-  sanitizeDiagnosticTail,
+  parseHostUsage,
   type HarnessAdapter,
   type HarnessError,
-  type HarnessCommandAccepted,
-  type HarnessCommandCapability,
-  type HarnessCommandInvocation,
   type HarnessInspection,
-  type HarnessModelCatalog,
-  type HarnessModelRef,
   type HarnessOutput,
   type HarnessResult,
   type HarnessSession,
   type HarnessSessionCapabilities,
   type HarnessSessionState,
-  type InspectHarnessInput,
   type HostAgentMessageItem,
-  type HostCommand,
-  type HostEvent,
-  type HostFileChange,
+  type HostFileChangeItem,
   type HostItem,
   type HostItemOutcome,
   type HostItemSnapshot,
-  type HostSubagentState,
+  type HostEvent,
+  type HostReasoningItem,
+  type HostToolExecutionItem,
+  type HostToolOutput,
   type HostThreadSnapshot,
   type HostUsage,
+  type InspectHarnessInput,
   type InteractionRespondAccepted,
   type InteractionRespondCommand,
   type ModelSelectCommand,
@@ -48,186 +41,181 @@ import {
   type TurnOutcome,
   type TurnStartAccepted,
   type TurnStartCommand,
+  type ResumeSessionInput,
 } from "@codexhost/harness-adapter";
-import { commandInvocation } from "@codexhost/harness-discovery";
 import {
   harnessIdSchema,
-  harnessModelRefSchema,
+  harnessInspectionSchema,
   harnessThinkingOptionIdSchema,
   hostItemIdSchema,
-  nativeCheckpointRefSchema,
+  jsonValueSchema,
   nativeSessionRefSchema,
   nativeTurnRefSchema,
   type HarnessId,
-  type HarnessAccountSnapshot,
-  type HarnessPermissionModeId,
+  type HarnessModelRef,
   type HarnessThinkingOptionId,
-  type HostItemId,
+  type JsonValue,
   type NativeSessionRef,
-  type NativeTurnRef,
+  type AccountCreditsSnapshot,
 } from "@codexhost/shared-contracts";
 
-import { resolveAntigravityExecutable } from "./command.js";
-import { forkAntigravitySession } from "./fork.js";
-import { AntigravityHistory } from "./history.js";
 import {
+  antigravityModelsInvocation,
+  AntigravityExecutableError,
+  resolveAntigravityExecutable,
+  resolveAntigravityProxyEnvironment,
+} from "./command.js";
+import { readAntigravityCreditsSync } from "./credits.js";
+import { pollAntigravityContextUsage } from "./context-usage.js";
+import { projectAntigravityFileChange } from "./file-change.js";
+import {
+  loadAntigravitySnapshot,
+  mergeAntigravityHistoryTurns,
+} from "./history.js";
+import { AntigravityHistory } from "./history-sidecar.js";
+import { AntigravitySessionLedger, type AntigravityLedgerTurn } from "./ledger.js";
+import { readSelectedPluginSkillPrompt } from "./plugin-bridge.js";
+import {
+  decodeAntigravityModelRef,
+  encodeAntigravityModelRef,
+  modelBySlug,
+  normalizeAntigravityModelCatalog,
+  parseAntigravityModelsOutput,
   antigravityAvailableThinkingOptions,
-  antigravityModelArguments,
-  parseAntigravityModels,
+  modelAcceptsThinking,
+  type AntigravityNativeModel,
 } from "./model-catalog.js";
 import {
   ANTIGRAVITY_PERMISSION_MODE_CATALOG,
   decodeAntigravityPermissionModeId,
   type AntigravityPermissionMode,
 } from "./permission-modes.js";
-import { rollbackAntigravityLastTurn } from "./rollback.js";
-import { ANTIGRAVITY_COMMAND_CATALOG, parseAndFormatAntigravityCommand } from "./slash-commands.js";
+import { fetchAntigravityQuota } from "./quota.js";
+import { antigravityToolErrorMessage, isAntigravityPermissionDenial } from "./stream-events.js";
+import { parseToolArgs } from "./transcript.js";
 import {
-  codeActionFileChange,
-  requestAntigravityTrajectorySteps,
-  type AntigravityCodeAction,
-} from "./code-action-diff.js";
-import { fetchAntigravityQuota, type AntigravityQuotaSnapshot } from "./quota.js";
-import { AntigravityQuestionBridge } from "./question-bridge.js";
-import { AntigravitySubagents } from "./subagents.js";
-import { nativeSubagentIdSchema, readSubagentTranscript } from "./subagent-transcript.js";
-import {
-  antigravityToolErrorMessage,
-  isAntigravityPermissionDenial,
-  isRecord,
-  parseAntigravityStreamLine,
+  AntigravityCliTransport,
+  AntigravityTransportError,
+  signalAntigravityProcessGroup,
+  type AntigravityInitEvent,
   type AntigravityResultEvent,
-  type AntigravityStepUpdateEvent,
-  type AntigravityStreamEvent,
-  type AntigravityUsage,
-} from "./stream-events.js";
-import {
-  completeAntigravityToolItem,
-  isAntigravityFileMutatingTool,
-  startAntigravityToolItem,
-  toolTargetFile,
-} from "./tool-projection.js";
+  type AntigravityStepUpdate,
+  type AntigravityTransportOptions,
+} from "./transport.js";
 
 export interface AntigravityAdapterOptions {
   command?: string;
   environment?: NodeJS.ProcessEnv;
-  inspectTimeoutMs?: number;
+  startupTimeoutMs?: number;
+  turnTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  turnDeadlineMs?: number;
+  /** How long an unused logical Session may keep its native process warm. */
+  sessionIdleTimeoutMs?: number;
+  closeTimeoutMs?: number;
   printTimeout?: string;
   toolOutputLimit?: number;
 }
 
-interface ActiveTurn {
-  command: TurnStartCommand;
-  process: ChildProcessByStdio<Writable, Readable, Readable>;
-  exited: Promise<void>;
-  questions: AntigravityQuestionBridge;
-  subagents: AntigravitySubagents;
-  logPath: string;
-  agentItem: HostAgentMessageItem | null;
-  agentText: string;
-  tools: Map<number, HostItem>;
-  completedItems: HostItemSnapshot[];
+export interface AntigravityModelsResult {
+  stdout: string;
   stderr: string;
-  cancellationRequested: boolean;
-  receivedResult: boolean;
-  /** agy's own effective permission mode, as reported by the `init` event. */
-  nativePermissionMode: string | null;
-  /** First tool denial of the Turn, kept to explain an otherwise empty result. */
-  permissionDenial: string | null;
-  latestUsage: HostUsage | null;
-  contextUsagePromise: Promise<Pick<
-    HostUsage,
-    "contextUsedTokens" | "contextWindowTokens"
-  > | null> | null;
-  /**
-   * Serializes stream handling: resolving a real edit diff needs an awaited
-   * Language Server round trip, and Items must still reach the Host in the
-   * order agy reported them.
-   */
-  queue: Promise<void>;
-  /** Applied edits already claimed by a tool step, so a repeat edit of the
-   * same file maps to the next recorded Code Action rather than the first. */
-  codeActionCursor: number;
-  fileChanges: Map<number, HostFileChange>;
-  /** First sighting of a step whose Item was deferred: agy names the tool and
-   * its parameters when the step opens, not when it ends. */
-  pendingSteps: Map<number, AntigravityStepUpdateEvent["step_update"]>;
-  httpsPort: number | null;
 }
 
-const antigravityHarnessId = harnessIdSchema.parse("antigravity");
-const DEFAULT_INSPECT_TIMEOUT_MS = 20_000;
-const DEFAULT_PRINT_TIMEOUT = "30m";
+export interface AntigravityAdapterDependencies {
+  createTransport(options: AntigravityTransportOptions): AntigravityCliTransportLike;
+  listModels(input: {
+    cwd: string;
+    command?: string;
+    environment: NodeJS.ProcessEnv;
+  }): Promise<AntigravityModelsResult>;
+}
+
+export interface AntigravityCliTransportLike {
+  readonly conversationId: string | undefined;
+  readonly effort?: string | undefined;
+  readonly stderrTail?: string;
+  /** Path of the CLI `--log-file` when one is active (context-usage discovery). */
+  readonly logPath: string | null;
+  start(): Promise<AntigravityInitEvent>;
+  setModel(model: string, effort?: string): Promise<AntigravityInitEvent>;
+  setEffort(effort: string | undefined): Promise<AntigravityInitEvent>;
+  setPermissionMode(skipPermissions: boolean): Promise<AntigravityInitEvent>;
+  runTurn(
+    text: string,
+    onStep: (step: AntigravityStepUpdate) => void,
+  ): Promise<AntigravityResultEvent>;
+  cancel(): Promise<void>;
+  /** Stop the native process while keeping this logical Session restartable. */
+  hibernate?(): Promise<void>;
+  close(): Promise<void>;
+}
+
+const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
 const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
-const CONTEXT_USAGE_TIMEOUT_MS = 8_000;
-const CONTEXT_USAGE_RETRY_MS = 100;
-const TRAJECTORY_TIMEOUT_MS = 2_000;
-const GEMINI_CONTEXT_WINDOW_TOKENS = 1_048_576;
-const CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
+const DEFAULT_MODELS_TIMEOUT_MS = 30_000;
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
+// Quota is telemetry; it must not compete with Session startup or every open.
+const CREDITS_REFRESH_COOLDOWN_MS = 60_000;
+// Do not turn an upstream auth/network failure into a probe storm. An explicit
+// refresh still bypasses this window immediately after login or recovery.
+const INSPECTION_FAILURE_COOLDOWN_MS = 15_000;
+/** After a failed context probe, skip further probes on the same log for a while. */
+const CONTEXT_PROBE_BACKOFF_MS = 60_000;
+const PERSISTED_INSPECTION_VERSION = 1;
+const PERSISTED_INSPECTION_MAX_AGE_MS = 6 * 60 * 60_000;
 
-/**
- * agy names a tool and its parameters when a step opens and repeats only what
- * changed when it ends, so a step whose Item was deferred has to carry that
- * opening detail forward.
- */
-function mergePendingStep(
-  pending: AntigravityStepUpdateEvent["step_update"] | undefined,
-  step: AntigravityStepUpdateEvent["step_update"],
-): AntigravityStepUpdateEvent["step_update"] {
-  if (!pending) return step;
-  const toolName = step.tool_name ?? pending.tool_name;
-  const name = step.tool_info?.name ?? pending.tool_info?.name;
-  const parameters = step.tool_info?.parameters ?? pending.tool_info?.parameters;
-  const output = step.tool_info?.output ?? pending.tool_info?.output;
-  const error = step.tool_info?.error ?? pending.tool_info?.error;
-  return {
-    ...pending,
-    ...step,
-    ...(toolName !== undefined ? { tool_name: toolName } : {}),
-    ...(step.tool_info !== undefined || pending.tool_info !== undefined
-      ? {
-          tool_info: {
-            ...(name !== undefined ? { name } : {}),
-            ...(parameters !== undefined ? { parameters } : {}),
-            ...(output !== undefined ? { output } : {}),
-            ...(error !== undefined ? { error } : {}),
-          },
-        }
-      : {}),
-  };
+function processHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
 }
 
-/**
- * agy reports a tool target with the platform's own separators while its
- * trajectory reports a `file://` URI, so the two only compare after both are
- * resolved — case-insensitively where the filesystem is.
- */
-function sameFile(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+function waitForProbeExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (processHasExited(child)) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (): void => {
+      if (timer) clearTimeout(timer);
+      child.off("exit", finish);
+      resolve();
+    };
+    child.once("exit", finish);
+    timer = setTimeout(finish, timeoutMs);
+  });
 }
 
-export function resolveAntigravityContextWindow(modelId?: string, reportedWindow?: number): number {
-  if (modelId && /^claude(?:[-_.]|$)/iu.test(modelId)) {
-    return CLAUDE_CONTEXT_WINDOW_TOKENS;
+async function terminateProbe(child: ChildProcess): Promise<void> {
+  if (processHasExited(child)) return;
+  signalAntigravityProcessGroup(child.pid, "SIGTERM");
+  await waitForProbeExit(child, 2_000);
+  if (!processHasExited(child)) {
+    signalAntigravityProcessGroup(child.pid, "SIGKILL");
+    await waitForProbeExit(child, 2_000);
   }
-  if (!modelId || /^gemini(?:[-_.]|$)/iu.test(modelId)) {
-    return GEMINI_CONTEXT_WINDOW_TOKENS;
-  }
-  return reportedWindow && reportedWindow > 0 ? reportedWindow : GEMINI_CONTEXT_WINDOW_TOKENS;
 }
 
-const CAPABILITIES: HarnessSessionCapabilities = {
+const ANTIGRAVITY_CAPABILITIES: HarnessSessionCapabilities = {
   configuration: {
     selectModel: true,
     selectThinkingOption: true,
     selectPermissionMode: true,
     permissionModeScope: "live",
   },
-  history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
-  subagents: { observe: true, readTranscript: true },
+  history: { fork: false, forkAcrossCwd: false, rollbackLastTurn: false },
+  subagents: { observe: false, readTranscript: false },
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -237,1059 +225,747 @@ function invalidState(message: string): HarnessError {
   return { code: "invalidState", message, retryable: false };
 }
 
-export const ANTIGRAVITY_WORKSPACE_FILE_INSTRUCTION =
-  "[System Instruction: When creating new files in the workspace, you MUST use the write_to_file tool. When modifying existing files, use the replace_file_content tool. CRITICAL: NEVER include ArtifactMetadata when calling write_to_file for workspace files (ArtifactMetadata is strictly reserved for artifacts in the brain directory, and providing it for workspace files causes a path validation rejection). Do NOT use terminal commands (such as Set-Content, Out-File, echo, or cat) to create or write code files. For clarification, ask_question is connected to the codexhost Desktop through a Hook. Use single-choice or text questions. The Hook returns the actual user response in its reason while blocking the native auto-skip behavior; do not retry merely because the native tool reports it was blocked.]\n\n";
-
-export function formatAntigravityTurnPrompt(text: string): string {
-  if (text.startsWith("/") || text.includes("ArtifactMetadata")) {
-    return text;
+function normalizeError(
+  error: unknown,
+  fallback: HarnessError["code"],
+  stderrTail?: string,
+): HarnessError {
+  if (error instanceof AntigravityTransportError) {
+    return {
+      code: error.kind,
+      message: error.message,
+      retryable: error.kind === "unavailable" || error.kind === "processExited",
+      ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+      ...(stderrTail && !error.diagnostic ? { stderrTail } : {}),
+    };
   }
-  return `${ANTIGRAVITY_WORKSPACE_FILE_INSTRUCTION}${text}`;
-}
-
-/**
- * Headless agy answers a permission request by denying it, then reports the
- * Turn as successful with an empty response. Without this the user sees a Turn
- * that silently did nothing. The denial echoes the rejected command line, so it
- * is redacted before it leaves the Adapter.
- */
-export function permissionDeniedTurnError(nativeMode: string | null, denial: string): HarnessError {
-  const mode = nativeMode ? ` '${nativeMode}'` : "";
+  if (error instanceof AntigravityExecutableError) {
+    return { code: "notInstalled", message: error.message, retryable: false };
+  }
+  const msg = errorMessage(error);
+  const textToCheck = `${msg} ${stderrTail ?? ""}`;
+  if (/sign[ -]?in|authenticat|credential|login/iu.test(textToCheck)) {
+    return {
+      code: "authenticationRequired",
+      message: msg,
+      retryable: false,
+      ...(stderrTail ? { stderrTail } : {}),
+    };
+  }
   return {
-    code: "nativeFailure",
-    message:
-      `Antigravity denied a tool call under its${mode} permission mode and produced no response. ` +
-      "Headless Antigravity evaluates its own permission rules and cannot ask for approval; " +
-      "retry with the Skip permissions Permission Mode.",
-    retryable: false,
-    diagnostic: sanitizeDiagnosticTail(denial),
+    code: fallback,
+    message: msg,
+    retryable: fallback === "unavailable" || fallback === "nativeFailure",
+    ...(stderrTail ? { stderrTail } : {}),
   };
 }
 
-function safeToken(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+function harnessErrorFromInspection(
+  error: Extract<HarnessInspection, { status: "notInstalled" | "unavailable" | "error" }>["error"],
+): HarnessError {
+  const codes: HarnessError["code"][] = [
+    "notInstalled",
+    "unavailable",
+    "authenticationRequired",
+    "sessionNotFound",
+    "sessionBusy",
+    "checkpointNotFound",
+    "unsupported",
+    "invalidRequest",
+    "invalidState",
+    "protocolError",
+    "processExited",
+    "nativeFailure",
+    "internalError",
+  ];
+  const code = codes.includes(error.code as HarnessError["code"])
+    ? (error.code as HarnessError["code"])
+    : "unavailable";
+  return {
+    code,
+    message: error.message,
+    retryable: error.retryable,
+    ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+    ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
+  };
 }
 
-function contextWindowMetadata(value: unknown): Record<string, unknown> | null {
-  if (!isRecord(value)) return null;
-  const trajectory = isRecord(value.trajectory) ? value.trajectory : value;
-  const generatorMetadata = trajectory.generatorMetadata;
-  if (!Array.isArray(generatorMetadata)) return null;
-  const first = generatorMetadata[0];
-  if (!isRecord(first) || !isRecord(first.chatModel)) return null;
-  const chatStartMetadata = first.chatModel.chatStartMetadata;
-  if (!isRecord(chatStartMetadata) || !isRecord(chatStartMetadata.contextWindowMetadata)) {
-    return null;
+function errorFromResult(result: AntigravityResultEvent): HarnessError {
+  const message = result.error || `Antigravity Turn ended with status ${result.status}`;
+  const authentication = /sign[ -]?in|authenticat|credential|login/iu.test(message);
+  return {
+    code: authentication ? "authenticationRequired" : "nativeFailure",
+    message,
+    retryable: false,
+  };
+}
+
+function modelSlugFromLocator(ref: NativeSessionRef): {
+  model?: string;
+  effort?: HarnessThinkingOptionId;
+  skipPermissions: boolean;
+} {
+  // New and legacy refs without an explicit permission bit follow the current
+  // Antigravity default: the Host runs unattended. An explicit `false` stays
+  // respected for a user who deliberately chose configured permissions.
+  if (!isRecord(ref.locator)) return { skipPermissions: true };
+  if (ref.locator.model !== undefined && !nonBlankString(ref.locator.model)) {
+    throw new Error("Antigravity Native Session locator has an invalid Model slug");
   }
-  return chatStartMetadata.contextWindowMetadata;
+  const parsedEffort =
+    ref.locator.effort !== undefined
+      ? harnessThinkingOptionIdSchema.safeParse(ref.locator.effort)
+      : null;
+  if (parsedEffort && !parsedEffort.success) {
+    throw new Error("Antigravity Native Session locator has an invalid Thinking option");
+  }
+  if (
+    ref.locator.skipPermissions !== undefined &&
+    typeof ref.locator.skipPermissions !== "boolean"
+  ) {
+    throw new Error("Antigravity Native Session locator has an invalid permission flag");
+  }
+  return {
+    ...(typeof ref.locator.model === "string" ? { model: ref.locator.model } : {}),
+    ...(parsedEffort?.success ? { effort: parsedEffort.data } : {}),
+    skipPermissions: ref.locator.skipPermissions !== false,
+  };
 }
 
-/** Parses the real context counters exposed by agy's local Language Server. */
-export function parseAntigravityContextUsage(
-  value: unknown,
-  modelId?: string,
-): Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null {
-  const metadata = contextWindowMetadata(value);
-  if (!metadata) return null;
-  const breakdown = isRecord(metadata.tokenBreakdown) ? metadata.tokenBreakdown : null;
-  const used = safeToken(
-    metadata.estimatedTokensUsed ??
-      metadata.estimated_tokens_used ??
-      breakdown?.totalTokens ??
-      breakdown?.total_tokens,
-  );
-  const window = safeToken(metadata.maxContextTokens ?? metadata.max_context_tokens);
-  if (used === undefined) return null;
-  const contextWindowTokens = resolveAntigravityContextWindow(modelId, window);
-  return { contextUsedTokens: used, contextWindowTokens };
-}
-
-function requestAntigravityContextUsage(
-  port: number,
-  conversationId: string,
-  timeoutMs: number,
-  modelId?: string,
-): Promise<Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null> {
-  return new Promise((resolve) => {
-    const request = https.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path: "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
-        method: "POST",
-        rejectUnauthorized: false,
-        timeout: timeoutMs,
-        headers: { "content-type": "application/json" },
-      },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        response.on("end", () => {
-          if (response.statusCode !== 200) return resolve(null);
-          try {
-            resolve(parseAntigravityContextUsage(JSON.parse(body), modelId));
-          } catch {
-            resolve(null);
-          }
-        });
-      },
+function sessionState(
+  init: AntigravityInitEvent,
+  model: AntigravityNativeModel | undefined,
+  modelSlug: string | undefined,
+  thinkingOptionId: HarnessThinkingOptionId | undefined,
+  skipPermissions: boolean,
+): HarnessSessionState {
+  if (!nonBlankString(init.conversationId)) {
+    throw new AntigravityTransportError(
+      "protocolError",
+      "Antigravity Session has no conversation ID",
     );
-    request.on("timeout", () => request.destroy());
-    request.on("error", () => resolve(null));
-    request.end(
-      JSON.stringify({
-        cascadeId: conversationId,
-        generatorMetadataOffset: 0,
-        includeMessages: false,
-      }),
-    );
+  }
+  const ref = nativeSessionRefSchema.parse({
+    harnessId: antigravityHarnessId,
+    nativeSessionId: init.conversationId,
+    locator: {
+      ...(modelSlug ? { model: modelSlug } : {}),
+      ...(thinkingOptionId ? { effort: thinkingOptionId } : {}),
+      skipPermissions,
+    },
+    formatVersion: 1,
   });
+  const availableThinkingOptions = antigravityAvailableThinkingOptions(model);
+  return {
+    nativeRef: ref,
+    ...(modelSlug ? { effectiveModel: encodeAntigravityModelRef(modelSlug) } : {}),
+    ...(thinkingOptionId ? { effectiveThinkingOptionId: thinkingOptionId } : {}),
+    ...(availableThinkingOptions.length > 0
+      ? { availableThinkingOptions: [...availableThinkingOptions] }
+      : {}),
+  };
 }
 
-async function antigravityHttpsPort(logPath: string): Promise<number | null> {
+function usageFromResult(value: unknown): HostUsage | null {
+  if (!isRecord(value)) return null;
+  const usage: Record<string, number> = {};
+  const fields: Array<[string, keyof HostUsage]> = [
+    ["input_tokens", "inputTokens"],
+    ["output_tokens", "outputTokens"],
+    ["thinking_tokens", "reasoningOutputTokens"],
+    ["cache_read_tokens", "cachedInputTokens"],
+    ["total_tokens", "totalTokens"],
+  ];
+  for (const [source, target] of fields) {
+    if (nonNegativeInteger(value[source])) usage[target] = value[source];
+  }
+  if (Object.keys(usage).length === 0) return null;
   try {
-    const log = await readFile(logPath, "utf8");
-    const match = log.match(
-      /Language server listening on random port at (\d+) for HTTPS \(gRPC\)/iu,
-    );
-    const port = match ? Number(match[1]) : Number.NaN;
-    return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
+    return parseHostUsage(usage);
   } catch {
     return null;
   }
 }
 
-async function pollAntigravityContextUsage(
-  logPath: string,
-  conversationId: string,
-  modelId?: string,
-  isDone?: () => boolean,
-): Promise<Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null> {
-  const deadline = Date.now() + CONTEXT_USAGE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const port = await antigravityHttpsPort(logPath);
-    if (port !== null) {
-      const usage = await requestAntigravityContextUsage(
-        port,
-        conversationId,
-        CONTEXT_USAGE_RETRY_MS,
-        modelId,
-      );
-      if (usage) return usage;
-    }
-    if (isDone?.()) break;
-    await new Promise<void>((resolve) => setTimeout(resolve, CONTEXT_USAGE_RETRY_MS));
+function textFromValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
-  return null;
 }
 
-function hostUsage(value: AntigravityUsage | undefined, modelId?: string): HostUsage | null {
-  if (!value) return null;
-  const inputTokens = safeToken(value.input_tokens);
-  const outputTokens = safeToken(value.output_tokens);
-  const reasoningOutputTokens = safeToken(value.thinking_tokens);
-  const totalTokens = safeToken(value.total_tokens);
-  const contextUsedTokens = safeToken(
-    value.context_used_tokens ?? value.estimated_tokens_used ?? value.input_tokens,
-  );
-  const rawWindow = safeToken(value.context_window_tokens ?? value.max_context_tokens);
-  const contextWindowTokens =
-    contextUsedTokens !== undefined || rawWindow !== undefined
-      ? resolveAntigravityContextWindow(modelId, rawWindow)
-      : undefined;
-  const usage: HostUsage = {
-    ...(inputTokens !== undefined ? { inputTokens } : {}),
-    ...(outputTokens !== undefined ? { outputTokens } : {}),
-    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
-    ...(totalTokens !== undefined ? { totalTokens } : {}),
-    ...(contextUsedTokens !== undefined &&
-    contextWindowTokens !== undefined &&
-    contextWindowTokens > 0
-      ? { contextUsedTokens, contextWindowTokens }
-      : {}),
-  };
-  return Object.keys(usage).length > 0 ? usage : null;
-}
-
-function normalizedProcessError(stderr: string, fallback: string): HarnessError {
-  // stderr can echo the invoked command line, so redact before it is surfaced.
-  const diagnostic = sanitizeDiagnosticTail(stderr.trim());
-  if (/sign[ -]?in|authenticat|credential|login/iu.test(diagnostic)) {
-    return {
-      code: "authenticationRequired",
-      message: diagnostic || fallback,
-      retryable: false,
-    };
-  }
+function boundedToolOutput(value: unknown, limit: number): HostToolOutput | undefined {
+  const text = textFromValue(value);
+  if (!text) return undefined;
+  const truncated = text.length > limit;
   return {
-    code: "nativeFailure",
-    message: fallback,
-    retryable: true,
-    ...(diagnostic ? { stderrTail: diagnostic.slice(-4_000) } : {}),
+    content: [{ type: "text", text: truncated ? text.slice(0, limit) : text }],
+    ...(truncated ? { truncated: true } : {}),
   };
 }
 
-async function runBuffered(
-  executable: string,
-  arguments_: string[],
-  cwd: string,
-  environment: NodeJS.ProcessEnv,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string }> {
-  const invocation = commandInvocation(executable, arguments_, environment);
-  return await new Promise((resolve, reject) => {
-    const child = spawn(invocation.command, invocation.arguments, {
-      cwd,
-      env: environment,
-      ...(signal ? { signal, killSignal: "SIGKILL" as const } : {}),
-      windowsHide: true,
-      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`Antigravity CLI timed out after ${timeoutMs} ms`));
-    }, timeoutMs);
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(stderr.trim() || `Antigravity CLI exited with code ${String(code)}`));
-    });
-  });
+function stepToolArguments(step: AntigravityStepUpdate): JsonValue {
+  const candidate = step.toolInfo?.parameters ?? step.toolInfo?.arguments ?? {};
+  const parsed = jsonValueSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : {};
 }
 
-class AntigravitySession implements HarnessSession {
+function stepToolOutput(step: AntigravityStepUpdate): unknown {
+  return step.toolInfo?.output ?? step.toolInfo?.result ?? step.toolInfo?.error;
+}
+
+function isSuccessfulStatus(status: string): boolean {
+  return status === "SUCCESS";
+}
+
+function isCancelledStatus(status: string): boolean {
+  return status === "CANCELED" || status === "CANCELLED" || status === "INTERRUPTED";
+}
+
+interface ActiveTurn {
+  command: TurnStartCommand;
+  text: string;
+  agent: HostAgentMessageItem | null;
+  agentText: string;
+  reasoning: HostReasoningItem | null;
+  tools: Map<string, { item: HostToolExecutionItem; output: string }>;
+  completedItems: HostItemSnapshot[];
+  /** First permission denial seen this Turn (tool error shape), kept to explain an empty result. */
+  permissionDenial: string | null;
+  cancellationRequested: boolean;
+}
+
+class AntigravityHarnessSession implements HarnessSession {
   readonly harnessId: HarnessId = antigravityHarnessId;
-  readonly capabilities = CAPABILITIES;
-  readonly commands: HarnessCommandCapability;
+  readonly capabilities = ANTIGRAVITY_CAPABILITIES;
+  readonly initialState: HarnessSessionState;
   readonly initialUsage: HostUsage | null = null;
   readonly outputs: AsyncIterable<HarnessOutput>;
   readonly #channel = new HarnessOutputChannel<HarnessOutput>();
   readonly #cwd: string;
   readonly #environment: NodeJS.ProcessEnv;
-  readonly #executable: string;
-  readonly #onClosed: () => void;
-  readonly #printTimeout: string;
+  readonly #models: readonly AntigravityNativeModel[];
+  readonly #ledger: AntigravitySessionLedger;
   readonly #toolOutputLimit: number;
-  readonly #history: AntigravityHistory;
-  readonly #subagentObservers = new Set<AntigravitySubagents>();
-  #active: ActiveTurn | null = null;
-  #preparingQuestions: Promise<AntigravityQuestionBridge> | null = null;
-  #questionCleanup: Promise<void> = Promise.resolve();
-  #closed = false;
-  #model: HarnessModelRef | undefined;
-  #nativeRef: NativeSessionRef | undefined;
+  readonly #sessionIdleTimeoutMs: number;
+  readonly #history: AntigravityHistory | null;
+  #transport: AntigravityCliTransportLike;
+  #state: HarnessSessionState;
   #permissionMode: AntigravityPermissionMode;
-  #thinkingOptionId: HarnessThinkingOptionId | undefined;
-  readonly #catalog: HarnessModelCatalog | undefined;
+  #nativePermissionMode: string | null = null;
+  #active: ActiveTurn | null = null;
+  #configuring = false;
+  #closed = false;
+  #historyRequired: number;
+  #sessionIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  #sessionActivityGeneration = 0;
+  /** Back-off bookkeeping for the Language Server context probe. */
+  #contextProbeLogPath: string | null = null;
+  #contextProbeFailedAt = 0;
 
   constructor(input: {
-    catalog?: HarnessModelCatalog;
     cwd: string;
-    environment: NodeJS.ProcessEnv;
-    executable: string;
-    model?: HarnessModelRef;
-    nativeRef?: NativeSessionRef;
-    history: AntigravityHistory;
+    environment?: NodeJS.ProcessEnv;
+    models: readonly AntigravityNativeModel[];
+    transport: AntigravityCliTransportLike;
+    initialState: HarnessSessionState;
+    ledger: AntigravitySessionLedger;
+    history: AntigravityHistory | null;
     permissionMode: AntigravityPermissionMode;
-    printTimeout: string;
-    thinkingOptionId?: HarnessThinkingOptionId;
+    nativePermissionMode?: string | null;
+    historyRequired?: number;
     toolOutputLimit: number;
-    onClosed(): void;
+    sessionIdleTimeoutMs?: number;
   }) {
-    this.#catalog = input.catalog;
     this.#cwd = input.cwd;
-    this.#environment = input.environment;
-    this.#executable = input.executable;
+    this.#environment = input.environment ?? process.env;
+    this.#models = input.models;
+    this.#transport = input.transport;
+    this.initialState = input.initialState;
+    this.#state = input.initialState;
+    this.#ledger = input.ledger;
     this.#history = input.history;
-    this.#model = input.model ?? input.history.model;
-    this.#nativeRef = input.nativeRef;
     this.#permissionMode = input.permissionMode;
-    this.#printTimeout = input.printTimeout;
-    this.#thinkingOptionId = input.thinkingOptionId ?? input.history.thinkingOptionId;
+    this.#nativePermissionMode = input.nativePermissionMode ?? null;
+    this.#historyRequired = input.historyRequired ?? 0;
     this.#toolOutputLimit = input.toolOutputLimit;
-    this.#onClosed = input.onClosed;
-    this.initialState = this.#state();
+    this.#sessionIdleTimeoutMs = input.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
     this.outputs = this.#channel.outputs;
-    this.commands = {
-      list: async () => ({ ok: true, value: ANTIGRAVITY_COMMAND_CATALOG }),
-      execute: (command) => this.#executeHarnessCommand(command),
-    };
+    this.#armSessionIdleTimer();
   }
-
-  get nativeRef(): NativeSessionRef | undefined {
-    return this.#nativeRef;
-  }
-
-  get model(): HarnessModelRef | undefined {
-    return this.#model;
-  }
-
-  get thinkingOptionId(): HarnessThinkingOptionId | undefined {
-    return this.#thinkingOptionId;
-  }
-
-  get permissionMode(): AntigravityPermissionMode {
-    return this.#permissionMode;
-  }
-
-  get history(): AntigravityHistory {
-    return this.#history;
-  }
-
-  get isActive(): boolean {
-    return (
-      this.#active !== null ||
-      this.#preparingQuestions !== null ||
-      [...this.#subagentObservers].some((observer) => observer.running)
-    );
-  }
-
-  subagentState(id: string): HostSubagentState | undefined {
-    for (const observer of [...this.#subagentObservers].reverse()) {
-      const state = observer.state(id);
-      if (state) return state;
-    }
-    return historySubagentState(this.#history, id);
-  }
-
-  readonly initialState: HarnessSessionState;
 
   async readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>> {
     if (this.#closed) return { ok: false, error: invalidState("Antigravity Session is closed") };
-    return { ok: true, value: { turns: this.#history.snapshot(), state: this.#state() } };
+    try {
+      const history = this.#history;
+      const sidecarTurns = history?.snapshot() ?? [];
+      let turns: HostThreadSnapshot["turns"];
+      if (sidecarTurns.length > 0 && sidecarTurns.length >= this.#historyRequired) {
+        // The sidecar already covers everything the Host recorded; reading
+        // Native history here could not add Turns the Host never saw.
+        turns = sidecarTurns;
+      }
+      else {
+        // Native transcript/ledger is authoritative and may contain Turns that
+        // predate or postdate the sidecar; merge instead of shadowing it.
+        const snapshot = await loadAntigravitySnapshot(this.#conversationId(), this.#state, {
+          cwd: this.#cwd,
+          environment: this.#environment,
+          fallbackLedger: () => this.#ledger.read(),
+        });
+        turns = mergeAntigravityHistoryTurns(snapshot?.turns ?? [], sidecarTurns);
+      }
+      if (turns.length < this.#historyRequired) {
+        const conversationId = this.#conversationId();
+        const existingKeys = new Set(turns.map((t) => t.nativeTurnRef.nativeTurnKey));
+        for (let i = turns.length + 1; i <= this.#historyRequired; i++) {
+          const nativeTurnKey = `${conversationId}:turn:${i}`;
+          if (!existingKeys.has(nativeTurnKey)) {
+            turns.push({
+              nativeTurnRef: nativeTurnRefSchema.parse({
+                harnessId: antigravityHarnessId,
+                nativeSessionId: conversationId,
+                nativeTurnKey,
+                formatVersion: 1,
+              }),
+              input: [],
+              items: [],
+              outcome: {
+                status: "unknown",
+                reason: "Antigravity Turn details were not recorded",
+              },
+            });
+          }
+        }
+      }
+      return { ok: true, value: { turns, state: this.#state } };
+    } catch (error) {
+      return { ok: false, error: normalizeError(error, "protocolError") };
+    }
   }
 
-  execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
-  execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
-  execute(command: InteractionRespondCommand): Promise<HarnessResult<InteractionRespondAccepted>>;
-  execute(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>>;
-  execute(command: ThinkingSelectCommand): Promise<HarnessResult<ThinkingSelectCompleted>>;
-  execute(
+  async execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
+  async execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
+  async execute(
+    command: InteractionRespondCommand,
+  ): Promise<HarnessResult<InteractionRespondAccepted>>;
+  async execute(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>>;
+  async execute(command: ThinkingSelectCommand): Promise<HarnessResult<ThinkingSelectCompleted>>;
+  async execute(
     command: PermissionModeSelectCommand,
   ): Promise<HarnessResult<PermissionModeSelectCompleted>>;
   async execute(
-    command: HostCommand,
-  ): Promise<
-    HarnessResult<
-      | TurnStartAccepted
-      | TurnCancelAccepted
-      | InteractionRespondAccepted
-      | ModelSelectCompleted
-      | ThinkingSelectCompleted
-      | PermissionModeSelectCompleted
-    >
-  > {
+    command:
+      | TurnStartCommand
+      | TurnCancelCommand
+      | InteractionRespondCommand
+      | ModelSelectCommand
+      | ThinkingSelectCommand
+      | PermissionModeSelectCommand,
+  ): Promise<HarnessResult<unknown>> {
     if (this.#closed) return { ok: false, error: invalidState("Antigravity Session is closed") };
-    if (command.type === "turn.cancel") return this.#cancel(command);
-    if (command.type === "model.select") return this.#selectModel(command);
-    if (command.type === "permissionMode.select") return this.#selectPermissionMode(command);
-    if (command.type === "thinking.select") return this.#selectThinking(command);
-    if (command.type === "interaction.respond") {
-      return (
-        this.#active?.questions.respond(command) ?? {
+    switch (command.type) {
+      case "turn.start":
+        return this.#startTurn(command);
+      case "turn.cancel":
+        return this.#cancelTurn(command);
+      case "model.select":
+        return this.#selectModel(command);
+      case "thinking.select":
+        return this.#selectThinking(command);
+      case "permissionMode.select":
+        return this.#selectPermissionMode(command);
+      case "interaction.respond":
+        return {
           ok: false,
-          error: invalidState("Antigravity Question is not active"),
-        }
-      );
+          error: {
+            code: "unsupported",
+            message: "Antigravity CLI headless mode has no interactive Host prompts",
+            retryable: false,
+          },
+        };
     }
-    if (this.isActive) {
-      return {
-        ok: false,
-        error: {
-          code: "sessionBusy",
-          message: "Antigravity Turn is already running",
-          retryable: true,
-        },
-      };
-    }
-    const text = command.input
-      .map(({ text: part }) => part)
-      .join("\n")
-      .trim();
-    if (!text) {
-      return {
-        ok: false,
-        error: { code: "invalidRequest", message: "Antigravity Turn is empty", retryable: false },
-      };
-    }
-
-    let questions: AntigravityQuestionBridge;
-    this.#preparingQuestions = AntigravityQuestionBridge.create({
-      approvals: this.#permissionMode === "desktop-approvals",
-      ownsApprovalSession: (id) =>
-        this.#active?.command === command &&
-        !this.#active.cancellationRequested &&
-        this.#active.subagents.state(id) !== undefined,
-      turnId: command.turnId,
-      nativeSessionId: () =>
-        this.#active?.command === command && !this.#active.cancellationRequested
-          ? this.#nativeRef?.nativeSessionId
-          : undefined,
-      schedule: (action) => {
-        if (this.#active?.command === command) this.#enqueue(this.#active, action);
-        else action();
-      },
-      emit: (output) => {
-        const active = this.#active;
-        if (!active || active.command !== command) return;
-        if (output.kind === "event" && output.event.type === "item.started" && active.agentItem) {
-          this.#completeItem(active, active.agentItem, { status: "succeeded" });
-          active.agentItem = null;
-          active.agentText = "";
-        }
-        if (output.kind === "event" && output.event.type === "item.completed") {
-          active.completedItems.push(output.event.snapshot);
-        }
-        this.#channel.emit(output);
-      },
-    }).then(async (bridge) => {
-      if (this.#permissionMode !== "desktop-approvals") return bridge;
-      try {
-        const { stdout } = await runBuffered(
-          this.#executable,
-          [
-            "--add-dir",
-            this.#cwd,
-            "--add-dir",
-            bridge.directory,
-            "--print=/hooks",
-            "--output-format",
-            "stream-json",
-          ],
-          this.#cwd,
-          { ...this.#environment, ...bridge.environment },
-          DEFAULT_INSPECT_TIMEOUT_MS,
-        );
-        if (!bridge.verifyApprovalHooks(stdout))
-          throw new Error("Desktop approval Hook was not loaded");
-        return bridge;
-      } catch {
-        await bridge.dispose();
-        throw new Error("Desktop approval Hook verification failed; no tools were started");
-      }
-    });
-    try {
-      questions = await this.#preparingQuestions;
-    } catch (error) {
-      return {
-        ok: false,
-        error: {
-          code: "nativeFailure",
-          message: `Question bridge setup failed: ${errorMessage(error)}`,
-          retryable: true,
-        },
-      };
-    } finally {
-      this.#preparingQuestions = null;
-    }
-    if (this.#closed) {
-      await questions.dispose();
-      return { ok: false, error: invalidState("Antigravity Session is closed") };
-    }
-    const environment = { ...this.#environment, ...questions.environment };
-    const logPath = path.join(os.tmpdir(), `codexhost-antigravity-${randomUUID()}.log`);
-    const arguments_ = [
-      "--input-format",
-      "stream-json",
-      "--output-format",
-      "stream-json",
-      "--print-timeout",
-      this.#printTimeout,
-    ];
-    if (this.#nativeRef) arguments_.unshift("--conversation", this.#nativeRef.nativeSessionId);
-    arguments_.push(...antigravityModelArguments(this.#model, this.#thinkingOptionId));
-    if (
-      this.#permissionMode === "dangerously-skip-permissions" ||
-      this.#permissionMode === "desktop-approvals"
-    ) {
-      arguments_.push("--dangerously-skip-permissions");
-    }
-    arguments_.push("--add-dir", this.#cwd);
-    arguments_.push("--add-dir", questions.directory);
-    arguments_.push("--log-file", logPath);
-    const invocation = commandInvocation(this.#executable, arguments_, environment);
-    let child: ChildProcessByStdio<Writable, Readable, Readable>;
-    try {
-      child = spawn(invocation.command, invocation.arguments, {
-        cwd: this.#cwd,
-        env: environment,
-        windowsHide: true,
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (error) {
-      await questions.dispose();
-      return {
-        ok: false,
-        error: { code: "nativeFailure", message: errorMessage(error), retryable: true },
-      };
-    }
-    const active: ActiveTurn = {
-      command,
-      process: child,
-      exited: new Promise<void>((resolve) => child.once("close", () => resolve())),
-      questions,
-      subagents: new AntigravitySubagents({
-        turnId: command.turnId,
-        parentId: () => this.#nativeRef?.nativeSessionId,
-        port: () => this.#languageServerPort(active),
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        initialStates: this.#history
-          .snapshot()
-          .flatMap((turn) =>
-            turn.items.flatMap(({ item }) =>
-              item.type === "subagentDelegation" ? item.subagents : [],
-            ),
-          ),
-        emit: (event) => {
-          if (event.type === "subagent.state.changed") {
-            const state = active.subagents.state(event.nativeSubagentId);
-            if (state) this.#history.updateSubagent(state);
-          }
-          this.#event(event);
-        },
-        complete: (snapshot) => active.completedItems.push(snapshot),
-        schedule: (work) => this.#enqueue(active, work),
-      }),
-      logPath,
-      agentItem: null,
-      agentText: "",
-      tools: new Map(),
-      completedItems: [],
-      stderr: "",
-      cancellationRequested: false,
-      receivedResult: false,
-      nativePermissionMode: null,
-      permissionDenial: null,
-      latestUsage: null,
-      contextUsagePromise: null,
-      queue: Promise.resolve(),
-      codeActionCursor: 0,
-      fileChanges: new Map(),
-      pendingSteps: new Map(),
-      httpsPort: null,
-    };
-    this.#active = active;
-    this.#subagentObservers.add(active.subagents);
-    child.stdin.on("error", () => undefined);
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
-      active.stderr = (active.stderr + chunk).slice(-8_000);
-    });
-    const lines = readline.createInterface({ input: child.stdout });
-    lines.on("line", (line) => {
-      const event = parseAntigravityStreamLine(line);
-      if (event) this.#enqueue(active, () => this.#handleEvent(active, event));
-      else if (line.trim()) active.stderr = (active.stderr + `\n${line}`).slice(-8_000);
-    });
-    child.once("error", (error) => {
-      this.#enqueue(active, () => {
-        if (this.#active !== active) return;
-        this.#completeTurn(active, {
-          status: "failed",
-          error: { code: "nativeFailure", message: error.message, retryable: true },
-        });
-      });
-    });
-    child.once("close", (code) => {
-      this.#enqueue(active, () => {
-        void unlink(active.logPath).catch(() => undefined);
-        if (active.subagents.running) void active.subagents.cancel();
-        else active.subagents.stop();
-        if (this.#active !== active || active.receivedResult) return;
-        if (active.cancellationRequested) {
-          this.#completeTurn(active, { status: "cancelled", reason: "Cancelled by user" });
-        } else {
-          this.#completeTurn(active, {
-            status: "failed",
-            error: normalizedProcessError(
-              active.stderr,
-              `Antigravity CLI exited before a result event (code ${String(code)})`,
-            ),
-          });
-        }
-      });
-    });
-    try {
-      const turnPrompt = formatAntigravityTurnPrompt(text);
-      if (child.stdin.writable) {
-        child.stdin.write(
-          `${JSON.stringify({ event: "user", message: { content: turnPrompt } })}\n`,
-          () => undefined,
-        );
-      }
-    } catch (error) {
-      child.kill();
-      this.#completeTurn(active, {
-        status: "failed",
-        error: { code: "nativeFailure", message: errorMessage(error), retryable: true },
-      });
-      return {
-        ok: false,
-        error: { code: "nativeFailure", message: errorMessage(error), retryable: true },
-      };
-    }
-    this.#event({ type: "turn.started", turnId: command.turnId });
-    return { ok: true, value: { turnId: command.turnId } };
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    this.#clearSessionIdleTimer();
     this.#closed = true;
-    const preparing = await this.#preparingQuestions?.catch(() => undefined);
-    await preparing?.dispose();
     if (this.#active) {
-      const active = this.#active;
-      active.cancellationRequested = true;
-      await active.subagents.cancel();
-      active.process.kill();
-      this.#completeTurn(active, { status: "cancelled", reason: "Session closed" });
+      this.#active.cancellationRequested = true;
+      this.#active = null;
     }
-    await Promise.all([...this.#subagentObservers].map((observer) => observer.cancel()));
-    await this.#questionCleanup;
-    await this.#history.flush().catch(() => undefined);
+    await this.#transport.close().catch(() => undefined);
+    await this.#history?.flush().catch(() => undefined);
     this.#channel.end();
-    this.#onClosed();
   }
 
-  /**
-   * Runs stream work one item at a time. Resolving a real edit patch needs an
-   * awaited Language Server call, and Codex Desktop renders Items in arrival
-   * order, so nothing may overtake a step that is still resolving.
-   */
-  #enqueue(active: ActiveTurn, work: () => Promise<void> | void): void {
-    active.queue = active.queue.then(work).catch((error: unknown) => {
-      if (this.#active !== active) return;
-      this.#completeTurn(active, {
-        status: "failed",
-        error: { code: "nativeFailure", message: errorMessage(error), retryable: true },
-      });
-    });
-  }
-
-  async #handleEvent(active: ActiveTurn, event: AntigravityStreamEvent): Promise<void> {
-    if (this.#active !== active) return;
-    if (event.event === "init") {
-      active.nativePermissionMode = event.init?.permission_mode ?? null;
-      if (this.#nativeRef && this.#nativeRef.nativeSessionId !== event.conversation_id) {
-        this.#completeTurn(active, {
-          status: "failed",
-          error: {
-            code: "sessionNotFound",
-            message: "Antigravity resumed a different Conversation",
-            retryable: false,
-          },
-        });
-        active.process.kill();
-        return;
-      }
-      this.#nativeRef = nativeSessionRefSchema.parse({
-        harnessId: this.harnessId,
-        nativeSessionId: event.conversation_id,
-        formatVersion: 1,
-      });
-      this.#history.bindNativeSession(event.conversation_id);
-      this.#event({ type: "session.state.changed", state: this.#state() });
-      this.#ensureContextUsage(active, event.conversation_id);
-      return;
-    }
-    if (event.event === "step_update") {
-      if (event.step_update.conversation_id !== this.#nativeRef?.nativeSessionId) return;
-      await this.#handleStep(active, event.step_update);
-      const usage = hostUsage(event.step_update.usage, this.#model?.id);
-      if (usage) this.#publishUsage(active, usage);
-      this.#ensureContextUsage(active, event.step_update.conversation_id);
-      return;
-    }
-    if (event.event !== "result") return;
-    active.receivedResult = true;
-    await this.#handleResult(active, event);
-  }
-
-  async #handleResult(active: ActiveTurn, event: AntigravityResultEvent): Promise<void> {
-    if (this.#active !== active) return;
-    const usage = hostUsage(event.result.usage, this.#model?.id);
-    if (usage) this.#publishUsage(active, usage);
-    this.#ensureContextUsage(active, event.result.conversation_id);
-    if (active.contextUsagePromise) {
-      const contextUsage = await active.contextUsagePromise;
-      if (contextUsage) this.#publishUsage(active, contextUsage);
-    }
-    await active.subagents.refresh();
-    if (this.#active !== active) return;
-    const convId =
-      event.result.conversation_id && event.result.conversation_id.trim().length > 0
-        ? event.result.conversation_id.trim()
-        : (this.#nativeRef?.nativeSessionId ?? "");
-
-    if (!this.#nativeRef && convId) {
-      this.#nativeRef = nativeSessionRefSchema.parse({
-        harnessId: this.harnessId,
-        nativeSessionId: convId,
-        formatVersion: 1,
-      });
-      this.#history.bindNativeSession(convId);
-      this.#event({ type: "session.state.changed", state: this.#state() });
-    }
-    if (event.result.response) {
-      this.#appendOrSyncAgentText(active, event.result.response, false);
-    }
-    const safeTurnId =
-      event.result.num_turns !== undefined && event.result.num_turns !== null
-        ? `turn:${event.result.num_turns}`
-        : `turn:${this.#history.snapshot().length + 1}`;
-    const safeSessionId = convId || this.#nativeRef?.nativeSessionId || "unknown-session";
-
-    const nativeTurnRef = nativeTurnRefSchema.parse({
-      harnessId: this.harnessId,
-      nativeSessionId: safeSessionId,
-      nativeTurnKey: safeTurnId,
-      formatVersion: 1,
-    });
-    const checkpoint = nativeCheckpointRefSchema.parse({
-      harnessId: this.harnessId,
-      nativeSessionId: safeSessionId,
-      checkpointId: safeTurnId,
-      formatVersion: 1,
-    });
-    if (active.cancellationRequested) {
-      this.#completeTurn(
-        active,
-        { status: "cancelled", reason: "Cancelled by user", checkpoint },
-        nativeTurnRef,
-      );
-    } else if (event.result.status === "SUCCESS") {
-      if (active.permissionDenial !== null && !active.agentItem) {
-        this.#completeTurn(
-          active,
-          {
-            status: "failed",
-            error: permissionDeniedTurnError(active.nativePermissionMode, active.permissionDenial),
-            checkpoint,
-          },
-          nativeTurnRef,
-        );
-      } else {
-        this.#completeTurn(active, { status: "succeeded", checkpoint }, nativeTurnRef);
-      }
-    } else {
-      const errorDetail = event.result.error?.trim() || active.stderr;
-      this.#completeTurn(
-        active,
-        {
-          status: "failed",
-          error: normalizedProcessError(
-            errorDetail,
-            `Antigravity Turn ended with status ${event.result.status}`,
-          ),
-          checkpoint,
+  #startTurn(command: TurnStartCommand): HarnessResult<TurnStartAccepted> {
+    if (this.#active || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Antigravity Session already has an active operation",
+          retryable: true,
         },
-        nativeTurnRef,
+      };
+    }
+    const text = command.input.map(({ text: input }) => input).join("");
+    if (!text.trim()) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Antigravity Turn must not be empty",
+          retryable: false,
+        },
+      };
+    }
+    this.#touchSessionActivity();
+    const active: ActiveTurn = {
+      command,
+      text,
+      agent: null,
+      agentText: "",
+      reasoning: null,
+      tools: new Map(),
+      completedItems: [],
+      permissionDenial: null,
+      cancellationRequested: false,
+    };
+    this.#active = active;
+    this.#event({ type: "turn.started", turnId: command.turnId });
+    void this.#runTurn(active);
+    return { ok: true, value: { turnId: command.turnId } };
+  }
+
+  async #runTurn(active: ActiveTurn): Promise<void> {
+    let result: AntigravityResultEvent | null = null;
+    try {
+      const prompt = await readSelectedPluginSkillPrompt(
+        active.text,
+        this.#environment,
+        this.#cwd,
       );
-    }
-  }
-
-  #publishUsage(active: ActiveTurn, usage: HostUsage): void {
-    active.latestUsage = { ...(active.latestUsage ?? {}), ...usage };
-    this.#event({
-      type: "session.usage.changed",
-      usage: active.latestUsage,
-      observedForTurnId: active.command.turnId,
-    });
-  }
-
-  #ensureContextUsage(active: ActiveTurn, conversationId: string): void {
-    if (active.contextUsagePromise) return;
-    active.contextUsagePromise = pollAntigravityContextUsage(
-      active.logPath,
-      conversationId,
-      this.#model?.id,
-      () =>
-        active.receivedResult || active.cancellationRequested || active.process.exitCode !== null,
-    );
-  }
-
-  async #handleStep(
-    active: ActiveTurn,
-    step: AntigravityStepUpdateEvent["step_update"],
-  ): Promise<void> {
-    if (step.step_type === "subagent") {
-      if (active.agentItem) {
-        this.#completeItem(active, active.agentItem, { status: "succeeded" });
-        active.agentItem = null;
-        active.agentText = "";
+      result = await this.#transport.runTurn(prompt, (step) => this.#handleStep(active, step));
+      if (result.conversationId !== this.#conversationId()) {
+        throw new AntigravityTransportError(
+          "protocolError",
+          "Antigravity changed the Native Session identity",
+        );
       }
-      if (active.subagents.handle(step)) return;
-      step = { ...step, step_type: "tool" };
-    }
-    if (step.step_type === "agent_response") {
-      if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
-        this.#appendOrSyncAgentText(active, step.text_delta, true);
-        return;
+      if (active.reasoning) this.#completeReasoning(active, { status: "succeeded" });
+      if (result.response) {
+        this.#appendOrSyncAgentText(active, result.response, false);
       }
-      const fullOrDelta =
-        step.text ??
-        (typeof step.content === "string" ? step.content : undefined) ??
-        (typeof step.message === "string" ? step.message : undefined);
-      if (typeof fullOrDelta === "string" && fullOrDelta.length > 0) {
-        this.#appendOrSyncAgentText(active, fullOrDelta, false);
-        return;
+      const usage = usageFromResult(result.usage);
+      if (usage) {
+        this.#event({
+          type: "session.usage.changed",
+          usage,
+          observedForTurnId: active.command.turnId,
+        });
       }
-      return;
-    }
-    if (step.step_type !== "tool") return;
-    if (active.agentItem) {
-      this.#completeItem(active, active.agentItem, { status: "succeeded" });
-      active.agentItem = null;
-      active.agentText = "";
-    }
-    const merged = mergePendingStep(active.pendingSteps.get(step.step_index), step);
-    let item = active.tools.get(step.step_index);
-    if (!item) {
-      const started = await this.#startToolItem(active, merged);
-      if (!started) {
-        active.pendingSteps.set(step.step_index, merged);
-        return;
-      }
-      active.pendingSteps.delete(step.step_index);
-      item = started;
-      active.tools.set(step.step_index, item);
-      this.#event({ type: "item.started", turnId: active.command.turnId, item });
-    }
-    if (merged.state !== "DONE" && merged.state !== "ERROR") return;
-    const toolError = antigravityToolErrorMessage(merged.tool_info?.error);
-    if (toolError !== null && active.permissionDenial === null) {
-      if (isAntigravityPermissionDenial(toolError)) active.permissionDenial = toolError;
-    }
-    const completed = completeAntigravityToolItem(item, merged, this.#toolOutputLimit, this.#cwd);
-    active.tools.delete(step.step_index);
-    const toolName =
-      merged.tool_name ??
-      merged.tool_info?.name ??
-      (item.type === "toolExecution" ? item.toolName : item.type);
-    const itemOutcome: HostItemOutcome =
-      merged.state === "ERROR"
+      // A permission denial with no assistant output explains an otherwise
+      // silent Turn (upstream-aligned). The denial text itself stays out of the
+      // surfaced error; the failed tool item already carries the detail.
+      const deniedEmptyTurn =
+        active.permissionDenial !== null && !active.agent && !active.agentText;
+      const outcome = deniedEmptyTurn
         ? {
-            status: "failed",
-            error: {
-              code: "nativeFailure",
-              message: toolError
-                ? `Antigravity tool '${toolName}' failed: ${toolError}`
-                : `Antigravity tool '${toolName}' failed`,
-              retryable: false,
-            },
+            status: "failed" as const,
+            error: this.#permissionDeniedError(),
           }
-        : { status: "succeeded" };
-    this.#completeItem(active, completed, itemOutcome);
-  }
-
-  /**
-   * A file-mutating step only becomes a File Change Item once its patch is
-   * known. agy publishes the step before the Language Server has recorded the
-   * applied edit, so an unresolved step stays uncarded until its terminal
-   * update rather than showing an empty patch.
-   */
-  async #startToolItem(
-    active: ActiveTurn,
-    step: AntigravityStepUpdateEvent["step_update"],
-  ): Promise<HostItem | null> {
-    const toolName = step.tool_name ?? step.tool_info?.name ?? "antigravity.tool";
-    if (isAntigravityFileMutatingTool(toolName)) {
-      const change = await this.#claimFileChange(active, step, toolName);
-      if (change) {
-        return { type: "fileChange", itemId: this.#newItemId(), changes: [change] };
+        : isSuccessfulStatus(result.status)
+          ? ({ status: "succeeded" } satisfies TurnOutcome)
+          : isCancelledStatus(result.status)
+            ? ({
+                status: "cancelled",
+                reason: result.error ?? "Cancelled by user",
+              } satisfies TurnOutcome)
+            : ({ status: "failed", error: errorFromResult(result) } satisfies TurnOutcome);
+      await this.#persistLedger(active, result, outcome);
+      this.#completeTurn(active, outcome, result);
+      this.#recordSidecarTurn(active, outcome, result);
+      // Real context-window usage from agy's local Language Server; never
+      // blocks the Turn, degrades to a no-op when the LS is unreachable. The
+      // counters are merged onto this Turn's own usage before publishing so a
+      // token-less context event can never overwrite the Host's per-Turn usage.
+      void this.#observeContextUsage(active, result, usage);
+    } catch (error) {
+      const outcome: TurnOutcome = active.cancellationRequested
+        ? { status: "cancelled", reason: "Cancelled by user" }
+        : {
+            status: "failed",
+            error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
+          };
+      if (result) await this.#persistLedger(active, result, outcome).catch(() => undefined);
+      this.#completeTurn(active, outcome, result ?? undefined);
+      if (result) {
+        this.#recordSidecarTurn(active, outcome, result);
+        void this.#observeContextUsage(active, result, null);
       }
-      if (step.state !== "DONE" && step.state !== "ERROR") return null;
     }
-    return startAntigravityToolItem(this.#newItemId(), step, this.#cwd);
   }
 
-  async #claimFileChange(
+  async #persistLedger(
     active: ActiveTurn,
-    step: AntigravityStepUpdateEvent["step_update"],
-    toolName: string,
-  ): Promise<HostFileChange | null> {
-    const claimed = active.fileChanges.get(step.step_index);
-    if (claimed) return claimed;
-    const target = toolTargetFile(toolName, step.tool_info?.parameters);
-    if (!target) return null;
-    const port = await this.#languageServerPort(active);
-    if (port === null) return null;
-    const actions = await requestAntigravityTrajectorySteps(
-      port,
-      step.conversation_id,
-      TRAJECTORY_TIMEOUT_MS,
-    );
-    const index = actions.findIndex(
-      (action, at) => at >= active.codeActionCursor && sameFile(action.absolutePath, target),
-    );
-    const action: AntigravityCodeAction | undefined = index === -1 ? undefined : actions[index];
-    if (!action) return null;
-    const change = codeActionFileChange(action, this.#cwd);
-    if (!change) return null;
-    active.codeActionCursor = index + 1;
-    active.fileChanges.set(step.step_index, change);
-    return change;
-  }
-
-  async #languageServerPort(active: ActiveTurn): Promise<number | null> {
-    if (active.httpsPort !== null) return active.httpsPort;
-    const port = await antigravityHttpsPort(active.logPath);
-    if (port !== null) active.httpsPort = port;
-    return port;
-  }
-
-  #appendOrSyncAgentText(active: ActiveTurn, text: string, isExplicitDelta: boolean): void {
-    if (!text) return;
-    if (isExplicitDelta || !active.agentItem) {
-      this.#appendAgentText(active, text);
+    result: AntigravityResultEvent,
+    outcome: TurnOutcome,
+  ): Promise<void> {
+    if (!nonNegativeInteger(result.numTurns) || result.numTurns < 1) {
+      if (outcome.status === "succeeded") {
+        throw new AntigravityTransportError(
+          "protocolError",
+          "Antigravity successful Turn has no native Turn index",
+        );
+      }
       return;
     }
-    if (
-      text === active.agentText ||
-      active.agentText.startsWith(text) ||
-      active.agentText.trim() === text.trim() ||
-      active.agentText.endsWith(text) ||
-      active.agentText.includes(text.trim())
-    ) {
-      return;
-    }
-    if (text.startsWith(active.agentText)) {
-      const delta = text.slice(active.agentText.length);
-      if (delta.length > 0) this.#appendAgentText(active, delta);
-      return;
-    }
-    this.#appendAgentText(active, text);
+    const nativeTurnKey = `${result.conversationId}:turn:${result.numTurns}`;
+    const ledgerTurn: AntigravityLedgerTurn = {
+      nativeTurnKey,
+      input: active.text,
+      response: result.response,
+      status:
+        outcome.status === "succeeded"
+          ? "succeeded"
+          : outcome.status === "cancelled"
+            ? "cancelled"
+            : "failed",
+      ...(outcome.status === "failed" ? { error: outcome.error.message } : {}),
+      ...(this.#modelSlug() ? { modelSlug: this.#modelSlug() as string } : {}),
+    };
+    await this.#ledger.append(ledgerTurn);
   }
 
-  #appendAgentText(active: ActiveTurn, text: string): void {
-    if (!active.agentItem) {
-      active.agentItem = { type: "agentMessage", itemId: this.#newItemId(), text };
-      active.agentText = text;
-      this.#event({ type: "item.started", turnId: active.command.turnId, item: active.agentItem });
-      return;
-    }
-    active.agentText += text;
-    active.agentItem = { ...active.agentItem, text: active.agentText };
-    this.#event({
-      type: "item.updated",
-      turnId: active.command.turnId,
-      itemId: active.agentItem.itemId,
-      update: { type: "text.append", text },
-    });
-  }
-
-  #completeTurn(active: ActiveTurn, outcome: TurnOutcome, nativeTurnRef?: NativeTurnRef): void {
+  #completeTurn(active: ActiveTurn, outcome: TurnOutcome, result?: AntigravityResultEvent): void {
     if (this.#active !== active) return;
-    active.questions.stop();
-    this.#questionCleanup = this.#questionCleanup
-      .then(async () => {
-        if (outcome.status !== "succeeded") await active.subagents.cancel();
-        await active.subagents.settled;
-        if (active.process.stdin.writable) active.process.stdin.end();
-        const timer = setTimeout(() => active.process.kill(), 2_000);
-        await active.exited.finally(() => clearTimeout(timer));
-        await active.questions.dispose();
-        this.#subagentObservers.delete(active.subagents);
-      })
-      .catch(() => undefined);
-    this.#active = null;
     const itemOutcome: HostItemOutcome =
       outcome.status === "failed"
         ? { status: "failed", error: outcome.error }
         : outcome.status === "cancelled"
           ? { status: "cancelled", ...(outcome.reason ? { reason: outcome.reason } : {}) }
           : { status: "succeeded" };
-    active.subagents.finish(itemOutcome);
-    if (active.agentItem) this.#completeItem(active, active.agentItem, itemOutcome);
-    // A step whose patch never resolved still ran, so an interrupted Turn
-    // reports it as a Tool Execution rather than dropping it silently.
-    for (const step of active.pendingSteps.values()) {
-      const item = startAntigravityToolItem(this.#newItemId(), step, this.#cwd);
-      this.#event({ type: "item.started", turnId: active.command.turnId, item });
-      this.#completeItem(active, item, itemOutcome);
-    }
-    active.pendingSteps.clear();
-    for (const item of active.tools.values()) this.#completeItem(active, item, itemOutcome);
+    if (active.reasoning) this.#completeReasoning(active, itemOutcome);
+    for (const tool of active.tools.values()) this.#completeItem(active, tool.item, itemOutcome);
     active.tools.clear();
-    if (nativeTurnRef) {
-      this.#history.append({
-        nativeTurnRef,
-        ...(outcome.checkpoint ? { checkpoint: outcome.checkpoint } : {}),
-        turnInput: active.command.input,
-        items: active.completedItems.map((snapshot) => ({
-          ...snapshot,
-          item: active.subagents.snapshot(snapshot.item),
-        })),
-        outcome:
-          outcome.status === "failed"
-            ? { status: "failed", error: outcome.error }
-            : outcome.status === "cancelled"
-              ? { status: "cancelled", ...(outcome.reason ? { reason: outcome.reason } : {}) }
-              : { status: "succeeded" },
-        ...(this.#model ? { model: this.#model } : {}),
-      });
-    }
+    if (active.agent) this.#completeItem(active, active.agent, itemOutcome);
+    const nativeTurnRef = result && result.numTurns > 0 ? this.#nativeTurnRef(result) : undefined;
+    const checkpoint = nativeTurnRef
+      ? {
+          harnessId: antigravityHarnessId,
+          nativeSessionId: nativeTurnRef.nativeSessionId,
+          checkpointId: nativeTurnRef.nativeTurnKey,
+          formatVersion: 1 as const,
+        }
+      : undefined;
+    this.#active = null;
     this.#event({
       type: "turn.completed",
       turnId: active.command.turnId,
-      outcome,
       ...(nativeTurnRef ? { nativeTurnRef } : {}),
+      outcome: {
+        ...outcome,
+        ...(checkpoint ? { checkpoint } : {}),
+      },
     });
+    this.#armSessionIdleTimer();
+  }
+
+  #handleStep(active: ActiveTurn, step: AntigravityStepUpdate): void {
+    if (this.#active !== active || this.#closed) return;
+    // Per-step token telemetry reaches the Host as it streams (upstream-aligned).
+    if (step.usage !== undefined) {
+      const stepUsage = usageFromResult(step.usage);
+      if (stepUsage) {
+        this.#event({
+          type: "session.usage.changed",
+          usage: stepUsage,
+          observedForTurnId: active.command.turnId,
+        });
+      }
+    }
+    if (step.thinkingDelta) {
+      this.#appendReasoning(active, step.thinkingDelta);
+    } else if (step.stepType === "thinking" && step.textDelta) {
+      this.#appendReasoning(active, step.textDelta);
+    }
+    if (step.stepType !== "tool" && step.stepType !== "thinking") {
+      const hasExplicitDelta =
+        typeof step.textDelta === "string" && step.textDelta.length > 0 && step.text === undefined;
+      const textCandidate =
+        step.textDelta ??
+        step.text ??
+        (typeof step.content === "string" ? step.content : undefined) ??
+        (typeof step.message === "string" ? step.message : undefined);
+      if (textCandidate) {
+        this.#completeReasoning(active, { status: "succeeded" });
+        this.#appendOrSyncAgentText(active, textCandidate, hasExplicitDelta);
+      }
+    }
+    if (step.stepType !== "tool") return;
+    this.#completeReasoning(active, { status: "succeeded" });
+    const callId = String(step.stepIndex ?? `tool-${active.tools.size}`);
+    let tool = active.tools.get(callId);
+    if (!tool) {
+      const item: HostToolExecutionItem = {
+        type: "toolExecution",
+        itemId: hostItemIdSchema.parse(`antigravity:${this.#conversationId()}:${callId}`),
+        toolName:
+          step.toolName ??
+          (nonBlankString(step.toolInfo?.name) ? step.toolInfo.name : "Antigravity tool"),
+        arguments: stepToolArguments(step),
+      };
+      tool = { item, output: "" };
+      active.tools.set(callId, tool);
+      if (active.agent) {
+        this.#completeItem(active, active.agent, { status: "succeeded" });
+        active.agent = null;
+      }
+      this.#event({ type: "item.started", turnId: active.command.turnId, item });
+    }
+    const output = boundedToolOutput(stepToolOutput(step), this.#toolOutputLimit);
+    if (output) {
+      const text = output.content
+        .filter(
+          (content): content is Extract<(typeof output.content)[number], { type: "text" }> =>
+            content.type === "text",
+        )
+        .map(({ text: content }) => content)
+        .join("");
+      const delta = text.startsWith(tool.output) ? text.slice(tool.output.length) : text;
+      tool.output = text;
+      tool.item = { ...tool.item, output };
+      if (delta)
+        this.#event({
+          type: "item.updated",
+          turnId: active.command.turnId,
+          itemId: tool.item.itemId,
+          update: { type: "output.append", text: delta },
+        });
+    }
+    if (step.state === "DONE") {
+      const hasError = step.toolInfo?.error !== undefined;
+      const toolError = hasError ? antigravityToolErrorMessage(step.toolInfo?.error) : null;
+      if (hasError && active.permissionDenial === null && toolError !== null) {
+        // Headless agy answers permission failures as tool errors; keep the first
+        // one so an otherwise empty Turn can be explained (upstream-aligned).
+        if (isAntigravityPermissionDenial(toolError)) active.permissionDenial = toolError;
+      }
+      const toolOutcome: HostItemOutcome = hasError
+        ? {
+            status: "failed",
+            error: {
+              code: "nativeFailure",
+              message: toolError ?? textFromValue(step.toolInfo?.error),
+              retryable: false,
+            },
+          }
+        : { status: "succeeded" };
+
+      const completedItem: HostToolExecutionItem =
+        typeof step.durationSeconds === "number"
+          ? { ...tool.item, durationMs: Math.max(0, Math.round(step.durationSeconds * 1_000)) }
+          : tool.item;
+      tool.item = completedItem;
+      this.#completeItem(active, completedItem, toolOutcome);
+
+      if (!hasError) {
+        const toolName =
+          step.toolName ?? (nonBlankString(step.toolInfo?.name) ? step.toolInfo.name : "");
+        const args = parseToolArgs(step.toolInfo?.parameters ?? step.toolInfo?.arguments);
+        const fileChange = projectAntigravityFileChange(toolName, args, this.#cwd);
+        if (fileChange) {
+          const fileChangeItem: HostFileChangeItem = {
+            type: "fileChange",
+            itemId: hostItemIdSchema.parse(
+              `antigravity:${this.#conversationId()}:${callId}:fileChange`,
+            ),
+            changes: [fileChange],
+          };
+          this.#event({
+            type: "item.started",
+            turnId: active.command.turnId,
+            item: fileChangeItem,
+          });
+          this.#completeItem(active, fileChangeItem, { status: "succeeded" });
+        }
+      }
+
+      active.tools.delete(callId);
+    }
+  }
+
+  #appendOrSyncAgentText(active: ActiveTurn, text: string, isExplicitDelta: boolean): void {
+    if (!text) return;
+    if (isExplicitDelta || !active.agent) {
+      this.#appendAgent(active, text);
+      return;
+    }
+    if (text === active.agentText) return;
+    if (text.startsWith(active.agentText)) {
+      const delta = text.slice(active.agentText.length);
+      if (delta.length > 0) this.#appendAgent(active, delta);
+      return;
+    }
+    this.#appendAgent(active, text);
+  }
+
+  #appendAgent(active: ActiveTurn, text: string): void {
+    if (!text) return;
+    if (!active.agent) {
+      active.agent = { type: "agentMessage", itemId: this.#newItemId(), text: "" };
+      this.#event({ type: "item.started", turnId: active.command.turnId, item: active.agent });
+    }
+    active.agent = { ...active.agent, text: active.agent.text + text };
+    active.agentText += text;
+    this.#event({
+      type: "item.updated",
+      turnId: active.command.turnId,
+      itemId: active.agent.itemId,
+      update: { type: "text.append", text },
+    });
+  }
+
+  #appendReasoning(active: ActiveTurn, text: string): void {
+    if (!text) return;
+    if (!active.reasoning) {
+      active.reasoning = { type: "reasoning", itemId: this.#newItemId(), text: "" };
+      this.#event({ type: "item.started", turnId: active.command.turnId, item: active.reasoning });
+    }
+    active.reasoning = { ...active.reasoning, text: active.reasoning.text + text };
+    this.#event({
+      type: "item.updated",
+      turnId: active.command.turnId,
+      itemId: active.reasoning.itemId,
+      update: { type: "text.append", text },
+    });
+  }
+
+  #completeReasoning(active: ActiveTurn, outcome: HostItemOutcome): void {
+    const item = active.reasoning;
+    if (!item) return;
+    active.reasoning = null;
+    this.#completeItem(active, item, outcome);
   }
 
   #completeItem(active: ActiveTurn, item: HostItem, outcome: HostItemOutcome): void {
-    const snapshot = { item, outcome } satisfies HostItemSnapshot;
-    active.completedItems.push(snapshot);
-    this.#event({ type: "item.completed", turnId: active.command.turnId, snapshot });
-  }
-
-  async #executeHarnessCommand(
-    command: HarnessCommandInvocation,
-  ): Promise<HarnessResult<HarnessCommandAccepted>> {
-    if (this.#closed) {
-      return { ok: false, error: invalidState("Antigravity Session is closed") };
-    }
-    if (this.isActive) {
-      return {
-        ok: false,
-        error: {
-          code: "sessionBusy",
-          message: "Antigravity Turn is already running",
-          retryable: true,
-        },
-      };
-    }
-    const formatted = parseAndFormatAntigravityCommand(command);
-    if (!formatted.ok) {
-      return formatted;
-    }
-    const started = await this.execute({
-      type: "turn.start",
-      turnId: command.turnId,
-      input: [{ type: "text", text: formatted.value.prompt }],
+    active.completedItems.push({ item, outcome });
+    this.#event({
+      type: "item.completed",
+      turnId: active.command.turnId,
+      snapshot: { item, outcome },
     });
-    if (!started.ok) {
-      return started;
-    }
-    return { ok: true, value: { turnId: command.turnId } };
   }
 
-  async #cancel(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>> {
-    if (!this.#active || this.#active.command.turnId !== command.turnId) {
+  async #cancelTurn(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>> {
+    const active = this.#active;
+    if (!active || active.command.turnId !== command.turnId) {
       return {
         ok: false,
         error: {
@@ -1299,208 +975,463 @@ class AntigravitySession implements HarnessSession {
         },
       };
     }
-    const active = this.#active;
     active.cancellationRequested = true;
-    active.questions.stop();
-    await active.subagents.cancel();
-    active.process.kill();
+    try {
+      await this.#transport.cancel();
+    } catch {
+      // Best-effort cancel
+    }
     return { ok: true, value: { cancellationRequested: true } };
   }
 
-  #selectModel(command: ModelSelectCommand): HarnessResult<ModelSelectCompleted> {
-    if (this.isActive) {
-      return {
-        ok: false,
-        error: { code: "sessionBusy", message: "Turn is active", retryable: true },
-      };
-    }
-    this.#model = harnessModelRefSchema.parse(command.model);
-    // Efforts are per-Model, so a Model that does not accept the retained
-    // option must drop it rather than pass a combination the CLI rejects.
-    const available = antigravityAvailableThinkingOptions(this.#catalog, this.#model);
-    if (this.#thinkingOptionId && !available?.some(({ id }) => id === this.#thinkingOptionId)) {
-      this.#thinkingOptionId = undefined;
-    }
-    this.#history.setSelection(this.#model, this.#thinkingOptionId);
-    this.#event({ type: "session.state.changed", state: this.#state() });
-    return { ok: true, value: { completed: true } };
-  }
-
-  #selectThinking(command: ThinkingSelectCommand): HarnessResult<ThinkingSelectCompleted> {
-    if (this.isActive) {
-      return {
-        ok: false,
-        error: { code: "sessionBusy", message: "Turn is active", retryable: true },
-      };
-    }
-    const requested = harnessThinkingOptionIdSchema.safeParse(command.thinkingOptionId);
-    if (!requested.success) {
+  async #selectModel(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>> {
+    if (this.#active || this.#configuring) {
       return {
         ok: false,
         error: {
-          code: "invalidRequest",
-          message: "Antigravity Thinking option is not a valid identifier",
-          retryable: false,
+          code: "sessionBusy",
+          message: "Antigravity Session cannot select a Model while busy",
+          retryable: true,
         },
       };
     }
-    const available = antigravityAvailableThinkingOptions(this.#catalog, this.#model);
-    if (!available?.some(({ id }) => id === requested.data)) {
-      return {
-        ok: false,
-        error: {
-          code: "invalidRequest",
-          message: `Antigravity Model does not accept effort "${requested.data}"`,
-          retryable: false,
-        },
-      };
-    }
-    this.#thinkingOptionId = requested.data;
-    this.#history.setSelection(this.#model, this.#thinkingOptionId);
-    this.#event({ type: "session.state.changed", state: this.#state() });
-    return { ok: true, value: { completed: true } };
-  }
-
-  #selectPermissionMode(
-    command: PermissionModeSelectCommand,
-  ): HarnessResult<PermissionModeSelectCompleted> {
-    if (this.isActive) {
-      return {
-        ok: false,
-        error: { code: "sessionBusy", message: "Turn is active", retryable: true },
-      };
-    }
+    let requestedSlug: string;
     try {
-      this.#permissionMode = decodeAntigravityPermissionModeId(command.permissionModeId);
+      requestedSlug = decodeAntigravityModelRef(command.model);
+    } catch (error) {
+      return { ok: false, error: normalizeError(error, "invalidRequest") };
+    }
+    const targetModel = modelBySlug(this.#models, requestedSlug);
+    if (!targetModel) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Antigravity Model is not in the Catalog",
+          retryable: false,
+        },
+      };
+    }
+    this.#touchSessionActivity();
+    this.#configuring = true;
+    try {
+      const currentThinking = this.#state.effectiveThinkingOptionId;
+      // Efforts are per-Model: a retained option the new Model rejects must be
+      // dropped rather than passed to the CLI (upstream-aligned).
+      let nextThinking: HarnessThinkingOptionId | undefined =
+        currentThinking !== undefined && modelAcceptsThinking(targetModel, currentThinking)
+          ? currentThinking
+          : undefined;
+      // agy requires an explicit --effort for Models with effort variants (e.g. gemini-3.7-flash);
+      // default to the strongest supported one when none was retained.
+      if (
+        !nextThinking &&
+        targetModel.supportedThinkingOptionIds &&
+        targetModel.supportedThinkingOptionIds.length > 0
+      ) {
+        nextThinking =
+          targetModel.supportedThinkingOptionIds[targetModel.supportedThinkingOptionIds.length - 1];
+      }
+      const init = await this.#transport.setModel(requestedSlug, nextThinking);
+      const effectiveModelSlug =
+        (init.model ? modelBySlug(this.#models, init.model)?.slug : undefined) ??
+        init.model ??
+        requestedSlug;
+      const effectiveModel = modelBySlug(this.#models, effectiveModelSlug) ?? targetModel;
+      const effectiveModelRef = encodeAntigravityModelRef(effectiveModel.slug);
+      const available = antigravityAvailableThinkingOptions(effectiveModel);
+      this.#state = {
+        ...this.#state,
+        effectiveModel: effectiveModelRef,
+        resolvedModelLabel: effectiveModel.label,
+        ...(nextThinking ? { effectiveThinkingOptionId: nextThinking } : {}),
+        ...(available.length > 0 ? { availableThinkingOptions: [...available] } : {}),
+      };
+      if (!nextThinking) {
+        delete this.#state.effectiveThinkingOptionId;
+      }
+      if (this.#state.nativeRef) {
+        const locator =
+          typeof this.#state.nativeRef.locator === "object" &&
+          this.#state.nativeRef.locator !== null
+            ? (this.#state.nativeRef.locator as Record<string, unknown>)
+            : {};
+        const nextLocator = {
+          ...locator,
+          model: effectiveModelSlug,
+          ...(nextThinking ? { effort: nextThinking } : {}),
+        };
+        if (!nextThinking) {
+          delete nextLocator.effort;
+        }
+        this.#state.nativeRef = nativeSessionRefSchema.parse({
+          ...this.#state.nativeRef,
+          locator: nextLocator,
+        });
+      }
+      this.#history?.setSelection(effectiveModelRef, nextThinking);
+      this.#event({
+        type: "session.state.changed",
+        state: this.#state,
+      });
+      return { ok: true, value: { completed: true } };
     } catch (error) {
       return {
         ok: false,
-        error: { code: "invalidRequest", message: errorMessage(error), retryable: false },
+        error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
       };
+    } finally {
+      this.#configuring = false;
+      this.#armSessionIdleTimer();
     }
-    this.#event({ type: "session.state.changed", state: this.#state() });
-    return { ok: true, value: { completed: true } };
   }
 
-  #state(): HarnessSessionState {
-    const availableThinkingOptions = antigravityAvailableThinkingOptions(
-      this.#catalog,
-      this.#model,
-    );
+  async #selectThinking(
+    command: ThinkingSelectCommand,
+  ): Promise<HarnessResult<ThinkingSelectCompleted>> {
+    if (this.#active || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Antigravity Session cannot select Thinking while busy",
+          retryable: true,
+        },
+      };
+    }
+    const modelSlug = this.#modelSlug();
+    const model = modelSlug ? modelBySlug(this.#models, modelSlug) : undefined;
+    const effectiveThinkingOptionId = modelAcceptsThinking(model, command.thinkingOptionId)
+      ? command.thinkingOptionId
+      : model?.supportedThinkingOptionIds?.at(-1);
+    if (!model || !effectiveThinkingOptionId) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: `Antigravity Model does not accept effort "${command.thinkingOptionId}"`,
+          retryable: false,
+        },
+      };
+    }
+    this.#touchSessionActivity();
+    this.#configuring = true;
+    try {
+      await this.#transport.setEffort(effectiveThinkingOptionId);
+      const available = antigravityAvailableThinkingOptions(model);
+      this.#state = {
+        ...this.#state,
+        effectiveThinkingOptionId,
+        ...(available.length > 0 ? { availableThinkingOptions: [...available] } : {}),
+      };
+      if (this.#state.nativeRef) {
+        const locator =
+          typeof this.#state.nativeRef.locator === "object" &&
+          this.#state.nativeRef.locator !== null
+            ? (this.#state.nativeRef.locator as Record<string, unknown>)
+            : {};
+        this.#state.nativeRef = nativeSessionRefSchema.parse({
+          ...this.#state.nativeRef,
+          locator: {
+            ...locator,
+            effort: effectiveThinkingOptionId,
+          },
+        });
+      }
+      this.#history?.setSelection(this.#modelRef(), effectiveThinkingOptionId);
+      this.#event({
+        type: "session.state.changed",
+        state: this.#state,
+      });
+      return { ok: true, value: { completed: true } };
+    } catch (error) {
+      return {
+        ok: false,
+        error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
+      };
+    } finally {
+      this.#configuring = false;
+      this.#armSessionIdleTimer();
+    }
+  }
+
+  async #selectPermissionMode(
+    command: PermissionModeSelectCommand,
+  ): Promise<HarnessResult<PermissionModeSelectCompleted>> {
+    if (this.#active || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Antigravity Session cannot select a Permission Mode while busy",
+          retryable: true,
+        },
+      };
+    }
+    let mode: AntigravityPermissionMode;
+    try {
+      mode = decodeAntigravityPermissionModeId(command.permissionModeId);
+    } catch (error) {
+      return { ok: false, error: normalizeError(error, "invalidRequest") };
+    }
+    this.#touchSessionActivity();
+    if (mode === this.#permissionMode) {
+      return { ok: true, value: { completed: true } };
+    }
+    this.#configuring = true;
+    try {
+      // The CLI fixes the permission mode at process start; switching means
+      // restarting the Session process with the same conversation (same cost
+      // as a Model switch on the resident-transport architecture).
+      await this.#transport.setPermissionMode(mode === "dangerously-skip-permissions");
+      this.#permissionMode = mode;
+      this.#event({ type: "session.state.changed", state: this.#state });
+      return { ok: true, value: { completed: true } };
+    } catch (error) {
+      return {
+        ok: false,
+        error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
+      };
+    } finally {
+      this.#configuring = false;
+      this.#armSessionIdleTimer();
+    }
+  }
+
+  #permissionDeniedError(): HarnessError {
+    const mode = this.#nativePermissionMode ? ` '${this.#nativePermissionMode}'` : "";
     return {
-      ...(this.#nativeRef ? { nativeRef: this.#nativeRef } : {}),
-      ...(this.#model ? { effectiveModel: this.#model } : {}),
-      ...(this.#thinkingOptionId ? { effectiveThinkingOptionId: this.#thinkingOptionId } : {}),
-      ...(availableThinkingOptions ? { availableThinkingOptions } : {}),
-      effectivePermissionModeId: ANTIGRAVITY_PERMISSION_MODE_CATALOG.modes.find(
-        ({ id }) => id === this.#permissionMode,
-      )?.id as HarnessPermissionModeId,
+      code: "nativeFailure",
+      message:
+        `Antigravity denied a tool call under its${mode} permission mode and produced no response. ` +
+        "Headless Antigravity evaluates its own permission rules and cannot ask for approval; " +
+        "retry with the Skip permissions Permission Mode.",
+      retryable: false,
     };
+  }
+
+  /** Persists the finished Turn into the upstream sidecar when one is attached. */
+  #recordSidecarTurn(
+    active: ActiveTurn,
+    outcome: TurnOutcome,
+    result: AntigravityResultEvent,
+  ): void {
+    const history = this.#history;
+    if (!history) return;
+    const nativeTurnRef = result.numTurns > 0 ? this.#nativeTurnRef(result) : undefined;
+    if (!nativeTurnRef) return;
+    const model = this.#modelRef();
+    history.bindNativeSession(nativeTurnRef.nativeSessionId);
+    history.append({
+      nativeTurnRef,
+      turnInput: [{ type: "text", text: active.text }],
+      items: active.completedItems,
+      outcome,
+      ...(model ? { model } : {}),
+    });
+  }
+
+  /**
+   * Reads real context-window usage from agy's local Language Server. Resolves
+   * to a no-op when the LS port is not discoverable or the metadata is not yet
+   * available; never rejects. Failures are remembered per log file so a CLI
+   * without a Language Server does not burn an 8s probe window on every Turn.
+   */
+  async #observeContextUsage(
+    active: ActiveTurn,
+    result: AntigravityResultEvent,
+    turnUsage: HostUsage | null,
+  ): Promise<void> {
+    const logPath = this.#transport.logPath;
+    if (!logPath || !result.conversationId) return;
+    const now = Date.now();
+    if (
+      this.#contextProbeLogPath === logPath &&
+      now - this.#contextProbeFailedAt < CONTEXT_PROBE_BACKOFF_MS
+    ) {
+      return;
+    }
+    try {
+      const context = await pollAntigravityContextUsage(
+        logPath,
+        result.conversationId,
+        this.#modelSlug(),
+      );
+      if (!context || this.#closed) {
+        if (!this.#closed) {
+          this.#contextProbeLogPath = logPath;
+          this.#contextProbeFailedAt = Date.now();
+        }
+        return;
+      }
+      this.#contextProbeLogPath = null;
+      const merged = turnUsage ? { ...turnUsage, ...context } : context;
+      this.#event({
+        type: "session.usage.changed",
+        usage: merged,
+        observedForTurnId: active.command.turnId,
+      });
+    } catch {
+      // Best-effort context telemetry
+    }
+  }
+
+  #conversationId(): string {
+    const id = this.#transport.conversationId ?? this.initialState.nativeRef?.nativeSessionId;
+    if (!id)
+      throw new AntigravityTransportError(
+        "protocolError",
+        "Antigravity has no Conversation identity",
+      );
+    return id;
+  }
+
+  #clearSessionIdleTimer(): void {
+    if (this.#sessionIdleTimer) {
+      clearTimeout(this.#sessionIdleTimer);
+      this.#sessionIdleTimer = null;
+    }
+  }
+
+  #touchSessionActivity(): void {
+    this.#sessionActivityGeneration += 1;
+    this.#clearSessionIdleTimer();
+  }
+
+  #armSessionIdleTimer(): void {
+    this.#clearSessionIdleTimer();
+    if (
+      this.#closed ||
+      this.#active ||
+      this.#configuring ||
+      !Number.isSafeInteger(this.#sessionIdleTimeoutMs) ||
+      this.#sessionIdleTimeoutMs <= 0
+    ) {
+      return;
+    }
+    const generation = this.#sessionActivityGeneration;
+    const timer = setTimeout(() => {
+      this.#sessionIdleTimer = null;
+      if (generation !== this.#sessionActivityGeneration) return;
+      void this.#hibernateIfIdle();
+    }, this.#sessionIdleTimeoutMs);
+    timer.unref?.();
+    this.#sessionIdleTimer = timer;
+  }
+
+  async #hibernateIfIdle(): Promise<void> {
+    if (this.#closed || this.#active || this.#configuring) {
+      this.#armSessionIdleTimer();
+      return;
+    }
+    try {
+      await this.#transport.hibernate?.();
+    } catch {
+      // A failed idle cleanup must not fault the logical Session. Retry on the
+      // next idle window while keeping the user's resumable Thread intact.
+      this.#armSessionIdleTimer();
+    }
+  }
+
+  #modelSlug(): string | undefined {
+    return this.#state.effectiveModel
+      ? decodeAntigravityModelRef(this.#state.effectiveModel)
+      : undefined;
+  }
+
+  #modelRef(): HarnessModelRef | undefined {
+    return this.#state.effectiveModel;
+  }
+
+  #newItemId() {
+    return hostItemIdSchema.parse(`antigravity:${this.#conversationId()}:${randomUUID()}`);
+  }
+
+  #nativeTurnRef(result: AntigravityResultEvent) {
+    return nativeTurnRefSchema.parse({
+      harnessId: antigravityHarnessId,
+      nativeSessionId: result.conversationId,
+      nativeTurnKey: `${result.conversationId}:turn:${result.numTurns}`,
+      formatVersion: 1,
+    });
   }
 
   #event(event: HostEvent): void {
     this.#channel.emit({ kind: "event", event });
   }
-
-  #newItemId(): HostItemId {
-    return hostItemIdSchema.parse(randomUUID());
-  }
 }
 
-function historySubagentState(
-  history: AntigravityHistory,
-  id: string,
-): HostSubagentState | undefined {
-  for (const turn of history.snapshot().reverse()) {
-    for (const { item } of [...turn.items].reverse()) {
-      if (item.type !== "subagentDelegation") continue;
-      const state = item.subagents.find((child) => child.nativeSubagentId === id);
-      if (state) return state;
-    }
-  }
-  return undefined;
+interface PreparedAntigravityTransport {
+  transport: AntigravityCliTransportLike;
+  startPromise: Promise<AntigravityInitEvent>;
 }
 
 export class AntigravityAdapter implements HarnessAdapter {
-  readonly commandCatalog = ANTIGRAVITY_COMMAND_CATALOG;
   readonly harnessId: HarnessId = antigravityHarnessId;
-  readonly subagents = {
-    readSnapshot: async (input: {
-      parent: NativeSessionRef;
-      nativeSubagentId: string;
-      cwd: string;
-    }): Promise<HarnessResult<HostThreadSnapshot>> => {
-      if (
-        this.#closed ||
-        input.parent.harnessId !== this.harnessId ||
-        !nativeSubagentIdSchema.safeParse(input.nativeSubagentId).success
-      ) {
-        return { ok: false, error: invalidState("Invalid Antigravity Subagent reference") };
-      }
-      const session = this.#findSession(input.parent.nativeSessionId);
-      const history =
-        session?.history ??
-        (await AntigravityHistory.findByNativeSessionId(
-          this.#environment,
-          input.parent.nativeSessionId,
-        ));
-      const state =
-        session?.subagentState(input.nativeSubagentId) ??
-        (history ? historySubagentState(history, input.nativeSubagentId) : undefined);
-      if (!state) {
-        return {
-          ok: false,
-          error: invalidState("Subagent does not belong to this parent Session"),
-        };
-      }
-      return readSubagentTranscript({
-        parentId: input.parent.nativeSessionId,
-        childId: input.nativeSubagentId,
-        status: state.status,
-        cwd: input.cwd,
-        outputLimit: this.#toolOutputLimit,
-      });
-    },
-  };
-  readonly #command: string | undefined;
-  readonly #environment: NodeJS.ProcessEnv;
-  readonly #inspectTimeoutMs: number;
+  readonly capabilities = ANTIGRAVITY_CAPABILITIES;
+  readonly cachedThreadCapabilities = ANTIGRAVITY_CAPABILITIES;
+  readonly #options: AntigravityAdapterOptions;
+  readonly #createTransport: (options: AntigravityTransportOptions) => AntigravityCliTransportLike;
+  readonly #listModels: (input: {
+    cwd: string;
+    command?: string;
+    environment: NodeJS.ProcessEnv;
+  }) => Promise<AntigravityModelsResult>;
+  readonly #sessions = new Set<AntigravityHarnessSession>();
+  readonly #probeProcesses = new Set<ChildProcessWithoutNullStreams>();
   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
+  readonly #inspectionFailures = new Map<
+    string,
+    { inspection: HarnessInspection; retryAt: number }
+  >();
   readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
-  readonly #printTimeout: string;
-  readonly #sessions = new Set<AntigravitySession>();
-  readonly #toolOutputLimit: number;
-  #closed = false;
-  #quota: AntigravityQuotaSnapshot | null = null;
-  #quotaCwd: string | null = null;
-  #quotaRefresh: Promise<AntigravityQuotaSnapshot | null> | null = null;
-  readonly #quotaAbort = new AbortController();
+  #inspectionPersistentLoad: Promise<void> | null = null;
+  #inspectionPersistentWrite: Promise<void> | null = null;
+  #closePromise: Promise<void> | null = null;
+  #credits: AccountCreditsSnapshot | null = null;
+  #creditsRefresh: Promise<AccountCreditsSnapshot | null> | null = null;
+  #creditsRefreshStartedAt = 0;
 
-  constructor(options: AntigravityAdapterOptions = {}) {
-    this.#command = options.command;
-    this.#environment = options.environment ?? process.env;
-    this.#inspectTimeoutMs = options.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS;
-    this.#printTimeout = options.printTimeout ?? DEFAULT_PRINT_TIMEOUT;
-    this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+  constructor(
+    options: AntigravityAdapterOptions = {},
+    dependencies: Partial<AntigravityAdapterDependencies> = {},
+  ) {
+    this.#options = options;
+    this.#createTransport =
+      dependencies.createTransport ?? ((opts) => new AntigravityCliTransport(opts));
+    this.#listModels = dependencies.listModels ?? defaultListModels;
+    this.#credits = readAntigravityCreditsSync();
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
-    if (this.#closed) {
-      return { status: "unavailable", error: invalidState("Antigravity Adapter is closed") };
+    if (this.#closePromise) {
+      return {
+        status: "unavailable",
+        error: invalidState("Antigravity Adapter is closed"),
+      };
     }
     const cwd = path.resolve(input.cwd ?? process.cwd());
+    await this.#loadPersistedInspectionCache();
     const inFlight = this.#inspectionInFlight.get(cwd);
     if (inFlight) return inFlight;
     if (!input.refresh) {
       const cached = this.#inspectionCache.get(cwd);
       if (cached) return cached;
+      const failure = this.#inspectionFailures.get(cwd);
+      if (failure && failure.retryAt > Date.now()) return failure.inspection;
+      if (failure) this.#inspectionFailures.delete(cwd);
     }
 
-    const inspection = this.#inspectCwd(cwd).then((result) => {
+    const inspection = this.#inspectCatalog(cwd).then((result) => {
       if (result.status === "ready") {
         this.#inspectionCache.set(cwd, result);
-        this.#quotaCwd = cwd;
-        void this.refreshCredits().catch(() => undefined);
+        this.#inspectionFailures.delete(cwd);
+        this.#persistInspectionCache();
+      } else {
+        this.#inspectionFailures.set(cwd, {
+          inspection: result,
+          retryAt: Date.now() + INSPECTION_FAILURE_COOLDOWN_MS,
+        });
       }
       return result;
     });
@@ -1512,289 +1443,683 @@ export class AntigravityAdapter implements HarnessAdapter {
     });
   }
 
-  async #inspectCwd(cwd: string): Promise<HarnessInspection> {
-    const executable = resolveAntigravityExecutable({
-      ...(this.#command ? { command: this.#command } : {}),
-      environment: this.#environment,
-    });
-    if (!executable) {
-      return {
-        status: "notInstalled",
-        error: {
-          code: "notInstalled",
-          message: "Antigravity CLI (agy) is not installed",
-          retryable: false,
-        },
-      };
-    }
+  /**
+   * Return the restart-safe local history cache without spawning AGY or
+   * contacting Google. The Host uses this only to paint an existing thread;
+   * execution still goes through the normal resume path below.
+   */
+  async readCachedSnapshot(
+    input: ResumeSessionInput,
+  ): Promise<HarnessResult<HostThreadSnapshot | null>> {
     try {
-      const { stdout } = await runBuffered(
-        executable,
-        ["models"],
-        cwd,
-        this.#environment,
-        this.#inspectTimeoutMs,
+      const environment = this.#environment(input.environment);
+      const history = await AntigravityHistory.open({
+        environment,
+        nativeSessionId: input.nativeRef.nativeSessionId,
+      });
+      const cachedTurns = history.snapshot();
+      if (cachedTurns.length > 0) {
+        return {
+          ok: true,
+          value: {
+            turns: cachedTurns,
+            state: { nativeRef: input.nativeRef },
+          },
+        };
+      }
+      const snapshot = await loadAntigravitySnapshot(
+        input.nativeRef.nativeSessionId,
+        { nativeRef: input.nativeRef },
+        {
+          cwd: input.cwd,
+          environment,
+        },
       );
+      return { ok: true, value: snapshot };
+    } catch {
+      // A cache read is an optimization. If it is unavailable or corrupt, the
+      // regular resume path remains authoritative and reports the real error.
+      return { ok: true, value: null };
+    }
+  }
+
+  async #inspectCatalog(cwd: string): Promise<HarnessInspection> {
+    const startedAt = Date.now();
+    let stage: HarnessInspection["status"] = "notInstalled";
+    try {
+      stage = "unavailable";
+      resolveAntigravityExecutable({
+        ...(this.#options.command ? { command: this.#options.command } : {}),
+        environment: this.#environment(),
+      });
+      const result = await this.#listModels({
+        cwd,
+        ...(this.#options.command ? { command: this.#options.command } : {}),
+        environment: this.#environment(),
+      });
+      const models = parseAntigravityModelsOutput(result.stdout);
+      const catalog = normalizeAntigravityModelCatalog(models);
       return {
         status: "ready",
-        catalog: parseAntigravityModels(stdout),
+        catalog,
+        // Upstream: the Permission Mode catalog must accompany the capability
+        // (the shared inspection schema cross-checks the two).
         permissionModes: ANTIGRAVITY_PERMISSION_MODE_CATALOG,
-        capabilities: CAPABILITIES,
+        capabilities: ANTIGRAVITY_CAPABILITIES,
       };
     } catch (error) {
-      const message = errorMessage(error);
-      const normalized = normalizedProcessError(message, message);
+      const normalized = normalizeError(error, "unavailable");
       return {
-        status: "error",
-        error: { ...normalized, stage: "model-catalog" },
+        status: normalized.code === "notInstalled" ? "notInstalled" : "error",
+        error: { ...normalized, stage, durationMs: Date.now() - startedAt },
       };
     }
   }
 
-  async inspectAccount(): Promise<HarnessAccountSnapshot | null> {
-    // The native /usage command resolves authentication itself. Never fall back
-    // to the last quota observation when authentication has changed or failed.
-    const snapshot = await this.refreshCredits();
-    if (!snapshot) return null;
-    return {
-      credits: {
-        label: snapshot.label,
-        usedPercent: snapshot.usedPercent,
-        periodType: snapshot.periodType,
-        ...(snapshot.resetsAt ? { resetsAt: snapshot.resetsAt } : {}),
-        ...(snapshot.productUsage ? { productUsage: [...snapshot.productUsage] } : {}),
-      },
-    };
-  }
-
-  /** Duck-typed by the Host Runtime to populate the account credits surface. */
-  credits(): AntigravityQuotaSnapshot | null {
-    return this.#quota;
-  }
-
-  refreshCredits(): Promise<AntigravityQuotaSnapshot | null> {
-    if (this.#quotaRefresh) return this.#quotaRefresh;
-    this.#quotaRefresh = this.#loadQuota().finally(() => {
-      this.#quotaRefresh = null;
-    });
-    return this.#quotaRefresh;
-  }
-
-  async #loadQuota(): Promise<AntigravityQuotaSnapshot | null> {
-    if (this.#closed) return null;
-    const executable = resolveAntigravityExecutable({
-      ...(this.#command ? { command: this.#command } : {}),
-      environment: this.#environment,
-    });
-    if (!executable) return null;
-    const cwd = this.#quotaCwd ?? process.cwd();
-    const snapshot = await fetchAntigravityQuota(async (arguments_) => {
-      const { stdout } = await runBuffered(
-        executable,
-        [...arguments_],
-        cwd,
-        this.#environment,
-        Math.min(this.#inspectTimeoutMs, 10_000),
-        this.#quotaAbort.signal,
-      );
-      return stdout;
-    });
-    if (snapshot) this.#quota = snapshot;
-    return snapshot;
-  }
-
-  #findSession(nativeSessionId: string): AntigravitySession | undefined {
-    for (const session of this.#sessions) {
-      if (session.nativeRef?.nativeSessionId === nativeSessionId) {
-        return session;
-      }
+  credits(): AccountCreditsSnapshot | null {
+    if (!this.#credits) {
+      this.#credits = readAntigravityCreditsSync();
     }
-    return undefined;
+    return this.#credits;
+  }
+
+  refreshCredits(): Promise<AccountCreditsSnapshot | null> {
+    if (this.#closePromise) return Promise.resolve(this.#credits);
+    if (this.#creditsRefresh) return this.#creditsRefresh;
+    const now = Date.now();
+    if (now - this.#creditsRefreshStartedAt < CREDITS_REFRESH_COOLDOWN_MS) {
+      return Promise.resolve(this.#credits);
+    }
+    this.#creditsRefreshStartedAt = now;
+    this.#creditsRefresh = this.#loadCredits().finally(() => {
+      this.#creditsRefresh = null;
+    });
+    return this.#creditsRefresh;
+  }
+
+  #scheduleCreditsRefresh(): void {
+    void this.refreshCredits();
+  }
+
+  async #loadCredits(): Promise<AccountCreditsSnapshot | null> {
+    // Fusion: the CLI's own `--print=/usage` is the primary quota source; the
+    // local statusline/snapshot files stay as a fallback when it is unavailable.
+    try {
+      const quota = await fetchAntigravityQuota((arguments_) =>
+        this.#runAntigravityCommand(arguments_),
+      );
+      if (quota) {
+        // The Host validates against the shared credits contract; project the
+        // CLI bucket shape onto it (upstream keeps them field-for-field).
+        const credits: AccountCreditsSnapshot = {
+          usedPercent: quota.usedPercent,
+          periodType: quota.periodType,
+          ...(quota.resetsAt ? { resetsAt: quota.resetsAt } : {}),
+          ...(quota.productUsage && quota.productUsage.length > 0
+            ? { productUsage: [...quota.productUsage] }
+            : {}),
+        };
+        this.#credits = credits;
+        return this.#credits;
+      }
+    } catch {
+      // Fall through to the filesystem-backed fallback below.
+    }
+    try {
+      const snapshot = readAntigravityCreditsSync();
+      if (snapshot) this.#credits = snapshot;
+    } catch {
+      // Best-effort account telemetry
+    }
+    return this.#credits;
+  }
+
+  /** Runs the Antigravity CLI once and resolves stdout (quota probes). */
+  #runAntigravityCommand(arguments_: readonly string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      let executable: string;
+      try {
+        executable = resolveAntigravityExecutable({
+          ...(this.#options.command ? { command: this.#options.command } : {}),
+          environment: this.#environment(),
+        });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const child = spawn(executable, [...arguments_], {
+        env: this.#environment(),
+        detached: process.platform !== "win32",
+        windowsHide: true,
+      });
+      this.#probeProcesses.add(child);
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.#probeProcesses.delete(child);
+        reject(new Error("Antigravity quota probe timed out"));
+        void terminateProbe(child).catch(() => undefined);
+      }, DEFAULT_PROBE_TIMEOUT_MS);
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#probeProcesses.delete(child);
+        callback();
+      };
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("exit", (code) => {
+        finish(() => {
+          if (code === 0) resolve(stdout);
+          else reject(new Error(stderr.trim() || `agy exited with code ${String(code)}`));
+        });
+      });
+    });
   }
 
   async open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>> {
-    if (this.#closed) return { ok: false, error: invalidState("Antigravity Adapter is closed") };
-    if (!input.cwd) {
-      return {
-        ok: false,
-        error: { code: "invalidRequest", message: "Antigravity requires cwd", retryable: false },
-      };
-    }
-    const executable = resolveAntigravityExecutable({
-      ...(this.#command ? { command: this.#command } : {}),
-      environment: this.#environment,
-    });
-    if (!executable) {
+    if (this.#closePromise)
+      return { ok: false, error: invalidState("Antigravity Adapter is closed") };
+    if (!input.cwd)
       return {
         ok: false,
         error: {
-          code: "notInstalled",
-          message: "Antigravity CLI is not installed",
+          code: "invalidRequest",
+          message: "Antigravity Adapter requires cwd",
+          retryable: false,
+        },
+      };
+    const prepared = this.#prepareTransport(input);
+    const cwd = path.resolve(input.cwd);
+    const cachedInspection = this.#inspectionCache.get(cwd);
+    let inspection: HarnessInspection;
+    if (cachedInspection) {
+      inspection = cachedInspection;
+    } else {
+      inspection = await this.inspect({ cwd: input.cwd });
+    }
+    if (inspection.status !== "ready") {
+      await this.#closePreparedTransport(prepared);
+      return { ok: false, error: harnessErrorFromInspection(inspection.error) };
+    }
+    const models = inspection.catalog.models.map((model) => {
+      const slug = decodeAntigravityModelRef(model.ref);
+      return {
+        slug,
+        label: model.label,
+        ...(model.supportedThinkingOptionIds && model.supportedThinkingOptionIds.length > 0
+          ? { supportedThinkingOptionIds: [...model.supportedThinkingOptionIds] }
+          : {}),
+      };
+    });
+    if (input.kind === "create") {
+      const opened = await this.#openCreate(input, models, prepared);
+      if (opened.ok) this.#scheduleCreditsRefresh();
+      return opened;
+    }
+    if (input.kind !== "resume") {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: "Antigravity CLI does not expose exact Fork or rollback operations",
           retryable: false,
         },
       };
     }
-    const cwd = path.resolve(input.cwd);
-    let catalog = this.#inspectionCache.get(cwd)?.catalog;
-    if (!catalog) {
-      const inspection = await this.inspect({ cwd: input.cwd });
-      if (inspection.status === "ready") catalog = inspection.catalog;
-    }
-
-    if (input.kind === "fork") {
-      const sourceSession = this.#findSession(input.sourceRef.nativeSessionId);
-      return forkAntigravitySession({
-        harnessId: this.harnessId,
-        input,
-        adapterEnvironment: this.#environment,
-        ...(sourceSession
-          ? {
-              sourceSession: {
-                history: sourceSession.history,
-                model: sourceSession.model,
-                thinkingOptionId: sourceSession.thinkingOptionId,
-                permissionMode: sourceSession.permissionMode,
-                isActive: sourceSession.isActive,
-              },
-            }
-          : {}),
-        createSession: (params) => {
-          const session = new AntigravitySession({
-            ...(catalog ? { catalog } : {}),
-            cwd: params.cwd,
-            environment: params.environment,
-            executable,
-            history: params.history,
-            ...(params.model ? { model: params.model } : {}),
-            nativeRef: params.nativeRef,
-            permissionMode: params.permissionMode,
-            printTimeout: this.#printTimeout,
-            ...(params.thinkingOptionId ? { thinkingOptionId: params.thinkingOptionId } : {}),
-            toolOutputLimit: this.#toolOutputLimit,
-            onClosed: () => this.#sessions.delete(session),
-          });
-          this.#sessions.add(session);
-          return session;
-        },
-      });
-    }
-
-    if (input.kind === "rollbackLastTurn") {
-      const sourceSession = this.#findSession(input.sourceRef.nativeSessionId);
-      return rollbackAntigravityLastTurn({
-        harnessId: this.harnessId,
-        input,
-        adapterEnvironment: this.#environment,
-        ...(sourceSession
-          ? {
-              sourceSession: {
-                history: sourceSession.history,
-                model: sourceSession.model,
-                thinkingOptionId: sourceSession.thinkingOptionId,
-                permissionMode: sourceSession.permissionMode,
-                isActive: sourceSession.isActive,
-              },
-            }
-          : {}),
-        createSession: (params) => {
-          const session = new AntigravitySession({
-            ...(catalog ? { catalog } : {}),
-            cwd: params.cwd,
-            environment: params.environment,
-            executable,
-            history: params.history,
-            ...(params.model ? { model: params.model } : {}),
-            nativeRef: params.nativeRef,
-            permissionMode: params.permissionMode,
-            printTimeout: this.#printTimeout,
-            ...(params.thinkingOptionId ? { thinkingOptionId: params.thinkingOptionId } : {}),
-            toolOutputLimit: this.#toolOutputLimit,
-            onClosed: () => this.#sessions.delete(session),
-          });
-          this.#sessions.add(session);
-          return session;
-        },
-      });
-    }
-
-    let nativeRef: NativeSessionRef | undefined;
-    if (input.kind === "resume") {
-      nativeRef = nativeSessionRefSchema.parse(input.nativeRef);
-      if (nativeRef.harnessId !== this.harnessId) {
-        return {
-          ok: false,
-          error: {
-            code: "invalidRequest",
-            message: "Antigravity cannot resume another Harness Session",
-            retryable: false,
-          },
-        };
-      }
-    }
-    let permissionMode: AntigravityPermissionMode = "configured";
-    if (input.kind === "create" && input.permissionModeId) {
-      try {
-        permissionMode = decodeAntigravityPermissionModeId(input.permissionModeId);
-      } catch (error) {
-        return {
-          ok: false,
-          error: { code: "invalidRequest", message: errorMessage(error), retryable: false },
-        };
-      }
-    }
-    const sessionEnvironment = { ...this.#environment, ...(input.environment ?? {}) };
-    const history = await AntigravityHistory.open({
-      environment: sessionEnvironment,
-      ...(nativeRef ? { nativeSessionId: nativeRef.nativeSessionId } : {}),
-      ...(input.kind === "resume" && input.knownTurnRefs
-        ? { knownTurnRefs: input.knownTurnRefs }
-        : {}),
-    });
-    const model = (input.kind === "create" ? input.model : undefined) ?? history.model;
-    const thinkingOptionId =
-      (input.kind === "create" ? input.thinkingOptionId : undefined) ?? history.thinkingOptionId;
-    // `thread/start` reaches open() directly, so an effort the Model does not
-    // accept has to be refused here; otherwise the CLI only rejects the
-    // resulting `--effort` once the first Turn runs.
-    if (thinkingOptionId) {
-      const available = antigravityAvailableThinkingOptions(catalog, model);
-      if (!available?.some(({ id }) => id === thinkingOptionId)) {
-        return {
-          ok: false,
-          error: {
-            code: "invalidRequest",
-            message: `Antigravity Model does not accept effort "${thinkingOptionId}"`,
-            retryable: false,
-          },
-        };
-      }
-    }
-    if (model || thinkingOptionId) history.setSelection(model, thinkingOptionId);
-    const session = new AntigravitySession({
-      ...(catalog ? { catalog } : {}),
-      cwd: input.cwd,
-      environment: sessionEnvironment,
-      executable,
-      history,
-      ...(model ? { model } : {}),
-      ...(nativeRef ? { nativeRef } : {}),
-      permissionMode,
-      printTimeout: this.#printTimeout,
-      ...(thinkingOptionId ? { thinkingOptionId } : {}),
-      toolOutputLimit: this.#toolOutputLimit,
-      onClosed: () => this.#sessions.delete(session),
-    });
-    this.#sessions.add(session);
-    return { ok: true, value: session };
+    const opened = await this.#openResume(input, models, prepared);
+    if (opened.ok) this.#scheduleCreditsRefresh();
+    return opened;
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#inspectionCache.clear();
-    this.#quota = null;
-    this.#quotaCwd = null;
-    this.#quotaAbort.abort();
-    await Promise.all([...this.#sessions].map((session) => session.close()));
+    if (this.#closePromise) return this.#closePromise;
+    this.#closePromise = (async () => {
+      const sessions = Array.from(this.#sessions);
+      const probes = Array.from(this.#probeProcesses);
+      await Promise.allSettled([
+        ...sessions.map((s) => s.close()),
+        ...probes.map((probe) => terminateProbe(probe)),
+      ]);
+      await this.#inspectionPersistentWrite?.catch(() => undefined);
+      this.#sessions.clear();
+      this.#probeProcesses.clear();
+      this.#inspectionCache.clear();
+      this.#inspectionFailures.clear();
+      this.#inspectionInFlight.clear();
+      this.#inspectionPersistentLoad = null;
+      this.#inspectionPersistentWrite = null;
+    })();
+    return this.#closePromise;
   }
+
+  #inspectionCachePath(): string | null {
+    const environment = this.#environment();
+    const root =
+      environment.CODEXHOST_DATA_DIR?.trim() ||
+      path.join(
+        environment.CODEX_HOME?.trim() || path.join(environment.HOME || homedir(), ".codex"),
+        "codexhost-cache",
+      );
+    return path.join(root, "antigravity-model-catalog-v1.json");
+  }
+
+  async #loadPersistedInspectionCache(): Promise<void> {
+    if (!this.#inspectionPersistentLoad) {
+      const filePath = this.#inspectionCachePath();
+      this.#inspectionPersistentLoad = (async () => {
+        if (!filePath) return;
+        try {
+          const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+          if (
+            !parsed ||
+            typeof parsed !== "object" ||
+            Array.isArray(parsed) ||
+            (parsed as { version?: unknown }).version !== PERSISTED_INSPECTION_VERSION ||
+            !Array.isArray((parsed as { entries?: unknown }).entries)
+          ) {
+            return;
+          }
+          for (const entry of (parsed as { entries: unknown[] }).entries) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const cwd = (entry as { cwd?: unknown }).cwd;
+            const updatedAtMs = (entry as { updatedAtMs?: unknown }).updatedAtMs;
+            const inspection = harnessInspectionSchema.safeParse(
+              (entry as { inspection?: unknown }).inspection,
+            );
+            if (
+              typeof cwd === "string" &&
+              typeof updatedAtMs === "number" &&
+              Number.isFinite(updatedAtMs) &&
+              Date.now() - updatedAtMs <= PERSISTED_INSPECTION_MAX_AGE_MS &&
+              inspection.success &&
+              inspection.data.status === "ready"
+            ) {
+              this.#inspectionCache.set(path.resolve(cwd), inspection.data);
+            }
+          }
+        } catch {
+          // Persisted model metadata is an optimization; stale or corrupt data
+          // falls back to the normal AGY catalog request.
+        }
+      })();
+    }
+    await this.#inspectionPersistentLoad;
+  }
+
+  #persistInspectionCache(): void {
+    const filePath = this.#inspectionCachePath();
+    if (!filePath || this.#inspectionCache.size === 0) return;
+    const updatedAtMs = Date.now();
+    const entries = [...this.#inspectionCache.entries()].map(([cwd, inspection]) => ({
+      cwd,
+      inspection,
+      updatedAtMs,
+    }));
+    const previous = this.#inspectionPersistentWrite ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+        const temporary = `${filePath}.tmp-${process.pid}`;
+        await writeFile(
+          temporary,
+          JSON.stringify({ version: PERSISTED_INSPECTION_VERSION, entries }),
+          {
+            encoding: "utf8",
+            mode: 0o600,
+          },
+        );
+        await rename(temporary, filePath);
+      });
+    this.#inspectionPersistentWrite = write.catch(() => undefined);
+  }
+
+  async #openCreate(
+    input: Extract<OpenSessionInput, { kind: "create" }>,
+    models: readonly AntigravityNativeModel[],
+    prepared?: PreparedAntigravityTransport | null,
+  ): Promise<HarnessResult<HarnessSession>> {
+    let modelSlug: string | undefined;
+    let model: AntigravityNativeModel | undefined;
+    let permissionMode: AntigravityPermissionMode = "dangerously-skip-permissions";
+    let thinkingOptionId: HarnessThinkingOptionId | undefined;
+    try {
+      modelSlug = input.model ? decodeAntigravityModelRef(input.model) : models[0]?.slug;
+      model = modelSlug ? modelBySlug(models, modelSlug) : undefined;
+      if (!modelSlug || !model)
+        throw new Error("Antigravity create Model is not in the current Catalog");
+      if (input.permissionModeId) {
+        permissionMode = decodeAntigravityPermissionModeId(input.permissionModeId);
+      }
+      thinkingOptionId = input.thinkingOptionId;
+      // agy requires an explicit --effort for Models with effort variants; the
+      // CLI default is the strongest one, so lead with it when none was chosen.
+      if (!thinkingOptionId) {
+        const supported = model.supportedThinkingOptionIds;
+        if (supported && supported.length > 0) {
+          thinkingOptionId = supported[supported.length - 1];
+        }
+      }
+      if (thinkingOptionId && !modelAcceptsThinking(model, thinkingOptionId)) {
+        throw new Error("Antigravity create Thinking option is not accepted by the selected Model");
+      }
+    } catch (error) {
+      await this.#closePreparedTransport(prepared);
+      return { ok: false, error: normalizeError(error, "invalidRequest") };
+    }
+    const skipPermissions = permissionMode === "dangerously-skip-permissions";
+    const transport =
+      prepared?.transport ??
+      this.#createTransport(
+        this.#transportOptions(input, modelSlug, undefined, skipPermissions, thinkingOptionId),
+      );
+    try {
+      const init = await (prepared?.startPromise ?? transport.start());
+      const effectiveModelSlug =
+        (init.model ? modelBySlug(models, init.model)?.slug : undefined) ??
+        modelSlug ??
+        init.model ??
+        models[0]?.slug;
+      const effectiveModel = effectiveModelSlug ? modelBySlug(models, effectiveModelSlug) : model;
+      const state = {
+        ...sessionState(
+          init,
+          effectiveModel,
+          effectiveModelSlug,
+          thinkingOptionId,
+          skipPermissions,
+        ),
+        ...(effectiveModel ? { resolvedModelLabel: effectiveModel.label } : {}),
+      };
+      const ledger = new AntigravitySessionLedger({
+        conversationId: init.conversationId,
+        cwd: input.cwd,
+        environment: this.#environment(input.environment),
+      });
+      const history = await AntigravityHistory.open({
+        environment: this.#environment(input.environment),
+        nativeSessionId: init.conversationId,
+      });
+      const session = this.#trackSession(
+        new AntigravityHarnessSession({
+          cwd: input.cwd,
+          environment: this.#environment(input.environment),
+          models,
+          transport,
+          initialState: state,
+          ledger,
+          history,
+          permissionMode,
+          nativePermissionMode: init.permissionMode ?? null,
+          toolOutputLimit: this.#options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT,
+          ...(this.#options.sessionIdleTimeoutMs !== undefined
+            ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
+            : {}),
+        }),
+      );
+      return { ok: true, value: session };
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      return { ok: false, error: normalizeError(error, "unavailable", transport.stderrTail) };
+    }
+  }
+
+  async #openResume(
+    input: Extract<OpenSessionInput, { kind: "resume" }>,
+    models: readonly AntigravityNativeModel[],
+    prepared?: PreparedAntigravityTransport | null,
+  ): Promise<HarnessResult<HarnessSession>> {
+    let sourceRef: NativeSessionRef;
+    let locator: {
+      model?: string;
+      effort?: HarnessThinkingOptionId;
+      skipPermissions: boolean;
+    };
+    try {
+      sourceRef = nativeSessionRefSchema.parse(input.nativeRef);
+      if (sourceRef.harnessId !== this.harnessId)
+        throw new Error("Antigravity Adapter cannot open another Harness's Native Session");
+      locator = modelSlugFromLocator(sourceRef);
+    } catch (error) {
+      return { ok: false, error: normalizeError(error, "invalidRequest") };
+    }
+    const transport =
+      prepared?.transport ??
+      this.#createTransport(
+        this.#transportOptions(
+          input,
+          locator.model,
+          sourceRef.nativeSessionId,
+          locator.skipPermissions,
+          locator.effort,
+        ),
+      );
+    try {
+      const init = await (prepared?.startPromise ?? transport.start());
+      if (
+        init.conversationId &&
+        sourceRef.nativeSessionId &&
+        init.conversationId !== sourceRef.nativeSessionId
+      )
+        throw new AntigravityTransportError(
+          "protocolError",
+          "Antigravity resume changed the Native Session identity",
+        );
+      const effectiveModelSlug =
+        (init.model ? modelBySlug(models, init.model)?.slug : undefined) ??
+        locator.model ??
+        init.model ??
+        models[0]?.slug;
+      const model = effectiveModelSlug ? modelBySlug(models, effectiveModelSlug) : undefined;
+      // A retained effort the Model does not accept must be dropped rather than
+      // passed to the CLI (upstream-aligned); the CLI then applies its own default.
+      let effort =
+        locator.effort && model && !modelAcceptsThinking(model, locator.effort)
+          ? undefined
+          : locator.effort;
+      // Resume spawns still pass --model; Models with effort variants require an
+      // explicit --effort, so default to the strongest when none was retained.
+      if (
+        !effort &&
+        model?.supportedThinkingOptionIds &&
+        model.supportedThinkingOptionIds.length > 0
+      ) {
+        effort = model.supportedThinkingOptionIds[model.supportedThinkingOptionIds.length - 1];
+      }
+      const skipPermissions = locator.skipPermissions;
+      const state = {
+        ...sessionState(init, model, effectiveModelSlug, effort, skipPermissions),
+        ...(model ? { resolvedModelLabel: model.label } : {}),
+      };
+      const ledger = new AntigravitySessionLedger({
+        conversationId: sourceRef.nativeSessionId,
+        cwd: input.cwd,
+        environment: this.#environment(input.environment),
+      });
+      const history = await AntigravityHistory.open({
+        environment: this.#environment(input.environment),
+        nativeSessionId: sourceRef.nativeSessionId,
+        ...(input.knownTurnRefs ? { knownTurnRefs: input.knownTurnRefs } : {}),
+      });
+      const session = this.#trackSession(
+        new AntigravityHarnessSession({
+          cwd: input.cwd,
+          environment: this.#environment(input.environment),
+          models,
+          transport,
+          initialState: state,
+          ledger,
+          history,
+          permissionMode: skipPermissions ? "dangerously-skip-permissions" : "configured",
+          nativePermissionMode: init.permissionMode ?? null,
+          historyRequired: input.knownTurnRefs?.length ?? 0,
+          toolOutputLimit: this.#options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT,
+          ...(this.#options.sessionIdleTimeoutMs !== undefined
+            ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
+            : {}),
+        }),
+      );
+      return { ok: true, value: session };
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      return { ok: false, error: normalizeError(error, "unavailable", transport.stderrTail) };
+    }
+  }
+
+  #trackSession(session: AntigravityHarnessSession): AntigravityHarnessSession {
+    this.#sessions.add(session);
+    return session;
+  }
+
+  #transportOptions(
+    input: OpenSessionInput,
+    model: string | undefined,
+    conversationId: string | undefined,
+    skipPermissions: boolean,
+    effort?: string,
+  ): AntigravityTransportOptions {
+    return {
+      cwd: input.cwd,
+      ...(this.#options.command ? { command: this.#options.command } : {}),
+      environment: this.#environment(input.environment),
+      ...(conversationId ? { conversationId } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      skipPermissions,
+      ...(this.#options.startupTimeoutMs !== undefined
+        ? { startupTimeoutMs: this.#options.startupTimeoutMs }
+        : {}),
+      ...(this.#options.turnTimeoutMs !== undefined
+        ? { turnTimeoutMs: this.#options.turnTimeoutMs }
+        : {}),
+      ...(this.#options.idleTimeoutMs !== undefined
+        ? { idleTimeoutMs: this.#options.idleTimeoutMs }
+        : {}),
+      ...(this.#options.turnDeadlineMs !== undefined
+        ? { turnDeadlineMs: this.#options.turnDeadlineMs }
+        : {}),
+      ...(this.#options.closeTimeoutMs !== undefined
+        ? { closeTimeoutMs: this.#options.closeTimeoutMs }
+        : {}),
+      ...(this.#options.printTimeout !== undefined
+        ? { printTimeout: this.#options.printTimeout }
+        : {}),
+    };
+  }
+
+  #prepareTransport(input: OpenSessionInput): PreparedAntigravityTransport | null {
+    let model: string | undefined;
+    let conversationId: string | undefined;
+    let effort: string | undefined;
+    let skipPermissions = false;
+    try {
+      if (input.kind === "create") {
+        // Pre-starting needs the full launch shape; the default effort for
+        // effort-variant Models is only known after the model catalog loads, so
+        // only pre-start when a Thinking option was explicitly requested.
+        if (!input.model || !input.thinkingOptionId) return null;
+        model = decodeAntigravityModelRef(input.model);
+        effort = input.thinkingOptionId;
+        skipPermissions = input.permissionModeId
+          ? decodeAntigravityPermissionModeId(input.permissionModeId) ===
+            "dangerously-skip-permissions"
+          : true;
+      } else if (input.kind === "resume") {
+        const sourceRef = nativeSessionRefSchema.parse(input.nativeRef);
+        if (sourceRef.harnessId !== this.harnessId) return null;
+        const locator = modelSlugFromLocator(sourceRef);
+        model = locator.model;
+        effort = locator.effort;
+        conversationId = sourceRef.nativeSessionId;
+        skipPermissions = locator.skipPermissions;
+      } else {
+        return null;
+      }
+      const transport = this.#createTransport(
+        this.#transportOptions(input, model, conversationId, skipPermissions, effort),
+      );
+      const startPromise = transport.start();
+      void startPromise.catch(() => undefined);
+      return { transport, startPromise };
+    } catch {
+      return null;
+    }
+  }
+
+  async #closePreparedTransport(prepared?: PreparedAntigravityTransport | null): Promise<void> {
+    if (!prepared) return;
+    await prepared.transport.close().catch(() => undefined);
+  }
+
+  #environment(explicit?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return resolveAntigravityProxyEnvironment({
+      ...process.env,
+      ...this.#options.environment,
+      ...explicit,
+    });
+  }
+}
+
+async function defaultListModels(input: {
+  cwd: string;
+  command?: string;
+  environment: NodeJS.ProcessEnv;
+}): Promise<AntigravityModelsResult> {
+  const executable = resolveAntigravityExecutable({
+    ...(input.command ? { command: input.command } : {}),
+    environment: input.environment,
+  });
+  const invocation = antigravityModelsInvocation(executable, input.environment);
+  return new Promise((resolve, reject) => {
+    const child = spawn(invocation.command, invocation.arguments, {
+      cwd: input.cwd,
+      env: input.environment,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("Antigravity models listing timed out"));
+      void terminateProbe(child).catch(() => undefined);
+    }, DEFAULT_MODELS_TIMEOUT_MS);
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("exit", (code) => {
+      finish(() => {
+        if (code === 0) resolve({ stdout, stderr });
+        else reject(new Error(`Antigravity models failed with exit code ${code}: ${stderr}`));
+      });
+    });
+  });
 }

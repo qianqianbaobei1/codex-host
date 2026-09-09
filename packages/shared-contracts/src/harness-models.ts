@@ -6,7 +6,12 @@ import {
   harnessPermissionModeIdSchema,
 } from "./harness-permission-modes.js";
 import { harnessIdSchema, hostThreadIdSchema } from "./ids.js";
-import { threadUsageSnapshotSchema } from "./thread-usage.js";
+import {
+  accountBalanceSnapshotSchema,
+  accountCreditsSnapshotSchema,
+  accountCreditsStatusSchema,
+  threadUsageSnapshotSchema,
+} from "./thread-usage.js";
 
 export const HARNESS_MODEL_REF_MAX_LENGTH = 512;
 export const HARNESS_MODEL_LABEL_MAX_LENGTH = 256;
@@ -225,6 +230,10 @@ const readyHarnessInspectionSchema = z
   .object({
     status: z.literal("ready"),
     catalog: harnessModelCatalogSchema,
+    accountCredits: accountCreditsSnapshotSchema.optional(),
+    accountBalance: accountBalanceSnapshotSchema.optional(),
+    accountBalanceStatus: accountCreditsStatusSchema.optional(),
+    accountCreditsStatus: accountCreditsStatusSchema.optional(),
     permissionModes: harnessPermissionModeCatalogSchema.optional(),
     capabilities: harnessSessionCapabilitiesSchema,
     webUi: harnessWebUiCapabilitySchema.optional(),

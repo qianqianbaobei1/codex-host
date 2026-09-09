@@ -37,7 +37,6 @@ export interface AntigravityStepUpdateEvent {
     duration_seconds?: number;
     usage?: AntigravityUsage;
     tool_name?: string;
-    subagent_info?: unknown;
     tool_info?: {
       name?: string;
       parameters?: unknown;
@@ -53,7 +52,6 @@ export interface AntigravityResultEvent {
     conversation_id: string;
     status: string;
     response?: string;
-    error?: string;
     num_turns: number;
     usage?: AntigravityUsage;
   };

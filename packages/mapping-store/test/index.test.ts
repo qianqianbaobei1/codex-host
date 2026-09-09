@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   MappingStore,
   packageMetadata,
+  storedExternalGoalV1Schema,
   storedThreadRecordV1Schema,
   type MappingStoreError,
   type StoredThreadRecordV1,
@@ -110,6 +111,37 @@ describe("mapping-store package", () => {
   it("participates in the shared contract", () => {
     expect(packageMetadata.name).toBe("@codexhost/mapping-store");
     expect(packageMetadata.contractVersion).toBe(1);
+  });
+
+  it("clears the old native identity while a handover session is still creating", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+
+    const nextHarness = harnessIdSchema.parse("claude-code");
+    const handedOver = await store.handoverHarness({
+      hostThreadId: threadId,
+      harnessId: nextHarness,
+      transportModelId: "codexhost/claude-code-native",
+    });
+
+    expect(handedOver.state).toBe("creating");
+    expect(handedOver.harnessId).toBe(nextHarness);
+    expect(handedOver.nativeSessionRef).toBeUndefined();
+
+    const nextNativeRef = nativeSessionRefSchema.parse({
+      harnessId: nextHarness,
+      nativeSessionId: "claude-session-1",
+      formatVersion: 1,
+    });
+    const ready = await store.commitReady({
+      hostThreadId: threadId,
+      nativeSessionRef: nextNativeRef,
+    });
+    expect(ready.state).toBe("ready");
+    expect(ready.nativeSessionRef?.harnessId).toBe(nextHarness);
+    await store.close();
   });
 
   it("resolves a repeated caller create request to the existing Thread", async () => {
@@ -227,6 +259,45 @@ describe("mapping-store package", () => {
       transportModelId: "codexhost/pi-native",
       turnMappings: [mapping(1)],
     });
+    await second.close();
+  });
+
+  it("persists one External Goal atomically with its Thread and rejects stale revisions", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory, instanceId: "goal-first" });
+    await first.initialize();
+    await createReady(first);
+    const goal = storedExternalGoalV1Schema.parse({
+      formatVersion: 1,
+      goalId: "goal-1",
+      origin: "codexhost",
+      harnessId,
+      objective: "Finish the synthetic Goal",
+      status: "active",
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      revision: 1,
+      turnCount: 0,
+      noProgressCount: 0,
+      blockerStallCount: 0,
+      createdAt: new Date("2026-09-04T00:00:00.000Z").toISOString(),
+      updatedAt: new Date("2026-09-04T00:00:00.000Z").toISOString(),
+    });
+    await first.setThreadGoal(threadId, goal);
+    await first.close();
+
+    const second = new MappingStore({ directory, instanceId: "goal-second" });
+    await second.initialize();
+    await expect(second.getThreadGoal(threadId)).resolves.toEqual(goal);
+    await expect(
+      second.setThreadGoal(threadId, { ...goal, status: "complete" }, 0),
+    ).rejects.toMatchObject({
+      code: "MAPPING_CONFLICT",
+    });
+    await expect(second.clearThreadGoal(threadId, goal.revision)).resolves.toMatchObject({
+      hostThreadId: threadId,
+    });
+    await expect(second.getThreadGoal(threadId)).resolves.toBeNull();
     await second.close();
   });
 

@@ -17,9 +17,12 @@ import type {
 import {
   harnessIdSchema,
   nativeSessionRefSchema,
+  type AccountBalanceSnapshot,
   type DeepSeekModernSessionCandidate,
   type HarnessId,
 } from "@codexhost/shared-contracts";
+
+import { fetchDeepSeekBalance } from "./credits.js";
 
 import {
   DeepSeekGenerationProbeError,
@@ -65,6 +68,9 @@ export interface DeepSeekHarnessAdapterDependencies {
   readonly createModernAdapter?: (
     options: ModernDeepSeekHarnessAdapterOptions,
   ) => ModernDelegateAdapter;
+  readonly fetchBalance?: (input: {
+    environment?: NodeJS.ProcessEnv;
+  }) => Promise<AccountBalanceSnapshot | null>;
 }
 
 interface ModernDelegateAdapter extends HarnessAdapter {
@@ -136,6 +142,11 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
     options: ModernDeepSeekHarnessAdapterOptions,
   ) => ModernDelegateAdapter;
   readonly #randomUUID: NonNullable<DeepSeekHarnessAdapterDependencies["randomUUID"]>;
+  readonly #fetchBalance: (input: {
+    environment?: NodeJS.ProcessEnv;
+  }) => Promise<AccountBalanceSnapshot | null>;
+  #balance: AccountBalanceSnapshot | null = null;
+  #balanceRefresh: Promise<AccountBalanceSnapshot | null> | null = null;
   #candidate: DelegateOwner | undefined;
   #cleanupFailedDuringClose = false;
   #closePromise: Promise<void> | undefined;
@@ -165,6 +176,30 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
     this.#createModernAdapter =
       dependencies.createModernAdapter ??
       ((modernOptions) => new ModernDeepSeekHarnessAdapter(modernOptions));
+    this.#fetchBalance =
+      dependencies.fetchBalance ??
+      ((input) =>
+        fetchDeepSeekBalance(input.environment ? { environment: input.environment } : {}));
+  }
+
+  balance(): AccountBalanceSnapshot | null {
+    return this.#balance;
+  }
+
+  refreshBalance(): Promise<AccountBalanceSnapshot | null> {
+    if (this.#closePromise) return Promise.resolve(this.#balance);
+    if (this.#balanceRefresh) return this.#balanceRefresh;
+    this.#balanceRefresh = this.#fetchBalance(
+      this.#options.environment ? { environment: this.#options.environment } : {},
+    )
+      .then((balance) => {
+        if (balance) this.#balance = balance;
+        return this.#balance;
+      })
+      .finally(() => {
+        this.#balanceRefresh = null;
+      });
+    return this.#balanceRefresh;
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {

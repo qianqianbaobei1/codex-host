@@ -48,7 +48,7 @@
 
 ## 界面预览
 
-无需切换应用，**Pi、Claude Code、OpenCode、OMP、Grok Build 和 DeepSeek Harness** 都可以在同一个 Codex Desktop 窗口中直接使用。
+无需切换应用，**Pi、Claude Code、OpenCode、OMP、Grok Build、DeepSeek Harness 和 Gemini CLI** 都可以在同一个 Codex Desktop 窗口中直接使用。
 
 https://github.com/user-attachments/assets/c48192d7-23ff-4f6e-b61a-6345a655bb76
 
@@ -93,6 +93,35 @@ xattr -dr com.apple.quarantine /Applications/codexhost.app
 然后完全退出 Codex Desktop，重新打开终端并启动 codexhost。
 
 </details>
+
+### Gemini CLI（Antigravity）
+
+codexhost 通过官方 Antigravity CLI 的登录态接入 Gemini，不读取或复制 Google 账号凭据。先完成一次交互式登录：
+
+```bash
+agy
+```
+
+确认 `agy models` 能列出 Gemini 模型后，启动 codexhost，在 Agent 选择器中选择 **Gemini CLI**。codexhost 会调用 `agy --input-format stream-json --output-format stream-json --print-timeout 2h`，使用 CLI 自己管理的系统钥匙串登录态；每个 Turn 完成后会有界回收 CLI 进程。若需关闭 codexhost 自身的绝对 Turn watchdog，可设置 `CODEXHOST_ANTIGRAVITY_DEADLINE_MS=0`；AGY 原生的 2 小时保护仍保留。
+
+官方 CLI 登录、模型选择和无头流式输出说明见 [Antigravity CLI 文档](https://antigravity.google/docs/cli/headless/)。
+
+### macOS 自动启动
+
+源码版默认不会随 macOS 自动启动。配置一次用户级监听器后，直接打开官方 Codex 即可自动由 codexhost 接管：
+
+```bash
+npm run mac:auto-launch -- --install --activate
+```
+
+监听器只检查 `/Applications/ChatGPT.app` 和 codexhost 自己的运行描述，不读取或保存任何模型凭据，并会优先选择受支持的 Node.js 22.19+ 或 24.x。查看或卸载：
+
+```bash
+npm run mac:auto-launch -- --status
+npm run mac:auto-launch -- --uninstall
+```
+
+如果当前 Codex 正在运行，请先只执行 `--install`，然后退出并重新登录 macOS；不要在当前 Codex 窗口内执行 `--activate`，因为 codexhost 启动时会重启官方 Desktop。
 
 ### 交互展示
 

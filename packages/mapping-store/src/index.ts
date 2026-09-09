@@ -5,6 +5,9 @@ export type { MappingStoreErrorCode, MappingStoreOptions } from "./mapping-store
 export {
   delegationStatusSchema,
   storedDelegationRecordV1Schema,
+  externalGoalStatusSchema,
+  externalGoalStopReasonSchema,
+  storedExternalGoalV1Schema,
   storedThreadRecordV1Schema,
   storedTurnMappingV1Schema,
 } from "./records.js";
@@ -13,10 +16,14 @@ export type {
   CreateDelegationInput,
   CreateProvisionalThreadInput,
   DelegationStatus,
+  ExternalGoalStatus,
+  ExternalGoalStopReason,
   FindRecentDelegationInput,
+  HandoverHarnessInput,
   ReplaceReadySessionAfterLastTurnInput,
   ReplaceReadySessionInput,
   StoredDelegationRecordV1,
+  StoredExternalGoalV1,
   StoredThreadRecordV1,
   StoredTurnMappingV1,
 } from "./records.js";
