@@ -288,6 +288,7 @@ describe("Renderer fixed Model request client", () => {
       "deleteCodexAccount",
       "executeThreadCommand",
       "forkThread",
+      "handoverThread",
       "importHarnessSession",
       "inspectCodexAccountUsage",
       "inspectHarness",

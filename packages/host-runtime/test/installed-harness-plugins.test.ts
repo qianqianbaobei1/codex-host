@@ -94,16 +94,7 @@ describe("installed Harness composition", () => {
       opencode: ["/compact"],
       grok: ["/compact"],
       omp: ["/compact"],
-      antigravity: [
-        "/plan",
-        "/goal",
-        "/browser",
-        "/grill-me",
-        "/boost",
-        "/learn",
-        "/schedule",
-        "/help",
-      ],
+      antigravity: [],
       "kiro-cli": [
         "/compact",
         "/kiro-context",
