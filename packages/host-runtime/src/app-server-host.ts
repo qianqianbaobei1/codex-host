@@ -101,6 +101,7 @@ import {
   type ExternalThreadResolution,
 } from "./external-thread-runtime.js";
 import { ExternalSteerError, ExternalTurnSteering } from "./external-turn-steering.js";
+import { normalizeThreadTitle } from "./thread-title-normalizer.js";
 import {
   DELEGATION_CLI_PATH_ENV,
   DELEGATION_RUNTIME_ENDPOINT_ENV,
@@ -229,6 +230,8 @@ export interface AppServerHostOptions {
   ) => OfficialAppServerConnection | Promise<OfficialAppServerConnection>;
   accountRepository?: AccountRepositoryLike;
   threadAccountStore?: ThreadAccountStoreLike;
+  /** Whether to normalize Thread titles to the local `[标签] 核心词+动作结果` standard. */
+  normalizeThreadTitles?: boolean;
   onCreateRequestRoute?: (observation: CreateRequestRouteObservation) => void;
   onRequestRoute?: (observation: RequestRouteObservation) => void;
   updateCoordinator?: HostUpdateCoordinator;
@@ -1228,7 +1231,11 @@ export class AppServerHost {
         if (await this.#writeResolutionError(request, location)) continue;
         if (location.kind === "external") {
           if (request.method === "thread/name/set") {
-            await this.#setExternalThreadName(request, location, params.name);
+            const rawName = typeof params.name === "string" ? params.name : "";
+            const name = this.#options.normalizeThreadTitles
+              ? normalizeThreadTitle(rawName)
+              : rawName;
+            await this.#setExternalThreadName(request, location, name);
           } else {
             await this.#deleteExternalThread(request, location);
           }
@@ -1348,6 +1355,18 @@ export class AppServerHost {
     value: JsonValue;
   }): Promise<void> {
     const parsed = input.value;
+    if (
+      this.#options.normalizeThreadTitles &&
+      isRecord(parsed) &&
+      parsed.method === "thread/name/updated" &&
+      isRecord(parsed.params) &&
+      typeof parsed.params.threadName === "string"
+    ) {
+      const normalized = normalizeThreadTitle(parsed.params.threadName);
+      if (normalized !== parsed.params.threadName) {
+        parsed.params.threadName = normalized;
+      }
+    }
     this.#observeOfficialTurnStartResponse(parsed);
     let forwarded: JsonValue = parsed;
     if (isRecord(parsed) && typeof parsed.method === "string" && "id" in parsed) {
