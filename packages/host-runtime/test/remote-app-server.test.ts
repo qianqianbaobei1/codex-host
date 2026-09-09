@@ -248,6 +248,7 @@ describe("remote SSH app-server transport", () => {
           output.end();
           return 0;
         },
+        disconnect: () => undefined,
         close: () => undefined,
       }),
     });
@@ -277,7 +278,7 @@ describe("remote SSH app-server transport", () => {
   it("closes the Host session when its WebSocket disconnects", async () => {
     const socketPath = testSocketPath();
     let finishSession = (): void => undefined;
-    const closeSession = vi.fn(() => finishSession());
+    const disconnectSession = vi.fn(() => finishSession());
     const listener = createRemoteAppServerWebSocketListener({
       socketPath,
       diagnosticOutput: new PassThrough(),
@@ -286,7 +287,8 @@ describe("remote SSH app-server transport", () => {
           new Promise<number>((resolve) => {
             finishSession = () => resolve(0);
           }),
-        close: closeSession,
+        disconnect: disconnectSession,
+        close: vi.fn(),
       }),
     });
 
@@ -299,7 +301,7 @@ describe("remote SSH app-server transport", () => {
       client.close();
       await once(client, "close");
 
-      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(disconnectSession).toHaveBeenCalledOnce());
       await expect(listener.close()).resolves.toBeUndefined();
     } finally {
       finishSession();
@@ -333,6 +335,7 @@ describe("remote SSH app-server transport", () => {
             new Promise<number>((resolve) => {
               finishSession = () => resolve(0);
             }),
+          disconnect: () => undefined,
           close: () => finishSession(),
         };
       },
@@ -552,6 +555,7 @@ describe("remote SSH app-server transport", () => {
             new Promise<number>((resolve) => {
               finishFirstSession = () => resolve(0);
             }),
+          disconnect: () => undefined,
           close: () => undefined,
         }),
       });
@@ -563,6 +567,7 @@ describe("remote SSH app-server transport", () => {
             output.end();
             return 0;
           },
+          disconnect: () => undefined,
           close: () => undefined,
         }),
       });
@@ -614,7 +619,11 @@ describe("remote SSH app-server transport", () => {
       const listener = createRemoteAppServerWebSocketListener({
         socketPath,
         diagnosticOutput: new PassThrough(),
-        createSession: () => ({ run: async () => 0, close: () => undefined }),
+        createSession: () => ({
+          run: async () => 0,
+          disconnect: () => undefined,
+          close: () => undefined,
+        }),
       });
 
       try {
@@ -636,7 +645,11 @@ describe("remote SSH app-server transport", () => {
       const listener = createRemoteAppServerWebSocketListener({
         socketPath,
         diagnosticOutput: new PassThrough(),
-        createSession: () => ({ run: async () => 0, close: () => undefined }),
+        createSession: () => ({
+          run: async () => 0,
+          disconnect: () => undefined,
+          close: () => undefined,
+        }),
       });
 
       try {
@@ -661,7 +674,11 @@ describe("remote SSH app-server transport", () => {
       const listener = createRemoteAppServerWebSocketListener({
         socketPath,
         diagnosticOutput: new PassThrough(),
-        createSession: () => ({ run: async () => 0, close: () => undefined }),
+        createSession: () => ({
+          run: async () => 0,
+          disconnect: () => undefined,
+          close: () => undefined,
+        }),
       });
 
       await expect(listener.listen()).rejects.toThrow("requires a private directory");

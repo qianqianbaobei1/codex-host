@@ -5,6 +5,7 @@ import type {
   RendererAgentAvailability,
 } from "./agent-selection-state.js";
 import type {
+  AccountBalanceSnapshot,
   AccountCreditsSnapshot,
   HarnessCommandDescriptor,
   ThreadUsageSnapshot,
@@ -34,6 +35,8 @@ import {
 import {
   mountRendererCreditsControl,
   renderRendererCreditsControl,
+  type RendererAntigravityQuotaGroup,
+  type RendererCreditsAvailability,
   type RendererCreditsControl,
 } from "./renderer-credits-control.js";
 import {
@@ -674,6 +677,8 @@ export function renderComposerAgentControl(
   permissionModeView: RendererPermissionModeControlView = { status: "idle" },
   usage: ThreadUsageSnapshot | null = null,
   accountCredits: AccountCreditsSnapshot | null = null,
+  accountCreditsAvailability: RendererCreditsAvailability = "unknown",
+  accountBalance: AccountBalanceSnapshot | null = null,
   locale: RendererSettingsLocale = "en",
 ): void {
   if (control.usage === null) {
@@ -734,7 +739,27 @@ export function renderComposerAgentControl(
   );
   if (control.usage) renderRendererUsageControl(control.usage, usage, locale);
   control.harnessCommands.setLocale(locale);
-  renderRendererCreditsControl(control.credits, accountCredits);
+  const modelName = selectedCatalogModel?.resolvedModelLabel ?? selectedCatalogModel?.label ?? "";
+  const selectedQuotaGroup: RendererAntigravityQuotaGroup | undefined =
+    state.agent === "antigravity"
+      ? /gemini/iu.test(modelName)
+        ? "gemini"
+        : /claude|gpt|3p/iu.test(modelName)
+          ? "other"
+          : undefined
+      : undefined;
+  const isDeepSeekModel = /deepseek/iu.test(modelName);
+  const visibleAccountBalance = isDeepSeekModel ? accountBalance : null;
+  if (state.agent === "codex" || (state.agent === "pi" && !isDeepSeekModel)) {
+    accountCreditsAvailability = "hidden";
+  }
+  renderRendererCreditsControl(
+    control.credits,
+    accountCredits,
+    selectedQuotaGroup,
+    accountCreditsAvailability,
+    visibleAccountBalance,
+  );
 }
 
 export function disposeComposerAgentControl(control: ComposerAgentControl): void {

@@ -22,6 +22,7 @@ const HARNESS_INSTALL_URLS: Readonly<Record<ExternalRendererAgent, string>> = Ob
   opencode: "https://opencode.ai/docs/",
   grok: "https://grok.com/",
   omp: "https://github.com/can1357/oh-my-pi",
+  antigravity: "https://antigravity.google/docs/cli/install/",
 });
 
 export interface RendererConnectionAgentSnapshot {

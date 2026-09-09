@@ -1,22 +1,30 @@
 import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
-import type {
-  HarnessAdapter,
-  HarnessSessionState,
-  HostThreadSnapshot,
+import {
+  HarnessOutputChannel,
+  type HarnessAdapter,
+  type HarnessOutput,
+  type HarnessSessionCapabilities,
+  type HarnessSessionState,
+  type HostThreadSnapshot,
 } from "@codexhost/harness-adapter";
 import { FakeHarnessAdapter, FakeHarnessSession } from "@codexhost/harness-adapter/testing";
-import { MappingStore } from "@codexhost/mapping-store";
+import { MappingStore, storedExternalGoalV1Schema } from "@codexhost/mapping-store";
 import {
+  ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID,
   CLAUDE_CODE_NATIVE_TRANSPORT_MODEL_ID,
   encodeClaudeTransportModel,
+  encodeAntigravityTransportModel,
+  encodeDeepSeekHarnessTransportModel,
   encodeGrokTransportModel,
+  encodeOmpTransportModel,
+  encodeOpenCodeTransportModel,
   encodePiTransportModel,
   type ExternalHarnessId,
   type JsonObject,
@@ -37,7 +45,11 @@ import type {
   DelegationControlApi,
   DelegationControlRegistration,
 } from "../src/delegation-types.js";
-import { AppServerHost, type HostUpdateCoordinator } from "../src/index.js";
+import {
+  AppServerHost,
+  sanitizeOfficialAppServerArguments,
+  type HostUpdateCoordinator,
+} from "../src/index.js";
 import type { OfficialAppServerConnection } from "../src/official-app-server-connection.js";
 
 class FakeOfficialProcess extends EventEmitter {
@@ -76,6 +88,77 @@ class FailingListMappingStore extends MappingStore {
 class FailingDelegationMappingStore extends MappingStore {
   override createDelegation(): Promise<never> {
     return Promise.reject(new Error("Synthetic Delegation write failure"));
+  }
+}
+
+class RestartableFakeHarnessAdapter extends FakeHarnessAdapter {
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    if (input.kind !== "resume") return super.open(input);
+    const session = new FakeHarnessSession(
+      this.harnessId,
+      this.catalog,
+      this.catalog.defaultModel,
+      input.nativeRef,
+      { turns: [] },
+      this.supportsFork,
+      input.cwd,
+      this.supportsForkAcrossCwd,
+      this.catalog.defaultThinkingOptionId,
+      this.initialUsage,
+      this.permissionModes,
+      this.permissionModes?.defaultModeId,
+      this.supportsRollbackLastTurn,
+      this.permissionModeScope,
+    );
+    this.sessions.push(session);
+    return { ok: true as const, value: session };
+  }
+}
+
+class CachedThreadInspectionAdapter extends FakeHarnessAdapter {
+  readonly cachedThreadCapabilities: HarnessSessionCapabilities = {
+    configuration: {
+      selectModel: true,
+      selectThinkingOption: true,
+      selectPermissionMode: false,
+      permissionModeScope: "live",
+    },
+    history: { fork: false, forkAcrossCwd: false, rollbackLastTurn: false },
+  };
+  override readonly readCachedSnapshot = vi.fn(async () => ({
+    ok: true as const,
+    value: { turns: [] } satisfies HostThreadSnapshot,
+  }));
+
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    if (input.kind === "resume") {
+      return {
+        ok: false as const,
+        error: {
+          code: "unavailable" as const,
+          message: "synthetic cold restore",
+          retryable: true,
+        },
+      };
+    }
+    return super.open(input);
+  }
+}
+
+class CapturingFakeHarnessAdapter extends FakeHarnessAdapter {
+  readonly executedCommands: any[] = [];
+
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    const opened = await super.open(input);
+    if (opened.ok && opened.value) {
+      const session = opened.value;
+      const origExecute = session.execute.bind(session) as (cmd: any) => Promise<any>;
+      session.execute = (async (cmd: any) => {
+        this.executedCommands.push(cmd);
+        return origExecute(cmd);
+      }) as typeof session.execute;
+    }
+    return opened;
   }
 }
 
@@ -119,7 +202,7 @@ class JsonLineCollector {
         timeout: setTimeout(() => {
           const index = this.#waiters.indexOf(waiter);
           if (index >= 0) this.#waiters.splice(index, 1);
-          reject(new Error("Timed out waiting for Host output"));
+          reject(new Error(`Timed out waiting for Host output. Received: ${JSON.stringify(this.messages)}`));
         }, 2_000),
       };
       this.#waiters.push(waiter);
@@ -212,6 +295,7 @@ function createFixture(
       OfficialAppServerConnection | Promise<OfficialAppServerConnection>;
     updateCoordinator?: HostUpdateCoordinator;
     onDelegationApi?: (api: DelegationControlRegistration) => (() => void) | undefined;
+    normalizeThreadTitles?: boolean;
   } = {},
 ) {
   const adapter =
@@ -246,6 +330,9 @@ function createFixture(
       : {}),
     ...(options.updateCoordinator ? { updateCoordinator: options.updateCoordinator } : {}),
     ...(options.onDelegationApi ? { onDelegationApi: options.onDelegationApi } : {}),
+    ...(options.normalizeThreadTitles !== undefined
+      ? { normalizeThreadTitles: options.normalizeThreadTitles }
+      : {}),
   });
   const running = host.run();
   return {
@@ -332,6 +419,28 @@ async function stopFixture(fixture: ReturnType<typeof createFixture>): Promise<v
 }
 
 describe("AppServerHost HarnessAdapter projection", () => {
+  it("disables the unsigned source-checkout codex_app MCP by default", () => {
+    const arguments_ = [
+      "-c",
+      "features.code_mode_host=true",
+      "app-server",
+      "-c",
+      'mcp_servers.codex_app={"enabled"=true,"command"="synthetic"}',
+    ];
+    expect(sanitizeOfficialAppServerArguments(arguments_)).toEqual([
+      "-c",
+      "features.code_mode_host=true",
+      "app-server",
+      "-c",
+      'mcp_servers.codex_app={"enabled"=false,"command"="synthetic"}',
+    ]);
+    expect(
+      sanitizeOfficialAppServerArguments(arguments_, {
+        CODEXHOST_ENABLE_UNTRUSTED_CODEX_APP_TOOLS: "1",
+      }),
+    ).toEqual(arguments_);
+  });
+
   it("uses an injected shared listener connection without spawning a stdio app-server", async () => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -724,6 +833,65 @@ describe("AppServerHost HarnessAdapter projection", () => {
     }
   });
 
+  it("lets an active external Turn finish after Desktop disconnects", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    const close = vi.spyOn(session, "close");
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+
+    fixture.host.disconnect();
+    const beforeTerminal = await Promise.race([
+      fixture.running.then(() => "settled" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25)),
+    ]);
+    expect(beforeTerminal).toBe("pending");
+    expect(close).not.toHaveBeenCalled();
+
+    session.appendText("completed after transport disconnect");
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turnId));
+    await expect(fixture.running).resolves.toBe(0);
+    expect(close).toHaveBeenCalled();
+  });
+
+  it("keeps a forwarded official Turn alive before its start response arrives", async () => {
+    const fixture = createFixture();
+    const threadId = "019cbe87-ae18-7543-97f1-c60deeb61b17";
+    const turnId = "019cbe87-b77a-78a2-a16a-c6ad1fc2a026";
+
+    writeRequest(fixture.desktopInput, {
+      id: 1,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "start then disconnect" }] },
+    });
+    await readJsonLine(fixture.official.stdin);
+    fixture.host.disconnect();
+
+    const beforeResponse = await Promise.race([
+      fixture.running.then(() => "settled" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25)),
+    ]);
+    expect(beforeResponse).toBe("pending");
+
+    fixture.official.stdout.write(
+      `${JSON.stringify({ id: 1, result: { turn: { id: turnId } } })}\n`,
+    );
+    await fixture.collector.waitFor((message) => requestId(message, 1));
+    expect(fixture.official.stdin.writableEnded).toBe(false);
+
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        method: "turn/completed",
+        params: { threadId, turn: { id: turnId, status: "completed" } },
+      })}\n`,
+    );
+    await expect(fixture.running).resolves.toBe(0);
+    expect(fixture.official.kill).not.toHaveBeenCalled();
+  });
+
   it("fails when official app-server output closes before Desktop input", async () => {
     const fixture = createFixture();
 
@@ -958,6 +1126,74 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
+  it("inspects a cold Antigravity Thread from its local cache before native restore", async () => {
+    const seedAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("antigravity"));
+    const seed = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([
+        ["antigravity", seedAdapter],
+      ]),
+    });
+    const mappingStoreDirectory = seed.mappingStoreDirectory;
+    let threadId: string;
+    try {
+      threadId = await startExternalThread(seed, ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID);
+      await closeFixture(seed);
+    } catch (error) {
+      await stopFixture(seed).catch(() => undefined);
+      throw error;
+    }
+
+    const adapter = new CachedThreadInspectionAdapter(harnessIdSchema.parse("antigravity"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["antigravity", adapter]]),
+      mappingStoreDirectory,
+    });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "codexhost/thread/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({
+        id: 2,
+        result: {
+          owner: "external",
+          harnessId: "antigravity",
+          transportModelId: ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID,
+          history: { fork: false, rollbackLastTurn: false },
+          locked: true,
+        },
+      });
+      expect(adapter.readCachedSnapshot).toHaveBeenCalledOnce();
+      expect(adapter.sessions).toHaveLength(0);
+
+      writeRequest(fixture.desktopInput, {
+        id: 3,
+        method: "codexhost/thread/commands/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 3)),
+      ).resolves.toMatchObject({ id: 3, result: { commands: [] } });
+
+      writeRequest(fixture.desktopInput, {
+        id: 4,
+        method: "codexhost/thread/usage/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 4)),
+      ).resolves.toMatchObject({
+        id: 4,
+        result: { threadId, usage: null, owner: { harnessId: "antigravity" } },
+      });
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
   it("dispatches inspection by registered Harness ID and rejects unknown Harnesses", async () => {
     const pi = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
     const claude = new FakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
@@ -989,6 +1225,38 @@ describe("AppServerHost HarnessAdapter projection", () => {
     ).resolves.toMatchObject({
       error: { code: -32077, message: "Harness 'unregistered' is unavailable" },
     });
+    await stopFixture(fixture);
+  });
+
+  it("includes refreshed target Harness credits in Harness inspection", async () => {
+    const adapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    let credits = { usedPercent: 80, periodType: "weekly" as const };
+    const refreshCredits = vi.fn(async () => {
+      credits = { usedPercent: 12, periodType: "weekly" };
+      return credits;
+    });
+    Object.assign(adapter, {
+      credits: () => credits,
+      refreshCredits,
+    });
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 31,
+      method: "codexhost/harness/inspect",
+      params: { harnessId: "pi", refresh: true },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 31)),
+    ).resolves.toMatchObject({
+      result: {
+        status: "ready",
+        accountCredits: { usedPercent: 12, periodType: "weekly" },
+      },
+    });
+    expect(refreshCredits).toHaveBeenCalledTimes(1);
     await stopFixture(fixture);
   });
 
@@ -1772,7 +2040,12 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     await expect(fixture.collector.waitFor((message) => requestId(message, 42))).resolves.toEqual({
       id: 42,
-      result: { threadId: "official-thread", usage: null },
+      result: {
+        threadId: "official-thread",
+        usage: null,
+        owner: { harnessId: "codex" },
+        accountCreditsStatus: "unknown",
+      },
     });
 
     writeRequest(fixture.desktopInput, {
@@ -1852,6 +2125,8 @@ describe("AppServerHost HarnessAdapter projection", () => {
       id: 44,
       result: {
         threadId: "official-thread",
+        owner: { harnessId: "codex" },
+        accountCreditsStatus: "available",
         usage: {
           totalTokens: 1_000,
           inputTokens: 800,
@@ -1912,7 +2187,12 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     await expect(fixture.collector.waitFor((message) => requestId(message, 45))).resolves.toEqual({
       id: 45,
-      result: { threadId: "official-thread", usage: null },
+      result: {
+        threadId: "official-thread",
+        usage: null,
+        owner: { harnessId: "codex" },
+        accountCreditsStatus: "unknown",
+      },
     });
     await stopFixture(fixture);
   });
@@ -2020,6 +2300,46 @@ describe("AppServerHost HarnessAdapter projection", () => {
     ).resolves.toMatchObject({ error: { code: -32081 } });
     expect(fixture.adapter.sessions).toHaveLength(0);
     expect(officialWrite).not.toHaveBeenCalled();
+    await stopFixture(fixture);
+  });
+
+  it("hands over an external Thread to official via codexhost/thread/handover", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 50,
+      method: "codexhost/thread/ownership/list",
+      params: { threadIds: [threadId] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 50)),
+    ).resolves.toMatchObject({
+      result: { threads: [{ threadId, owner: "external", harnessId: "pi" }] },
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 51,
+      method: "codexhost/thread/handover",
+      params: { threadId, target: "codex" },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 51)),
+    ).resolves.toMatchObject({
+      result: { ok: true },
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 52,
+      method: "codexhost/thread/ownership/list",
+      params: { threadIds: [threadId] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 52)),
+    ).resolves.toMatchObject({
+      result: { threads: [{ threadId, owner: "codex" }] },
+    });
+
     await stopFixture(fixture);
   });
 
@@ -3357,6 +3677,9 @@ describe("AppServerHost HarnessAdapter projection", () => {
       id: 72,
       result: {
         threadId: claudeThreadId,
+        owner: { harnessId: "claude-code", modelId: "fake-model-v1.primary" },
+        accountCreditsStatus: "unavailable",
+        accountBalanceStatus: "unavailable",
         usage: {
           cacheHitRatePercent: 99,
           totalCostUsd: 1.373,
@@ -5481,13 +5804,342 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await expect(
       fixture.collector.waitFor((message) => requestId(message, 24)),
     ).resolves.toMatchObject({
-      error: {
-        code: -32602,
-        message: "Turn Model carrier does not belong to the Thread Harness",
+      result: {
+        turn: {
+          status: "inProgress",
+        },
       },
     });
-    expect(claudeAdapter.sessions[1]?.state.effectiveModel).toEqual(firstModel);
+    expect(piAdapter.sessions.length).toBeGreaterThanOrEqual(1);
     await stopFixture(fixture);
+  });
+
+  it("supports seamless handover from Official Thread to External Harness", async () => {
+    const claudeAdapter = new CapturingFakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([
+        ["claude-code", claudeAdapter],
+      ]),
+    });
+
+    // 1. Start an official thread
+    writeRequest(fixture.desktopInput, {
+      id: 1,
+      method: "thread/start",
+      params: { cwd: "/synthetic", model: "gpt-5.6-luna" },
+    });
+    const officialThreadStart = await readJsonLine(fixture.official.stdin);
+    expect(officialThreadStart).toMatchObject({ method: "thread/start" });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialThreadStart.id,
+        result: {
+          thread: { id: "official-thread-100", cwd: "/synthetic", title: "Official Conversation" },
+        },
+      })}\n`,
+    );
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 1)),
+    ).resolves.toMatchObject({
+      result: {
+        thread: { id: "official-thread-100" },
+      },
+    });
+
+    // 2. Start a turn with an external model on this official thread (handover!)
+    const claudeModel = claudeAdapter.catalog.defaultModel;
+    if (!claudeModel) throw new Error("Fake Claude catalog has no default Model");
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId: "official-thread-100",
+        model: encodeClaudeTransportModel(claudeModel),
+        input: [{ type: "text", text: "Please continue with Claude" }],
+      },
+    });
+
+    // 3. Official request broker queries thread/read
+    const threadRead = await readJsonLine(fixture.official.stdin);
+    expect(threadRead).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "official-thread-100", includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: threadRead.id,
+        result: {
+          thread: {
+            id: "official-thread-100",
+            cwd: "/synthetic",
+            title: "Official Conversation",
+            turns: [
+              {
+                id: "official-turn-1",
+                items: [
+                  { type: "userMessage", text: "What is 2+2?" },
+                  { type: "agentMessage", text: "4" },
+                ],
+              },
+            ],
+          },
+        },
+      })}\n`,
+    );
+
+    // 4. Desktop gets turn/start response
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 2)),
+    ).resolves.toMatchObject({
+      result: {
+        turn: { status: "inProgress" },
+      },
+    });
+
+    // 5. Verify external Claude session was created and received handover context
+    expect(claudeAdapter.sessions).toHaveLength(1);
+    const turnCommand = claudeAdapter.executedCommands.find(
+      (candidate) => candidate.type === "turn.start",
+    );
+    expect(turnCommand).toBeDefined();
+    const executedText = turnCommand.input[0].text;
+    expect(executedText).toContain("Prior Conversation History");
+    expect(executedText).toContain("[User]:\nWhat is 2+2?");
+    expect(executedText).toContain("[Assistant]:\n4");
+    expect(executedText).toContain("Please continue with Claude");
+
+    // 6. Inspecting the thread now confirms it belongs to external claude-code harness
+    writeRequest(fixture.desktopInput, {
+      id: 3,
+      method: "codexhost/thread/inspect",
+      params: { threadId: "official-thread-100" },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 3)),
+    ).resolves.toMatchObject({
+      result: {
+        harnessId: "claude-code",
+      },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("supports multi-turn handover between External Harnesses retaining full history", async () => {
+    const claudeAdapter = new CapturingFakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
+    const piAdapter = new CapturingFakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([
+        ["claude-code", claudeAdapter],
+        ["pi", piAdapter],
+      ]),
+    });
+
+    // 1. Start Claude thread
+    const threadId = await startExternalThread(fixture, CLAUDE_CODE_NATIVE_TRANSPORT_MODEL_ID, 1);
+
+    // 2. Complete a turn on Claude
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "Hello Claude" }] },
+    });
+    const claudeSession = claudeAdapter.sessions[0];
+    if (!claudeSession) throw new Error("Fake Claude Session was not opened");
+    const turn1Response = await fixture.collector.waitFor((message) => requestId(message, 2));
+    const turn1Id = (turn1Response.result as any).turn.id;
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turn1Id));
+    claudeSession.appendText("Hello from Claude");
+    claudeSession.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turn1Id));
+
+    // 3. Switch to Pi in the same thread
+    writeRequest(fixture.desktopInput, {
+      id: 3,
+      method: "turn/start",
+      params: {
+        threadId,
+        model: encodePiTransportModel(piAdapter.catalog.defaultModel),
+        input: [{ type: "text", text: "Hello Pi" }],
+      },
+    });
+
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 3)),
+    ).resolves.toMatchObject({
+      result: {
+        turn: { status: "inProgress" },
+      },
+    });
+
+    // Verify Pi session was opened and received context from Claude turn
+    expect(piAdapter.sessions).toHaveLength(1);
+    const piTurnCommand = piAdapter.executedCommands.find(
+      (candidate) => candidate.type === "turn.start",
+    );
+    expect(piTurnCommand).toBeDefined();
+    const piExecutedText = piTurnCommand.input[0].text;
+    expect(piExecutedText).toContain("Prior Conversation History");
+    expect(piExecutedText).toContain("[Assistant]:\nHello from Claude");
+    expect(piExecutedText).toContain("Hello Pi");
+
+    // 4. Complete turn on Pi
+    const piSession = piAdapter.sessions[0];
+    if (!piSession) throw new Error("Fake Pi Session was not opened");
+    const turn2Response = await fixture.collector.waitFor((message) => requestId(message, 3));
+    const turn2Id = (turn2Response.result as any).turn.id;
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turn2Id));
+    piSession.appendText("Hello from Pi");
+    piSession.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turn2Id));
+
+    // 5. Inspect thread to verify history turns and current harness
+    writeRequest(fixture.desktopInput, {
+      id: 4,
+      method: "thread/read",
+      params: { threadId, includeTurns: true },
+    });
+    const threadReadResponse = await fixture.collector.waitFor((message) => requestId(message, 4));
+    const turns = (threadReadResponse.result as any).thread.turns;
+    expect(turns.length).toBeGreaterThanOrEqual(2);
+
+    writeRequest(fixture.desktopInput, {
+      id: 5,
+      method: "codexhost/thread/inspect",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 5)),
+    ).resolves.toMatchObject({
+      result: {
+        harnessId: "pi",
+      },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("switches one conversation through every registered External Harness", async () => {
+    const adapters = new Map<ExternalHarnessId, CapturingFakeHarnessAdapter>(
+      (
+        ["pi", "claude-code", "deepseek-harness", "opencode", "grok", "omp", "antigravity"] as const
+      ).map((harnessId) => [
+        harnessId,
+        new CapturingFakeHarnessAdapter(harnessIdSchema.parse(harnessId)),
+      ]),
+    );
+    const fixture = createFixture({
+      externalAdapters: adapters as ReadonlyMap<ExternalHarnessId, FakeHarnessAdapter>,
+    });
+    const carriers = {
+      pi: encodePiTransportModel(adapters.get("pi")!.catalog.defaultModel),
+      "claude-code": encodeClaudeTransportModel(adapters.get("claude-code")!.catalog.defaultModel),
+      "deepseek-harness": encodeDeepSeekHarnessTransportModel(
+        adapters.get("deepseek-harness")!.catalog.defaultModel,
+      ),
+      opencode: encodeOpenCodeTransportModel(adapters.get("opencode")!.catalog.defaultModel),
+      grok: encodeGrokTransportModel(adapters.get("grok")!.catalog.defaultModel),
+      omp: encodeOmpTransportModel(adapters.get("omp")!.catalog.defaultModel),
+      antigravity: encodeAntigravityTransportModel(
+        adapters.get("antigravity")!.catalog.defaultModel,
+      ),
+    } satisfies Record<ExternalHarnessId, string>;
+    const threadId = await startExternalThread(fixture, carriers.pi, 1);
+    const sequence = [
+      "claude-code",
+      "deepseek-harness",
+      "opencode",
+      "grok",
+      "omp",
+      "antigravity",
+    ] as const;
+
+    for (const [index, harnessId] of sequence.entries()) {
+      const requestIdValue = index + 2;
+      writeRequest(fixture.desktopInput, {
+        id: requestIdValue,
+        method: "turn/start",
+        params: {
+          threadId,
+          model: carriers[harnessId],
+          input: [{ type: "text", text: `switch to ${harnessId}` }],
+        },
+      });
+      const started = await fixture.collector.waitFor((message) =>
+        requestId(message, requestIdValue),
+      );
+      expect(started).toMatchObject({ result: { turn: { status: "inProgress" } } });
+      const adapter = adapters.get(harnessId);
+      const session = adapter?.sessions.at(-1);
+      if (!session) throw new Error(`No session was opened for ${harnessId}`);
+      session.succeedTurn();
+      const startedTurn = (started.result as JsonObject).turn as JsonObject;
+      if (typeof startedTurn.id !== "string") throw new Error(`No Turn ID for ${harnessId}`);
+      await fixture.collector.waitFor((message) =>
+        turnEvent(message, "turn/completed", startedTurn.id as string),
+      );
+      writeRequest(fixture.desktopInput, {
+        id: 100 + requestIdValue,
+        method: "codexhost/thread/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 100 + requestIdValue)),
+      ).resolves.toMatchObject({ result: { owner: "external", harnessId } });
+    }
+    await stopFixture(fixture);
+  });
+
+  it("does not reselect an unchanged carrier model on continuation", async () => {
+    const adapter = new CapturingFakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({ externalAdapters: new Map([["pi", adapter]]) });
+    const model = adapter.catalog.defaultModel!;
+    const threadId = await startExternalThread(fixture, encodePiTransportModel(model), 1);
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        model: encodePiTransportModel({ ...model }),
+        input: [{ type: "text", text: "continue" }],
+      },
+    });
+    const response = await fixture.collector.waitFor((message) => requestId(message, 2));
+    await stopFixture(fixture);
+    expect(response).toHaveProperty("result");
+    expect(adapter.executedCommands.some((command) => command.type === "model.select")).toBe(false);
+  });
+
+  it("does not start a turn on the old model when carrier model selection fails", async () => {
+    const adapter = new CapturingFakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({ externalAdapters: new Map([["pi", adapter]]) });
+    const threadId = await startExternalThread(
+      fixture,
+      encodePiTransportModel(adapter.catalog.defaultModel!),
+      1,
+    );
+    const session = adapter.sessions[0]!;
+    const execute = session.execute.bind(session) as (command: any) => Promise<any>;
+    session.execute = (async (command: any) =>
+      command.type === "model.select"
+        ? {
+            ok: false,
+            error: { code: "invalidRequest", message: "Model switch rejected", retryable: false },
+          }
+        : execute(command)) as typeof session.execute;
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        model: encodePiTransportModel(harnessModelRefSchema.parse({ id: "different-model" })),
+        input: [{ type: "text", text: "continue" }],
+      },
+    });
+    const response = await fixture.collector.waitFor((message) => requestId(message, 2));
+    await stopFixture(fixture);
+    expect(response).toMatchObject({ error: { code: -32078, message: "Model switch rejected" } });
+    expect(adapter.executedCommands.some((command) => command.type === "turn.start")).toBe(false);
   });
 
   it("rejects Model selection when the owning Claude Session does not support it", async () => {
@@ -5720,6 +6372,796 @@ describe("AppServerHost HarnessAdapter projection", () => {
       result: { source: "official" },
     });
     expect(fixture.adapter.sessions).toHaveLength(0);
+    await stopFixture(fixture);
+  });
+
+  it("intercepts thread/goal/* RPCs and auto-continues for an Antigravity thread", async () => {
+    const adapter = new FakeHarnessAdapter(harnessIdSchema.parse("antigravity"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["antigravity", adapter]]),
+    });
+
+    const threadId = await startExternalThread(fixture, ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID);
+
+    // 1. Initial thread/goal/get returns null
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "thread/goal/get",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 2)),
+    ).resolves.toMatchObject({
+      id: 2,
+      result: { goal: null },
+    });
+
+    // 2. thread/goal/set creates the goal, emits thread/goal/updated, and starts a seed turn
+    writeRequest(fixture.desktopInput, {
+      id: 3,
+      method: "thread/goal/set",
+      params: { threadId, objective: "完成自动化测试", tokenBudget: 5000 },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 3)),
+    ).resolves.toMatchObject({
+      id: 3,
+      result: {
+        goal: {
+          objective: "完成自动化测试",
+          status: "active",
+          tokenBudget: 5000,
+          tokensUsed: 0,
+        },
+      },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/goal/updated")),
+    ).resolves.toMatchObject({
+      method: "thread/goal/updated",
+      params: {
+        threadId,
+        goal: {
+          objective: "完成自动化测试",
+          status: "active",
+        },
+      },
+    });
+
+    // A delegated seed Turn is auto-initiated for the goal (observable on the wire).
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "turn/started")),
+    ).resolves.toMatchObject({ method: "turn/started" });
+
+    // 3. thread/goal/get returns active goal
+    writeRequest(fixture.desktopInput, {
+      id: 4,
+      method: "thread/goal/get",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 4)),
+    ).resolves.toMatchObject({
+      id: 4,
+      result: {
+        goal: {
+          objective: "完成自动化测试",
+          status: "active",
+          timeUsedSeconds: expect.any(Number),
+        },
+      },
+    });
+
+    // 4. Pause the goal via thread/goal/set
+    writeRequest(fixture.desktopInput, {
+      id: 5,
+      method: "thread/goal/set",
+      params: { threadId, status: "paused" },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 5)),
+    ).resolves.toMatchObject({
+      id: 5,
+      result: {
+        goal: {
+          objective: "完成自动化测试",
+          status: "paused",
+        },
+      },
+    });
+
+    // 5. thread/goal/clear clears the goal and broadcasts thread/goal/cleared
+    writeRequest(fixture.desktopInput, {
+      id: 6,
+      method: "thread/goal/clear",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 6)),
+    ).resolves.toMatchObject({
+      id: 6,
+      result: {},
+    });
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/goal/cleared")),
+    ).resolves.toMatchObject({
+      method: "thread/goal/cleared",
+      params: { threadId },
+    });
+
+    // Verify subsequent get returns null
+    writeRequest(fixture.desktopInput, {
+      id: 7,
+      method: "thread/goal/get",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 7)),
+    ).resolves.toMatchObject({
+      id: 7,
+      result: { goal: null },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("handles chat /goal command, executes continuation turns, and completes on a structured decision", async () => {
+    const adapter = new FakeHarnessAdapter(harnessIdSchema.parse("antigravity"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["antigravity", adapter]]),
+    });
+
+    const threadId = await startExternalThread(fixture, ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID);
+    const session = adapter.sessions[0];
+    if (!session) throw new Error("Fake Antigravity session was not opened");
+
+    // 1. User sends a message starting with /goal
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "/goal 构建新特性" }],
+      },
+    });
+    const turnResponse = await fixture.collector.waitFor((message) => requestId(message, 2));
+    const turnId = ((turnResponse.result as JsonObject).turn as JsonObject).id as string;
+
+    // Goal was created and broadcast
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/goal/updated")),
+    ).resolves.toMatchObject({
+      params: {
+        threadId,
+        goal: { objective: "构建新特性", status: "active" },
+      },
+    });
+
+    // Model replies without completion marker but with substantive progress (>= 40 chars)
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+    session.appendText("正在深入分析代码仓库并开始实现新特性的基础架构与接口定义");
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turnId));
+
+    // Auto continuation: the next delegated turn is launched with a fresh id.
+    const continuationStart = await fixture.collector.waitFor(
+      (message) =>
+        method(message, "turn/started") &&
+        messageParams(message)?.threadId === threadId &&
+        ((messageParams(message)?.turn as JsonObject | undefined)?.id ??
+          messageParams(message)?.turnId) !== turnId,
+    );
+    const secondTurnId = (messageParams(continuationStart)?.turn as JsonObject | undefined)?.id as
+      string | undefined;
+    if (!secondTurnId) throw new Error("Second turn ID missing");
+
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", secondTurnId));
+
+    // Second turn reports a structured completion proposal with evidence.
+    session.appendText(
+      `所有特性已实现并经过验证\n${JSON.stringify({
+        version: 1,
+        goal_event: "complete",
+        completion_evidence: [{ type: "command", command: "synthetic", exit_code: 0 }],
+      })}`,
+    );
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", secondTurnId),
+    );
+
+    // Goal status transitions to complete
+    await expect(
+      fixture.collector.waitFor(
+        (message) =>
+          method(message, "thread/goal/updated") &&
+          ((message.params as JsonObject)?.goal as JsonObject | undefined)?.status === "complete",
+      ),
+    ).resolves.toMatchObject({
+      params: {
+        threadId,
+        goal: {
+          objective: "构建新特性",
+          status: "complete",
+        },
+      },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("runs the same External Goal loop for a Pi Thread", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi session was not opened");
+
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "thread/goal/set",
+      params: { threadId, objective: "完成 Pi 目标", tokenBudget: 5_000 },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 2)),
+    ).resolves.toMatchObject({
+      result: { goal: { origin: "codexhost", objective: "完成 Pi 目标", status: "active" } },
+    });
+    const firstStarted = await fixture.collector.waitFor(
+      (message) => method(message, "turn/started") && messageParams(message).threadId === threadId,
+    );
+    const firstTurnId = (messageParams(firstStarted).turn as JsonObject).id as string;
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", firstTurnId));
+    session.emitFileChange([{ path: "progress.md", kind: "update", unifiedDiff: "+ progress" }]);
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", firstTurnId));
+
+    const continuation = await fixture.collector.waitFor(
+      (message) =>
+        method(message, "turn/started") &&
+        messageParams(message).threadId === threadId &&
+        (messageParams(message).turn as JsonObject).id !== firstTurnId,
+    );
+    const secondTurnId = (messageParams(continuation).turn as JsonObject).id as string;
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", secondTurnId));
+    session.appendText(
+      JSON.stringify({
+        version: 1,
+        goal_event: "complete",
+        completion_evidence: [{ type: "research-source", uri: "synthetic://pi-progress" }],
+      }),
+    );
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", secondTurnId),
+    );
+    await expect(
+      fixture.collector.waitFor(
+        (message) =>
+          method(message, "thread/goal/updated") &&
+          (messageParams(message).goal as JsonObject | undefined)?.status === "complete",
+      ),
+    ).resolves.toMatchObject({ params: { threadId, goal: { status: "complete" } } });
+    await stopFixture(fixture);
+  });
+
+  it("restores an active External Goal after Host restart and starts one recovery Turn", async () => {
+    const first = createFixture();
+    const threadId = await startPiThread(first);
+    const record = await first.mappingStore.getThread(hostThreadIdSchema.parse(threadId));
+    if (!record?.nativeSessionRef) throw new Error("Persisted Pi Thread has no Native Session");
+    const directory = first.mappingStoreDirectory;
+    const goal = storedExternalGoalV1Schema.parse({
+      formatVersion: 1,
+      goalId: "restart-goal",
+      origin: "codexhost",
+      harnessId: harnessIdSchema.parse("pi"),
+      objective: "从重启后继续 Pi 目标",
+      status: "active",
+      tokenBudget: 5_000,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      revision: 1,
+      turnCount: 1,
+      noProgressCount: 0,
+      inFlightTurnId: hostTurnIdSchema.parse("interrupted-turn"),
+      blockerStallCount: 0,
+      createdAt: new Date("2026-09-04T00:00:00.000Z").toISOString(),
+      updatedAt: new Date("2026-09-04T00:00:00.000Z").toISOString(),
+    });
+    const storedWithGoal = await first.mappingStore.setThreadGoal(
+      hostThreadIdSchema.parse(threadId),
+      goal,
+    );
+    expect(storedWithGoal).toMatchObject({
+      state: "ready",
+      nativeSessionRef: record.nativeSessionRef,
+      goal,
+    });
+    await closeFixture(first);
+    expect(
+      JSON.parse(readFileSync(path.join(directory, "threads", `${threadId}.json`), "utf8")),
+    ).toMatchObject({ state: "ready", goal });
+    const verifyStore = new MappingStore({ directory, instanceId: "goal-verify" });
+    await verifyStore.initialize();
+    await expect(verifyStore.getThread(hostThreadIdSchema.parse(threadId))).resolves.toMatchObject({
+      state: "ready",
+      goal,
+    });
+    await verifyStore.close();
+
+    const adapter = new RestartableFakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const restarted = createFixture({
+      externalAdapters: new Map([["pi", adapter]]),
+      mappingStoreDirectory: directory,
+    });
+    await vi.waitFor(async () => {
+      await expect(
+        restarted.mappingStore.getThread(hostThreadIdSchema.parse(threadId)),
+      ).resolves.toMatchObject({ state: "ready", goal });
+    });
+    writeRequest(restarted.desktopInput, {
+      id: 2,
+      method: "thread/goal/get",
+      params: { threadId },
+    });
+    const goalResponse = await restarted.collector.waitFor((message) => requestId(message, 2));
+    expect(
+      await restarted.mappingStore.getThread(hostThreadIdSchema.parse(threadId)),
+    ).toMatchObject({
+      state: "ready",
+      nativeSessionRef: record.nativeSessionRef,
+      goal,
+    });
+    expect(goalResponse).toMatchObject({
+      result: { goal: { objective: "从重启后继续 Pi 目标", status: "active" } },
+    });
+    const recoveryStarted = await restarted.collector.waitFor(
+      (message) => method(message, "turn/started") && messageParams(message).threadId === threadId,
+    );
+    const recoveryTurnId = (messageParams(recoveryStarted).turn as JsonObject).id as string;
+    const recoverySession = adapter.sessions[0];
+    if (!recoverySession) throw new Error("Recovery Pi session was not opened");
+    await restarted.collector.waitFor((message) =>
+      turnEvent(message, "turn/started", recoveryTurnId),
+    );
+    recoverySession.appendText(
+      JSON.stringify({
+        version: 1,
+        goal_event: "complete",
+        completion_evidence: [{ type: "research-source", uri: "synthetic://recovered" }],
+      }),
+    );
+    recoverySession.succeedTurn();
+    await restarted.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", recoveryTurnId),
+    );
+    await expect(
+      restarted.collector.waitFor(
+        (message) =>
+          method(message, "thread/goal/updated") &&
+          (messageParams(message).goal as JsonObject | undefined)?.status === "complete",
+      ),
+    ).resolves.toMatchObject({ params: { threadId, goal: { status: "complete" } } });
+    await stopFixture(restarted);
+  });
+
+  it("forwards thread/goal/* requests to official app-server for official threads", async () => {
+    const fixture = createFixture();
+    fixture.official.stdin.once("data", (chunk: Buffer) => {
+      const request = JSON.parse(chunk.toString("utf8")) as JsonObject;
+      fixture.official.stdout.write(
+        `${JSON.stringify({ id: request.id, result: { goal: { objective: "official goal" } } })}\n`,
+      );
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 30,
+      method: "thread/goal/get",
+      params: { threadId: "official-thread" },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 30))).resolves.toEqual({
+      id: 30,
+      result: { goal: { objective: "official goal" } },
+    });
+    expect(fixture.adapter.sessions).toHaveLength(0);
+    await stopFixture(fixture);
+  });
+
+  it("normalizes thread titles when normalizeThreadTitles is enabled", async () => {
+    const fixture = createFixture({ normalizeThreadTitles: true });
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "thread/name/set",
+      params: { threadId, name: "帮我审视任务要求并给出结论" },
+    });
+
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/name/updated")),
+    ).resolves.toMatchObject({
+      params: {
+        threadId,
+        threadName: "[代码] 审视任务要求",
+      },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("auto-generates and emits normalized thread title on first external turn when untitled", async () => {
+    const fixture = createFixture({ normalizeThreadTitles: true });
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: "/Users/example/PycharmProjects/glodon_ai_sales_guide 我想知道这个路径为什么没有按照我们之前的这个文件保存的方式保存在codex文件下面",
+          },
+        ],
+      },
+    });
+
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/name/updated")),
+    ).resolves.toMatchObject({
+      params: {
+        threadId,
+        threadName: expect.stringMatching(/^\[规范\]/),
+      },
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("supports thread/settings/update on external thread and emits thread/settings/updated", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 2,
+      method: "thread/settings/update",
+      params: { threadId, model: "gpt-5.3-codex" },
+    });
+
+    await expect(fixture.collector.waitFor((message) => requestId(message, 2))).resolves.toEqual({
+      id: 2,
+      result: {},
+    });
+
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "thread/settings/updated")),
+    ).resolves.toMatchObject({
+      params: {
+        threadId,
+        threadSettings: {
+          threadId,
+          model: "gpt-5.3-codex",
+        },
+      },
+    });
+
+    // Verify subsequent turn executes smoothly
+    const turnId = await startPiTurn(fixture, threadId, 3);
+    expect(typeof turnId).toBe("string");
+
+    await stopFixture(fixture);
+  });
+
+  it("forwards thread/settings/update on official thread to official app-server", async () => {
+    const fixture = createFixture();
+
+    writeRequest(fixture.desktopInput, {
+      id: 10,
+      method: "thread/settings/update",
+      params: { threadId: "official-thread-42", model: "gpt-5.3-codex" },
+    });
+
+    const officialUpdate = await readJsonLine(fixture.official.stdin);
+    expect(officialUpdate).toMatchObject({
+      id: 10,
+      method: "thread/settings/update",
+      params: { threadId: "official-thread-42", model: "gpt-5.3-codex" },
+    });
+
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: 10,
+        result: {},
+      })}\n`,
+    );
+
+    await expect(fixture.collector.waitFor((message) => requestId(message, 10))).resolves.toEqual({
+      id: 10,
+      result: {},
+    });
+
+    await stopFixture(fixture);
+  });
+
+  it("finalizes an active turn on session.faulted, unblocks thread status to idle, and accepts subsequent turns", async () => {
+    class FaultInjectableHarnessAdapter extends RestartableFakeHarnessAdapter {
+      readonly channels: HarnessOutputChannel<HarnessOutput>[] = [];
+
+      override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+        const opened = await super.open(input);
+        if (!opened.ok) return opened;
+        const session = opened.value;
+        const channel = new HarnessOutputChannel<HarnessOutput>();
+        this.channels.push(channel);
+        const innerOutputs = session.outputs;
+        (session as { outputs: AsyncIterable<HarnessOutput> }).outputs = channel.outputs;
+        void (async () => {
+          try {
+            for await (const output of innerOutputs) channel.emit(output);
+          } finally {
+            channel.end();
+          }
+        })();
+        return opened;
+      }
+    }
+
+    const adapter = new FaultInjectableHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId, 2);
+    const session = adapter.sessions[0];
+    expect(session).toBeDefined();
+
+    // Wait until turn/started is projected
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+
+    const channel = adapter.channels[0];
+    if (!channel) throw new Error("Fault injection channel was not created");
+    channel.emit({
+      kind: "event",
+      event: {
+        type: "session.faulted",
+        error: { code: "internalError", message: "underlying crash", retryable: false },
+      },
+    });
+    // A completion that arrives after the fault must not produce a second terminal.
+    channel.emit({
+      kind: "event",
+      event: { type: "turn.completed", turnId, outcome: { status: "succeeded" } },
+    });
+
+    // 1. turn/completed with status failed is emitted
+    const completed = await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", turnId),
+    );
+    expect((messageParams(completed).turn as JsonObject).status).toBe("failed");
+
+    // 2. thread/status/changed to idle is emitted
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, threadId, "idle")),
+    ).resolves.toBeDefined();
+
+    // 3. The faulted Session is replaced, so the next Turn runs on a resumed Session.
+    const nextTurnId = await startPiTurn(fixture, threadId, 3);
+    expect(typeof nextTurnId).toBe("string");
+    expect(nextTurnId).not.toBe(turnId);
+    const resumed = adapter.sessions[1];
+    if (!resumed) throw new Error("Fake Pi Session was not resumed");
+    resumed.appendText("recovered output");
+    resumed.succeedTurn();
+    await expect(
+      fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", nextTurnId)),
+    ).resolves.toBeDefined();
+
+    // 4. The faulted Turn still has exactly one terminal.
+    expect(
+      fixture.collector.messages.filter((message) => turnEvent(message, "turn/completed", turnId)),
+    ).toHaveLength(1);
+
+    await stopFixture(fixture);
+  });
+
+  it("finalizes active turn with failure when external harness output stream terminates unexpectedly", async () => {
+    class FaultInjectableHarnessAdapter extends FakeHarnessAdapter {
+      channel = new HarnessOutputChannel<HarnessOutput>();
+      filterOutputs = false;
+
+      override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+        const opened = await super.open(input);
+        if (!opened.ok) return opened;
+        const session = opened.value;
+        const channel = this.channel;
+        const innerOutputs = session.outputs;
+        (session as { outputs: AsyncIterable<HarnessOutput> }).outputs = channel.outputs;
+        const self = this;
+        void (async () => {
+          try {
+            for await (const output of innerOutputs) {
+              if (!self.filterOutputs) {
+                channel.emit(output);
+              }
+            }
+          } finally {
+            channel.end();
+          }
+        })();
+        return opened;
+      }
+    }
+
+    const adapter = new FaultInjectableHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId, 2);
+
+    // Wait until turn/started is projected
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+
+    // Abruptly terminate the output stream without completing the turn
+    adapter.channel.end();
+
+    // 1. turn/completed with status failed is emitted
+    const completed = await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", turnId),
+    );
+    expect((messageParams(completed).turn as JsonObject).status).toBe("failed");
+    expect(
+      ((messageParams(completed).turn as JsonObject).error as JsonObject | undefined)?.message,
+    ).toContain("stream terminated unexpectedly");
+
+    // 2. thread/status/changed to idle is emitted
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, threadId, "idle")),
+    ).resolves.toBeDefined();
+
+    await stopFixture(fixture);
+  });
+
+  it("re-opens a faulted Session on the next Turn instead of failing on a dead Session", async () => {
+    const adapter = new RestartableFakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId, 2);
+    const session = adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+
+    // A real fault closes the Session itself, not just the Host-visible Turn.
+    session.fault({ code: "internalError", message: "native process exited", retryable: false });
+
+    const completed = await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", turnId),
+    );
+    expect((messageParams(completed).turn as JsonObject).status).toBe("failed");
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, threadId, "idle")),
+    ).resolves.toBeDefined();
+
+    // The dead Session is dropped, so the next Turn resumes the Thread instead of
+    // answering -32073 "Session is not open".
+    const nextTurnId = await startPiTurn(fixture, threadId, 3);
+    expect(adapter.sessions).toHaveLength(2);
+    const resumed = adapter.sessions[1];
+    if (!resumed) throw new Error("Fake Pi Session was not resumed");
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", nextTurnId));
+    resumed.appendText("recovered output");
+    resumed.succeedTurn();
+    await expect(
+      fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", nextTurnId)),
+    ).resolves.toBeDefined();
+
+    await stopFixture(fixture);
+  });
+
+  it("retires a pending Desktop Approval when the Session dies without closing it", async () => {
+    class DroppableOutputHarnessAdapter extends FakeHarnessAdapter {
+      readonly channel = new HarnessOutputChannel<HarnessOutput>();
+      forwarding = true;
+
+      override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+        const opened = await super.open(input);
+        if (!opened.ok) return opened;
+        const session = opened.value;
+        const channel = this.channel;
+        const forwards = () => this.forwarding;
+        const innerOutputs = session.outputs;
+        (session as { outputs: AsyncIterable<HarnessOutput> }).outputs = channel.outputs;
+        void (async () => {
+          for await (const output of innerOutputs) {
+            if (forwards()) channel.emit(output);
+          }
+        })();
+        return opened;
+      }
+    }
+
+    const adapter = new DroppableOutputHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId, 2);
+    const session = adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+    session.requestApproval("Approve before the crash");
+    const approvalRequest = await fixture.collector.waitFor((message) =>
+      method(message, "mcpServer/elicitation/request"),
+    );
+    const approvalRequestId = approvalRequest.id;
+    if (typeof approvalRequestId !== "number") {
+      throw new Error("Approval request has no numeric Host ID");
+    }
+
+    // Abrupt death: no interaction.closed, no turn.completed from the Adapter.
+    adapter.channel.end();
+
+    await expect(
+      fixture.collector.waitFor((message) => method(message, "serverRequest/resolved")),
+    ).resolves.toMatchObject({ params: { threadId, requestId: approvalRequestId } });
+    const completed = await fixture.collector.waitFor((message) =>
+      turnEvent(message, "turn/completed", turnId),
+    );
+    expect((messageParams(completed).turn as JsonObject).status).toBe("failed");
+
+    // The retired prompt must not reach the dead Session.
+    writeRequest(fixture.desktopInput, { id: approvalRequestId, result: { action: "accept" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.interactionResponses).toHaveLength(0);
+
+    await stopFixture(fixture);
+  });
+
+  it("idles a Parent whose Session dies while its Subagent is still running", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const turnId = await startPiTurn(fixture, threadId, 2);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+
+    session.startSubagentDelegation({
+      subagentId: "sub-1",
+      nativeSubagentId: "native-sub-1",
+      description: "synthetic worker",
+      background: true,
+      status: "running",
+    });
+    const childStarted = await fixture.collector.waitFor((message) => {
+      if (!method(message, "thread/started")) return false;
+      const thread = messageParams(message).thread;
+      return (
+        typeof thread === "object" &&
+        thread !== null &&
+        !Array.isArray(thread) &&
+        (thread as JsonObject).parentThreadId === threadId
+      );
+    });
+    const childThreadId = (messageParams(childStarted).thread as JsonObject).id as string;
+    expect((messageParams(childStarted).thread as JsonObject).status).toEqual({
+      type: "active",
+      activeFlags: [],
+    });
+
+    // The Session dies while the Subagent is still running, so no terminal
+    // subagent.state.changed can ever arrive.
+    session.fault({ code: "internalError", message: "native process exited", retryable: false });
+
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, childThreadId, "idle")),
+    ).resolves.toBeDefined();
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, threadId, "idle")),
+    ).resolves.toBeDefined();
+
     await stopFixture(fixture);
   });
 });

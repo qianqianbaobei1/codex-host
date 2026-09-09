@@ -12,6 +12,7 @@ export const KNOWN_RENDERER_AGENTS = [
   "opencode",
   "grok",
   "omp",
+  "antigravity",
 ] as const;
 export const DEFAULT_RENDERER_AGENTS = KNOWN_RENDERER_AGENTS;
 export type RendererAgent = (typeof KNOWN_RENDERER_AGENTS)[number];
@@ -35,6 +36,8 @@ export interface DraftComposerState {
   grokThinkingOptionId?: HarnessThinkingOptionId;
   ompModel?: HarnessModelRef;
   ompThinkingOptionId?: HarnessThinkingOptionId;
+  antigravityModel?: HarnessModelRef;
+  antigravityThinkingOptionId?: HarnessThinkingOptionId;
   permissionModeByAgent?: Partial<Record<ExternalRendererAgent, HarnessPermissionModeId>>;
 }
 
@@ -82,6 +85,7 @@ export class DraftAgentController<Composer extends object> {
   readonly #states = new WeakMap<Composer, MutableComposerState>();
   readonly #switching = new Set<MutableComposerState>();
   readonly #pendingSubmissions = new Set<MutableComposerState>();
+  readonly #userSwitchedAgents = new Set<MutableComposerState>();
   #composerSequence = 0;
   #modelRequestSequence = 0;
   #ownershipRequestSequence = 0;
@@ -118,11 +122,34 @@ export class DraftAgentController<Composer extends object> {
       preferredNewThreadAgent && this.#enabledAgents.has(preferredNewThreadAgent)
         ? preferredNewThreadAgent
         : this.#lastSubmittedAgent;
-    const state = this.#state(composer, isDefaultTarget(target) ? preferredAgent : "codex");
     if (isConversationTarget(target)) {
+      const state: MutableComposerState = {
+        agent: "codex",
+        phase: "draft",
+        composerId: this.#idFactory(++this.#composerSequence),
+      };
       this.#conversationStates.push({ target, state });
+      this.#states.set(composer, state);
+      return state;
     }
-    return state;
+    const existing = this.#states.get(composer);
+    const existingIsConversation =
+      existing !== undefined &&
+      this.#conversationStates.some((candidate) => candidate.state === existing);
+    if (existing && !existingIsConversation) {
+      return existing;
+    }
+    const created: MutableComposerState = {
+      agent: isDefaultTarget(target) ? preferredAgent : "codex",
+      phase: "draft",
+      composerId: this.#idFactory(++this.#composerSequence),
+    };
+    this.#states.set(composer, created);
+    return created;
+  }
+
+  isUserSwitched(composer: Composer): boolean {
+    return this.#userSwitchedAgents.has(this.#state(composer));
   }
 
   isSwitching(composer: Composer): boolean {
@@ -180,6 +207,32 @@ export class DraftAgentController<Composer extends object> {
     return state;
   }
 
+  rebindDraft(
+    composer: Composer,
+    target: readonly unknown[] | null,
+    preferredNewThreadAgent?: RendererAgent,
+  ): Readonly<DraftComposerState> {
+    const previous = this.#states.get(composer);
+    if (previous) {
+      this.#pendingSubmissions.delete(previous);
+      this.#modelRequestGenerations.set(previous, ++this.#modelRequestSequence);
+      this.#ownershipRequestGenerations.set(previous, ++this.#ownershipRequestSequence);
+    }
+    const preferredAgent =
+      preferredNewThreadAgent && this.#enabledAgents.has(preferredNewThreadAgent)
+        ? preferredNewThreadAgent
+        : this.#lastSubmittedAgent;
+    const created: MutableComposerState = {
+      agent: isDefaultTarget(target) ? preferredAgent : "codex",
+      phase: "draft",
+      composerId: this.#idFactory(++this.#composerSequence),
+    };
+    this.#states.set(composer, created);
+    this.#modelRequestGenerations.set(created, ++this.#modelRequestSequence);
+    this.#ownershipRequestGenerations.set(created, ++this.#ownershipRequestSequence);
+    return created;
+  }
+
   restore(
     composer: Composer,
     agent: RendererAgent,
@@ -190,7 +243,9 @@ export class DraftAgentController<Composer extends object> {
     if (!this.#enabledAgents.has(agent)) return null;
     const state = this.#state(composer);
     this.#pendingSubmissions.delete(state);
-    state.agent = agent;
+    if (!this.#userSwitchedAgents.has(state)) {
+      state.agent = agent;
+    }
     state.phase = "locked";
     if (agent === "pi" && model) state.piModel = model;
     if (agent === "claude-code" && model) state.claudeModel = model;
@@ -198,6 +253,7 @@ export class DraftAgentController<Composer extends object> {
     if (agent === "opencode" && model) state.openCodeModel = model;
     if (agent === "grok" && model) state.grokModel = model;
     if (agent === "omp" && model) state.ompModel = model;
+    if (agent === "antigravity" && model) state.antigravityModel = model;
     if (agent === "pi" && thinkingOptionId) state.piThinkingOptionId = thinkingOptionId;
     else if (agent === "pi") delete state.piThinkingOptionId;
     if (agent === "claude-code" && thinkingOptionId) {
@@ -210,6 +266,9 @@ export class DraftAgentController<Composer extends object> {
     } else if (agent === "opencode") delete state.openCodeThinkingOptionId;
     if (agent === "omp" && thinkingOptionId) state.ompThinkingOptionId = thinkingOptionId;
     else if (agent === "omp") delete state.ompThinkingOptionId;
+    if (agent === "antigravity" && thinkingOptionId) {
+      state.antigravityThinkingOptionId = thinkingOptionId;
+    } else if (agent === "antigravity") delete state.antigravityThinkingOptionId;
     if (agent !== "codex") {
       const permissionModeByAgent: NonNullable<DraftComposerState["permissionModeByAgent"]> = {};
       for (const candidate of [
@@ -219,6 +278,7 @@ export class DraftAgentController<Composer extends object> {
         "opencode",
         "grok",
         "omp",
+        "antigravity",
       ] as const) {
         const current = state.permissionModeByAgent?.[candidate];
         if (candidate !== agent && current) permissionModeByAgent[candidate] = current;
@@ -240,6 +300,7 @@ export class DraftAgentController<Composer extends object> {
     if (agent === "deepseek-harness") return state.deepSeekHarnessModel;
     if (agent === "opencode") return state.openCodeModel;
     if (agent === "grok") return state.grokModel;
+    if (agent === "antigravity") return state.antigravityModel;
     return state.ompModel;
   }
 
@@ -252,6 +313,7 @@ export class DraftAgentController<Composer extends object> {
     if (agent === "claude-code") return state.claudeThinkingOptionId;
     if (agent === "grok") return state.grokThinkingOptionId;
     if (agent === "opencode") return state.openCodeThinkingOptionId;
+    if (agent === "antigravity") return state.antigravityThinkingOptionId;
     return state.ompThinkingOptionId;
   }
 
@@ -286,6 +348,7 @@ export class DraftAgentController<Composer extends object> {
     else if (agent === "deepseek-harness") state.deepSeekHarnessModel = model;
     else if (agent === "opencode") state.openCodeModel = model;
     else if (agent === "grok") state.grokModel = model;
+    else if (agent === "antigravity") state.antigravityModel = model;
     else state.ompModel = model;
     return state;
   }
@@ -330,6 +393,10 @@ export class DraftAgentController<Composer extends object> {
       state.ompThinkingOptionId = thinkingOptionId;
     } else if (agent === "omp") {
       delete state.ompThinkingOptionId;
+    } else if (agent === "antigravity" && thinkingOptionId) {
+      state.antigravityThinkingOptionId = thinkingOptionId;
+    } else if (agent === "antigravity") {
+      delete state.antigravityThinkingOptionId;
     }
     return state;
   }
@@ -364,6 +431,7 @@ export class DraftAgentController<Composer extends object> {
 
   recordSubmission(composer: Composer): Readonly<DraftComposerState> {
     const state = this.#state(composer);
+    this.#userSwitchedAgents.delete(state);
     this.#lastSubmittedAgent = state.agent;
     return state;
   }
@@ -397,7 +465,7 @@ export class DraftAgentController<Composer extends object> {
   ): Promise<boolean> {
     const state = this.#state(composer);
     if (!this.#enabledAgents.has(nextAgent)) return false;
-    if (state.phase !== "draft" || this.#switching.has(state)) return false;
+    if (this.#switching.has(state)) return false;
     if (state.agent === nextAgent) return true;
 
     this.#pendingSubmissions.delete(state);
@@ -416,6 +484,7 @@ export class DraftAgentController<Composer extends object> {
         return false;
       }
       state.agent = nextAgent;
+      this.#userSwitchedAgents.add(state);
       return true;
     } finally {
       this.#switching.delete(state);

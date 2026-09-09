@@ -180,10 +180,10 @@ describe("Renderer draft Agent controller", () => {
     expect(agents.get(composer)).toMatchObject({ agent: "pi", phase: "draft" });
 
     agents.lock(composer);
-    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(false);
+    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(true);
     expect(agents.get(composer)).toEqual({
       composerId: "composer-1",
-      agent: "pi",
+      agent: "codex",
       phase: "locked",
     });
   });
@@ -348,10 +348,31 @@ describe("Renderer draft Agent controller", () => {
     expect(agents.isCurrentModelRequest(composer, staleModelRequest)).toBe(false);
     expect(agents.isCurrentOwnershipRequest(composer, staleOwnershipRequest)).toBe(false);
 
-    expect(agents.restore(composer, "codex")).toMatchObject({
-      agent: "codex",
+    expect(agents.rebindConversation(composer, piTarget)).toMatchObject({
+      agent: "pi",
       phase: "locked",
+      piModel: model,
+      piThinkingOptionId: thinkingOptionId,
     });
+  });
+
+  it("rebinds a reused Composer from conversation to draft without carrying conversation state", () => {
+    const composer = {};
+    const piTarget = ["conversation", "pi-thread"];
+    const draftTarget = ["default", "draft-1"];
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "openai~gpt-5.6-sol" });
+
+    agents.mount(composer, piTarget);
+    agents.restore(composer, "pi", model);
+    expect(agents.get(composer)).toMatchObject({ agent: "pi", phase: "locked" });
+
+    const draft = agents.rebindDraft(composer, draftTarget, "codex");
+    expect(draft).toMatchObject({
+      agent: "codex",
+      phase: "draft",
+    });
+    expect(agents.get(composer)).not.toHaveProperty("piModel");
   });
 
   it("restores a newly mounted Fork owner and ignores stale ownership generations", () => {
@@ -555,5 +576,70 @@ describe("Renderer draft Agent controller", () => {
       }),
     ).rejects.toThrow("could not restore the prior Agent");
     expect(agents.isSwitching(composer)).toBe(false);
+  });
+
+  it("preserves user-switched agent across restore calls until recorded submission", async () => {
+    const composer = {};
+    const agents = controller();
+    agents.mount(composer, ["conversation", "official-thread"]);
+
+    // Thread starts as codex
+    agents.restore(composer, "codex");
+    expect(agents.get(composer).agent).toBe("codex");
+    expect(agents.isUserSwitched(composer)).toBe(false);
+
+    // User switches to deepseek-harness
+    await agents.switchAgent(composer, "deepseek-harness", {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    });
+    expect(agents.get(composer).agent).toBe("deepseek-harness");
+    expect(agents.isUserSwitched(composer)).toBe(true);
+
+    // Backend thread inspection still says "codex" before turn start
+    agents.restore(composer, "codex");
+    // Should preserve deepseek-harness!
+    expect(agents.get(composer).agent).toBe("deepseek-harness");
+    expect(agents.isUserSwitched(composer)).toBe(true);
+
+    // Message sent and handover recorded
+    agents.recordSubmission(composer);
+    expect(agents.isUserSwitched(composer)).toBe(false);
+
+    // Now restore respects backend inspection normally
+    agents.restore(composer, "deepseek-harness");
+    expect(agents.get(composer).agent).toBe("deepseek-harness");
+  });
+
+  it("isolates Agent selection when the same Composer instance is reused across multiple Threads and draft", async () => {
+    const singleComposerDom = {};
+    const agents = controller();
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    // User is in Thread A and switches to antigravity
+    agents.mount(singleComposerDom, ["conversation", "thread-A"]);
+    await agents.switchAgent(singleComposerDom, "antigravity", operations);
+    expect(agents.get(singleComposerDom).agent).toBe("antigravity");
+
+    // User switches to Thread B using the same composer instance
+    agents.mount(singleComposerDom, ["conversation", "thread-B"]);
+    // Thread B MUST default to codex, not inherit Thread A's antigravity!
+    expect(agents.get(singleComposerDom).agent).toBe("codex");
+    expect(agents.get(singleComposerDom).composerId).not.toBe("composer-1");
+
+    // Remounting Thread A restores antigravity
+    agents.mount(singleComposerDom, ["conversation", "thread-A"]);
+    expect(agents.get(singleComposerDom).agent).toBe("antigravity");
+
+    // Switching to draft (+ New Thread) gets a fresh draft state
+    agents.mount(singleComposerDom, ["default"]);
+    expect(agents.get(singleComposerDom).agent).toBe("codex");
+
+    // Remounting Thread A still preserves antigravity
+    agents.mount(singleComposerDom, ["conversation", "thread-A"]);
+    expect(agents.get(singleComposerDom).agent).toBe("antigravity");
   });
 });

@@ -494,6 +494,7 @@ export interface HarnessSession {
   readonly commands?: HarnessCommandCapability;
 
   refreshUsage?(): Promise<void>;
+  readUsage?(): Promise<HostUsage | null>;
   readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>>;
   execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
   execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
@@ -517,8 +518,16 @@ export interface HarnessSubagentCapability {
 export interface HarnessAdapter {
   readonly harnessId: HarnessId;
   readonly subagents?: HarnessSubagentCapability;
+  /** Capabilities safe to report before a native Session is opened. */
+  readonly cachedThreadCapabilities?: HarnessSessionCapabilities;
 
   inspect(input?: InspectHarnessInput): Promise<HarnessInspection>;
+  /**
+   * Read a restart-safe local snapshot without starting the native Session.
+   * This is an optional fast path for adapters with an independent history
+   * cache; callers must still use `open({ kind: "resume" })` before executing.
+   */
+  readCachedSnapshot?(input: ResumeSessionInput): Promise<HarnessResult<HostThreadSnapshot | null>>;
   open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>>;
   close(): Promise<void>;
 }

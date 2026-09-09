@@ -24,9 +24,12 @@
   },
   "scripts": {
     "start": "node tools/dev-desktop/run.mjs",
-    "build": "npm run build:typescript && npm run build:renderer && npm run build:rust",
-    "build:typescript": "tsc -b",
+    "build": "npm run build:typescript && npm run build:renderer && npm run build:release && npm run build:rust",
+    "build:typescript": "tsc -b && npm run build --workspace=@codexhost/shared-contracts",
     "build:renderer": "npm run build --workspace=@codexhost/renderer-extension",
+    "build:release": "npm run build:release:host && npm run build:release:desktop-control",
+    "build:release:host": "node packages/host-runtime/scripts/build-release.mjs --output packages/host-runtime/dist/main.js",
+    "build:release:desktop-control": "node packages/desktop-control/scripts/build-release.mjs --output packages/desktop-control/dist/release-main.js",
     "build:rust": "cargo build --locked --package codexhost-launcher --package codexhost-platform --package codexhost-shim --package codexhost-updater",
     "release:prepare": "node scripts/release/prepare-version.mjs",
     "release:package": "node scripts/release/prepare-payload.mjs",
@@ -72,7 +75,8 @@
     "audit:codex-desktop": "npm run build:typescript && npm run build:renderer && node tools/codex-desktop-contract-audit/run.mjs",
     "check:rust": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked --features codexhost-shim/test-utils,codexhost-gate-a-native/gate-tools -- -D warnings && cargo test --workspace --locked --features codexhost-shim/test-utils,codexhost-gate-a-native/gate-tools",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:typescript && npm run check:rust",
-    "clean": "node tools/clean.mjs"
+    "clean": "node tools/clean.mjs",
+    "mac:auto-launch": "node tools/mac/install-auto-launch.mjs"
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "1.3.0",

@@ -13,7 +13,7 @@ import {
 } from "@codexhost/shared-contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ExternalThreadRepository } from "../src/external-thread-repository.js";
+import { ExternalThreadRepository, externalThreadValue } from "../src/external-thread-repository.js";
 
 const temporaryDirectories: string[] = [];
 const harnessId = harnessIdSchema.parse("claude-code");
@@ -67,6 +67,28 @@ afterEach(async () => {
 });
 
 describe("ExternalThreadRepository", () => {
+  it("includes the current Codex Desktop project field in projected Threads", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    const repository = new ExternalThreadRepository(store);
+    await repository.initialize();
+    const record = await store.createProvisional({
+      hostThreadId,
+      createRequestId: "create-thread-contract",
+      harnessId,
+      cwd: "/synthetic",
+      title: "External Thread",
+      transportModelId: "codexhost/claude-code-native",
+      ephemeral: false,
+      historyMode: "legacy",
+    });
+
+    const thread = externalThreadValue({ record, turns: [], sessionId: hostThreadId });
+
+    expect(thread).toHaveProperty("projectId", null);
+    await repository.close();
+  });
+
   it("commits a last-Turn replacement with retained Host Turn identity", async () => {
     const directory = await temporaryStoreDirectory();
     const store = new MappingStore({ directory });

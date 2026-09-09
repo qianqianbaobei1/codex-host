@@ -2,6 +2,8 @@ import { createTwoFilesPatch, parsePatch } from "diff";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
+import { fetchDeepSeekBalance } from "@codexhost/adapter-deepseek-harness";
+
 import {
   HarnessOutputChannel,
   validateHostQuestionResponse,
@@ -64,6 +66,7 @@ import {
   type NativeCheckpointRef,
   type NativeSessionRef,
   type NativeTurnRef,
+  type AccountBalanceSnapshot,
 } from "@codexhost/shared-contracts";
 
 import { mapPiSnapshot, resolvePiForkBoundary, type PiSessionHistory } from "./pi-history.js";
@@ -644,6 +647,11 @@ class PiHarnessSession implements HarnessSession {
     } catch (error) {
       return { ok: false, error: normalizedError(error, "nativeFailure") };
     }
+  }
+
+  async readUsage(): Promise<HostUsage | null> {
+    await this.#refreshUsage();
+    return this.#usage;
   }
 
   execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
@@ -1734,6 +1742,9 @@ export class PiAdapter implements HarnessAdapter {
   readonly #inspections = new Set<PiTurnTransport>();
   readonly #sessions = new Set<PiHarnessSession>();
   readonly #toolOutputLimit: number;
+  readonly #environment: NodeJS.ProcessEnv | undefined;
+  #balance: AccountBalanceSnapshot | null = null;
+  #balanceRefresh: Promise<AccountBalanceSnapshot | null> | null = null;
   #closePromise: Promise<void> | null = null;
   #thinkingSelectionSupported: boolean | null = null;
 
@@ -1746,6 +1757,27 @@ export class PiAdapter implements HarnessAdapter {
     this.#createTransport = dependencies.createTransport;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+    this.#environment = options.environment;
+  }
+
+  balance(): AccountBalanceSnapshot | null {
+    return this.#balance;
+  }
+
+  refreshBalance(): Promise<AccountBalanceSnapshot | null> {
+    if (this.#closePromise) return Promise.resolve(this.#balance);
+    if (this.#balanceRefresh) return this.#balanceRefresh;
+    this.#balanceRefresh = fetchDeepSeekBalance(
+      this.#environment ? { environment: this.#environment } : {},
+    )
+      .then((balance) => {
+        if (balance) this.#balance = balance;
+        return this.#balance;
+      })
+      .finally(() => {
+        this.#balanceRefresh = null;
+      });
+    return this.#balanceRefresh;
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {

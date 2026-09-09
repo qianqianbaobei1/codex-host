@@ -12,6 +12,7 @@ export const RENDERER_AGENT_LABELS: Record<RendererAgent, string> = {
   opencode: "OpenCode",
   grok: "Grok",
   omp: "Oh My Pi",
+  antigravity: "Gemini CLI",
 };
 
 const PI_PATHS = [
@@ -93,6 +94,18 @@ export function createRendererAgentIcon(
     image.style.objectFit = "contain";
     image.style.flex = "none";
     return image;
+  }
+  if (agent === "antigravity") {
+    return createSvgIcon(
+      [
+        {
+          d: "M12 1.5l1.6 7.1L20.5 12l-6.9 1.6L12 20.5l-1.6-6.9L3.5 12l6.9-3.4L12 1.5zm6.2 12.9l.7 2.7 2.6.7-2.6.7-.7 2.8-.7-2.8-2.7-.7 2.7-.7.7-2.7z",
+        },
+      ],
+      "#8E75FF",
+      size,
+      ownerDocument,
+    );
   }
   if (agent === "omp") {
     const image = ownerDocument.createElement("img");

@@ -43,7 +43,7 @@ But **Codex** is not the only capable **Agent Harness**. Some developers prefer 
 
 ## Interface Preview
 
-No app switching required: use Pi, Claude Code, OMP, Grok Build, and DeepSeek Harness directly in the same Codex Desktop window.
+No app switching required: use Pi, Claude Code, OMP, Grok Build, DeepSeek Harness, and Gemini CLI directly in the same Codex Desktop window.
 
 https://github.com/user-attachments/assets/c48192d7-23ff-4f6e-b61a-6345a655bb76
 

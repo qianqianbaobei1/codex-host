@@ -7,8 +7,10 @@ import {
   GROK_COMMAND_ENV,
   OPENCODE_COMMAND_ENV,
   createExternalHarnessAdapters,
+  externalHarnessEnvironment,
   prefetchClaudeCodeModelCatalog,
 } from "../src/index.js";
+import { ANTIGRAVITY_DEADLINE_ENV, antigravityTimeoutOptions } from "../src/adapter-composition.js";
 
 describe("Host external Harness composition", () => {
   it("starts Claude Catalog prefetch immediately without waiting for it", async () => {
@@ -24,6 +26,35 @@ describe("Host external Harness composition", () => {
     expect(inspect).toHaveBeenCalledOnce();
     finish();
     await expect(prefetch).resolves.toBeUndefined();
+  });
+
+  it("does not wake AGY during Host startup prefetch", async () => {
+    const claudeInspect = vi.fn(() => Promise.resolve({} as HarnessInspection));
+    const antigravityInspect = vi.fn(() => Promise.resolve({} as HarnessInspection));
+
+    await expect(
+      prefetchClaudeCodeModelCatalog(
+        new Map([
+          ["claude-code", { inspect: claudeInspect }],
+          ["antigravity", { inspect: antigravityInspect }],
+        ] as const),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(claudeInspect).toHaveBeenCalledOnce();
+    expect(antigravityInspect).not.toHaveBeenCalled();
+  });
+
+  it("keeps App-private pipes out of external Harness environments", () => {
+    expect(
+      externalHarnessEnvironment({
+        PATH: "/synthetic",
+        CODEX_APP_TOOLS_PIPE_PATH: "/tmp/private.sock",
+        CODEX_MCP_NODE_PATH: "/Applications/ChatGPT.app/node",
+        CODEX_BROWSER_USE_NODE_PATH: "/Applications/ChatGPT.app/cua-node",
+        CODEX_ELECTRON_RESOURCES_PATH: "/Applications/ChatGPT.app/resources",
+      }),
+    ).toEqual({ PATH: "/synthetic" });
   });
 
   it("isolates a missing or failed Claude prefetch from Host startup", async () => {
@@ -47,6 +78,7 @@ describe("Host external Harness composition", () => {
       "opencode",
       "grok",
       "omp",
+      "antigravity",
     ]);
     expect(adapters.get("claude-code")?.harnessId).toBe("claude-code");
     expect(adapters.get("deepseek-harness")?.harnessId).toBe("deepseek-harness");
@@ -93,6 +125,13 @@ describe("Host external Harness composition", () => {
       error: { code: "notInstalled" },
     });
     await Promise.all([...adapters.values()].map((adapter) => adapter.close()));
+  });
+
+  it("preserves zero as the explicit host deadline disable value", () => {
+    expect(antigravityTimeoutOptions({ [ANTIGRAVITY_DEADLINE_ENV]: "0" })).toEqual({
+      turnDeadlineMs: 0,
+    });
+    expect(antigravityTimeoutOptions({ [ANTIGRAVITY_DEADLINE_ENV]: "-1" })).toEqual({});
   });
 
   it("fails closed when a managed macOS SSH Host cannot reach the Aqua broker", async () => {

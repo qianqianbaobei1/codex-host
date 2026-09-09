@@ -86,11 +86,12 @@ function loopbackUrl(value: string, protocols: readonly string[]): URL {
 
 function parseTarget(value: unknown): CdpTarget {
   if (!isRecord(value)) throw new Error("CDP target must be an object");
+  // Worker targets may have an empty or omitted URL; the debugger endpoint is validated separately.
   const target = {
     id: nonEmptyString(value.id, "id"),
     type: nonEmptyString(value.type, "type"),
     title: typeof value.title === "string" ? value.title : "",
-    url: nonEmptyString(value.url, "url"),
+    url: typeof value.url === "string" ? value.url : "",
     webSocketDebuggerUrl: nonEmptyString(value.webSocketDebuggerUrl, "webSocketDebuggerUrl"),
   };
   loopbackUrl(target.webSocketDebuggerUrl, ["ws:", "wss:"]);

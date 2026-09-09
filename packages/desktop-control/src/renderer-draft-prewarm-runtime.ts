@@ -71,7 +71,9 @@ export function installDraftPrewarmPolicyBridge(
   const originalPrewarm = bridge.prewarmThreadStart;
   const originalOnNotification = manager.onNotification;
   const originalDispatchAppServerResponse = manager.dispatchAppServerResponse;
-  let selectedModel: string | null = null;
+  let selectedDraftModel: string | null = null;
+  let pendingDraftThreadModel: string | null = null;
+  const threadSelectedModels = new Map<string, string | null>();
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === "object" && value !== null && !Array.isArray(value);
   const isRemoteControlHost = hostId.startsWith("remote-control:");
@@ -162,11 +164,14 @@ export function installDraftPrewarmPolicyBridge(
     nextBridgeServerRequestOrdinal = 1;
     bridgeState = "idle";
   };
-  const rememberExternalThread = (value: unknown): void => {
+  const rememberThread = (value: unknown): void => {
     if (!isRecord(value) || typeof value.id !== "string") return;
     if (value.modelProvider === "codexhost" || value.cliVersion === "codexhost") {
       knownExternalThreadIds.add(value.id);
       knownOfficialThreadIds.delete(value.id);
+    } else {
+      knownOfficialThreadIds.add(value.id);
+      knownExternalThreadIds.delete(value.id);
     }
   };
   const observeBridgeResult = (
@@ -175,7 +180,7 @@ export function installDraftPrewarmPolicyBridge(
   ): void => {
     if (!request || !isRecord(result)) return;
     if (request.method === "thread/list" && Array.isArray(result.data)) {
-      for (const thread of result.data) rememberExternalThread(thread);
+      for (const thread of result.data) rememberThread(thread);
       return;
     }
     if (
@@ -183,7 +188,20 @@ export function installDraftPrewarmPolicyBridge(
       request.method === "thread/read" ||
       request.method === "thread/resume"
     ) {
-      rememberExternalThread(result.thread);
+      rememberThread(result.thread);
+      if (
+        request.method === "thread/start" &&
+        pendingDraftThreadModel !== null &&
+        isRecord(result.thread) &&
+        typeof result.thread.id === "string"
+      ) {
+        threadSelectedModels.set(result.thread.id, pendingDraftThreadModel);
+        knownExternalThreadIds.add(result.thread.id);
+        knownOfficialThreadIds.delete(result.thread.id);
+        pendingDraftThreadModel = null;
+      } else if (request.method !== "thread/start") {
+        pendingDraftThreadModel = null;
+      }
       return;
     }
     if (
@@ -198,6 +216,26 @@ export function installDraftPrewarmPolicyBridge(
         knownOfficialThreadIds.add(request.parameters.threadId);
         knownExternalThreadIds.delete(request.parameters.threadId);
       }
+      return;
+    }
+    if (
+      request.method === "turn/start" &&
+      isRecord(request.parameters) &&
+      typeof request.parameters.threadId === "string" &&
+      typeof request.parameters.model === "string" &&
+      request.parameters.model.startsWith("codexhost/")
+    ) {
+      knownExternalThreadIds.add(request.parameters.threadId);
+      knownOfficialThreadIds.delete(request.parameters.threadId);
+      return;
+    }
+    if (
+      request.method === "codexhost/thread/handover" &&
+      isRecord(request.parameters) &&
+      typeof request.parameters.threadId === "string"
+    ) {
+      knownOfficialThreadIds.add(request.parameters.threadId);
+      knownExternalThreadIds.delete(request.parameters.threadId);
       return;
     }
     if (
@@ -229,7 +267,17 @@ export function installDraftPrewarmPolicyBridge(
     }
     if (typeof value.method === "string" && value.id === undefined) {
       if (value.method === "thread/started" && isRecord(value.params)) {
-        rememberExternalThread(value.params.thread);
+        rememberThread(value.params.thread);
+        if (
+          pendingDraftThreadModel !== null &&
+          isRecord(value.params.thread) &&
+          typeof value.params.thread.id === "string"
+        ) {
+          threadSelectedModels.set(value.params.thread.id, pendingDraftThreadModel);
+          knownExternalThreadIds.add(value.params.thread.id);
+          knownOfficialThreadIds.delete(value.params.thread.id);
+          pendingDraftThreadModel = null;
+        }
       }
       originalOnNotification.call(manager, value.method, value.params);
       return;
@@ -484,44 +532,117 @@ export function installDraftPrewarmPolicyBridge(
     if (!isRemoteControlHost) return false;
     if (method.startsWith("codexhost/")) return true;
     if (method === "thread/list") return true;
-    if (method === "thread/start") {
-      return (
+    if (method === "thread/start" || method === "turn/start") {
+      if (
         isRecord(parameters) &&
         typeof parameters.model === "string" &&
         parameters.model.startsWith("codexhost/")
-      );
+      ) {
+        return true;
+      }
     }
     const threadId = threadIdFromParameters(parameters);
-    if (threadId && knownExternalThreadIds.has(threadId)) return true;
+    if (threadId && threadSelectedModels.has(threadId)) {
+      const configured = threadSelectedModels.get(threadId);
+      if (configured !== null) return true;
+      return false;
+    }
     if (threadId && knownOfficialThreadIds.has(threadId)) return false;
-    return (
-      selectedModel !== null &&
+    if (threadId && knownExternalThreadIds.has(threadId)) return true;
+    if (
+      !threadId &&
+      selectedDraftModel !== null &&
       (method.startsWith("thread/") || method.startsWith("turn/") || method.startsWith("review/"))
-    );
+    ) {
+      return true;
+    }
+    return false;
   };
   const routeThreadStart = (parameters: unknown): unknown => {
-    if (selectedModel === null || !isRecord(parameters) || parameters.ephemeral === true) {
+    if (isRecord(parameters) && parameters.ephemeral === true) {
       return parameters;
     }
-    return { ...parameters, model: selectedModel };
+    if (selectedDraftModel === null || !isRecord(parameters)) {
+      pendingDraftThreadModel = null;
+      return parameters;
+    }
+    pendingDraftThreadModel = selectedDraftModel;
+    return { ...parameters, model: selectedDraftModel };
+  };
+  const routeTurnStart = (parameters: unknown): unknown => {
+    if (!isRecord(parameters)) return parameters;
+    const threadId = threadIdFromParameters(parameters);
+    if (threadId && threadSelectedModels.has(threadId)) {
+      const configured = threadSelectedModels.get(threadId);
+      if (configured !== null && configured !== undefined) {
+        return { ...parameters, model: configured };
+      }
+      return parameters;
+    }
+    if (threadId && knownOfficialThreadIds.has(threadId)) {
+      return parameters;
+    }
+    if (threadId && knownExternalThreadIds.has(threadId)) {
+      return parameters;
+    }
+    if (pendingDraftThreadModel !== null) {
+      const model = pendingDraftThreadModel;
+      if (threadId) {
+        threadSelectedModels.set(threadId, model);
+        knownExternalThreadIds.add(threadId);
+        knownOfficialThreadIds.delete(threadId);
+      }
+      pendingDraftThreadModel = null;
+      return { ...parameters, model };
+    }
+    return parameters;
   };
   const routedSend = (method: string, parameters: unknown, options?: unknown): unknown => {
-    const routedParameters = method === "thread/start" ? routeThreadStart(parameters) : parameters;
+    const routedParameters =
+      method === "thread/start"
+        ? routeThreadStart(parameters)
+        : method === "turn/start"
+          ? routeTurnStart(parameters)
+          : parameters;
     const sendBridged = (): Promise<unknown> =>
       initializeBridge().then(
         () => enqueueBridgeRequest(method, routedParameters, options) as Promise<unknown>,
       );
-    const sendDirect = (): unknown =>
-      options === undefined
-        ? originalSend.call(bridge, method, routedParameters)
-        : originalSend.call(bridge, method, routedParameters, options);
+    const observeDirectResult = (result: unknown): unknown => {
+      if (isRecord(result)) {
+        if (
+          method === "thread/start" ||
+          method === "thread/read" ||
+          method === "thread/resume"
+        ) {
+          rememberThread(result.thread);
+          if (method !== "thread/start") pendingDraftThreadModel = null;
+        } else if (method === "thread/list" && Array.isArray(result.data)) {
+          for (const thread of result.data) rememberThread(thread);
+        }
+      }
+      return result;
+    };
+    const sendDirect = (): unknown => {
+      const response =
+        options === undefined
+          ? originalSend.call(bridge, method, routedParameters)
+          : originalSend.call(bridge, method, routedParameters, options);
+      if (response && typeof (response as Promise<unknown>).then === "function") {
+        return (response as Promise<unknown>).then(observeDirectResult);
+      }
+      return observeDirectResult(response);
+    };
+    if (shouldUseBridge(method, routedParameters)) {
+      return sendBridged();
+    }
     const unresolvedThreadId = shouldResolveThreadOwnership(method, routedParameters);
     if (unresolvedThreadId) {
       return resolveThreadOwnership(unresolvedThreadId).then((owner) =>
         owner === "external" ? sendBridged() : sendDirect(),
       );
     }
-    return shouldUseBridge(method, routedParameters) ? sendBridged() : sendDirect();
+    return sendDirect();
   };
   const routedPrewarm = (parameters: unknown, options?: unknown): unknown => {
     const routedParameters = routeThreadStart(parameters);
@@ -595,12 +716,35 @@ export function installDraftPrewarmPolicyBridge(
     requestTarget(): RendererHostRequestManager {
       return manager;
     },
-    select(model: string | null): boolean {
+    select(model: string | null, threadId?: string): boolean {
       if (model !== null && (typeof model !== "string" || !model.startsWith("codexhost/"))) {
         throw new Error("Draft route Model must be a codexhost transport carrier");
       }
-      if (selectedModel === model) return false;
-      selectedModel = model;
+      if (threadId) {
+        const previous = threadSelectedModels.get(threadId);
+        if (previous === model) return false;
+        threadSelectedModels.set(threadId, model);
+        if (model !== null) {
+          knownExternalThreadIds.add(threadId);
+          knownOfficialThreadIds.delete(threadId);
+        } else {
+          knownOfficialThreadIds.add(threadId);
+          knownExternalThreadIds.delete(threadId);
+          if (isRemoteControlHost) {
+            void Promise.resolve(
+              enqueueBridgeRequest("codexhost/thread/handover", { threadId, target: "codex" }),
+            ).catch(() => undefined);
+          } else {
+            void Promise.resolve(
+              originalSend.call(bridge, "codexhost/thread/handover", { threadId, target: "codex" }),
+            ).catch(() => undefined);
+          }
+        }
+        return true;
+      }
+      if (selectedDraftModel === model) return false;
+      selectedDraftModel = model;
+      if (model === null) pendingDraftThreadModel = null;
       return true;
     },
     clear(): Promise<void> {
@@ -636,7 +780,9 @@ export function installDraftPrewarmPolicyBridge(
       knownExternalThreadIds.clear();
       knownOfficialThreadIds.clear();
       threadOwnershipResolutions.clear();
-      selectedModel = null;
+      threadSelectedModels.clear();
+      pendingDraftThreadModel = null;
+      selectedDraftModel = null;
     },
   });
   Object.defineProperty(target, "__codexhostDraftPrewarmPolicyV1", {

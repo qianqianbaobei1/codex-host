@@ -23,6 +23,58 @@ const isoDateSchema = z.string().refine((value) => !Number.isNaN(Date.parse(valu
   message: "Timestamp must be an ISO date",
 });
 
+export const externalGoalStatusSchema = z.enum([
+  "active",
+  "paused",
+  "blocked",
+  "usage_limited",
+  "budget_limited",
+  "complete",
+]);
+
+export const externalGoalStopReasonSchema = z.enum([
+  "same_blocker",
+  "no_progress",
+  "max_turns",
+  "user_pause",
+  "user_interrupt",
+  "runtime_error",
+  "usage_limit",
+  "token_budget",
+  "completion_audit_failed",
+]);
+
+export const storedExternalGoalV1Schema = z
+  .object({
+    formatVersion: z.literal(1),
+    goalId: nonBlankTextSchema.max(128),
+    origin: z.literal("codexhost"),
+    harnessId: harnessIdSchema,
+    objective: nonBlankTextSchema.max(4_000),
+    status: externalGoalStatusSchema,
+    stopReason: externalGoalStopReasonSchema.optional(),
+    tokenBudget: z.number().int().positive().optional(),
+    tokensUsed: z.number().int().nonnegative(),
+    timeUsedSeconds: z.number().nonnegative(),
+    revision: z.number().int().positive(),
+    turnCount: z.number().int().nonnegative(),
+    noProgressCount: z.number().int().nonnegative(),
+    lastCompletedTurnId: hostTurnIdSchema.optional(),
+    inFlightTurnId: hostTurnIdSchema.optional(),
+    blockerFingerprint: nonBlankTextSchema.max(1_024).optional(),
+    blockerStallCount: z.number().int().nonnegative(),
+    lastProgressAt: isoDateSchema.optional(),
+    usageBaselineTokens: z.number().int().nonnegative().optional(),
+    usageTotalTokens: z.number().int().nonnegative().optional(),
+    createdAt: isoDateSchema,
+    updatedAt: isoDateSchema,
+  })
+  .strict();
+
+export type ExternalGoalStatus = z.infer<typeof externalGoalStatusSchema>;
+export type ExternalGoalStopReason = z.infer<typeof externalGoalStopReasonSchema>;
+export type StoredExternalGoalV1 = z.infer<typeof storedExternalGoalV1Schema>;
+
 export const storedTurnMappingV1Schema = z
   .object({
     hostTurnId: hostTurnIdSchema,
@@ -48,6 +100,7 @@ export const storedThreadRecordV1Schema = z
     transportModelId: nonBlankTextSchema.max(1_024),
     ephemeral: z.boolean(),
     historyMode: z.enum(["legacy", "paginated"]),
+    goal: storedExternalGoalV1Schema.optional(),
     forkSource: z
       .object({
         hostThreadId: hostThreadIdSchema,
@@ -83,6 +136,13 @@ export const storedThreadRecordV1Schema = z
         message: "Native Session Harness must match the Thread Harness",
       });
     }
+    if (record.goal && record.goal.harnessId !== record.harnessId) {
+      context.addIssue({
+        code: "custom",
+        path: ["goal", "harnessId"],
+        message: "Goal Harness must match the Thread Harness",
+      });
+    }
     const hostTurnIds = new Set<string>();
     const nativeTurnKeys = new Set<string>();
     for (const [index, mapping] of record.turnMappings.entries()) {
@@ -103,26 +163,19 @@ export const storedThreadRecordV1Schema = z
         });
       }
       nativeTurnKeys.add(nativeKey);
-      for (const [name, ref] of [
-        ["nativeTurnRef", mapping.nativeTurnRef],
-        ["nativeCheckpointRef", mapping.nativeCheckpointRef],
-      ] as const) {
-        if (!ref) continue;
-        if (ref.harnessId !== record.harnessId) {
+      if (mapping.nativeCheckpointRef) {
+        if (mapping.nativeCheckpointRef.harnessId !== mapping.nativeTurnRef.harnessId) {
           context.addIssue({
             code: "custom",
-            path: ["turnMappings", index, name, "harnessId"],
-            message: "Turn Ref Harness must match the Thread Harness",
+            path: ["turnMappings", index, "nativeCheckpointRef", "harnessId"],
+            message: "Turn Checkpoint Harness must match the Turn Ref Harness",
           });
         }
-        if (
-          record.nativeSessionRef &&
-          ref.nativeSessionId !== record.nativeSessionRef.nativeSessionId
-        ) {
+        if (mapping.nativeCheckpointRef.nativeSessionId !== mapping.nativeTurnRef.nativeSessionId) {
           context.addIssue({
             code: "custom",
-            path: ["turnMappings", index, name, "nativeSessionId"],
-            message: "Turn Ref Native Session must match the Thread Native Session",
+            path: ["turnMappings", index, "nativeCheckpointRef", "nativeSessionId"],
+            message: "Turn Checkpoint Native Session must match the Turn Ref Native Session",
           });
         }
       }
@@ -216,4 +269,11 @@ export interface ReplaceReadySessionAfterLastTurnInput {
   hostThreadId: HostThreadId;
   nativeSessionRef: NativeSessionRef;
   turnMappings: StoredTurnMappingV1[];
+}
+
+export interface HandoverHarnessInput {
+  hostThreadId: HostThreadId;
+  harnessId: HarnessId;
+  transportModelId: string;
+  nativeSessionRef?: NativeSessionRef;
 }

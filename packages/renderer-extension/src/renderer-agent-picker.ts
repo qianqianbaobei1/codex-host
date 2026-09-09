@@ -51,6 +51,7 @@ export const RENDERER_AGENT_INSTALL_URLS: Readonly<Record<ExternalRendererAgent,
   opencode: "https://opencode.ai/docs/",
   grok: "https://grok.com/",
   omp: "https://github.com/can1357/oh-my-pi",
+  antigravity: "https://antigravity.google/docs/cli/install/",
 };
 
 type AgentAvailability = Partial<Record<ExternalRendererAgent, RendererAgentAvailability>>;
@@ -124,7 +125,6 @@ export function rendererAgentPickerView(
     agents.map((agent) => [
       agent,
       switching ||
-        state.phase === "locked" ||
         (agent !== "codex" && (adapterState !== "ready" || availability[agent] !== "ready")),
     ]),
   ) as Partial<Record<RendererAgent, boolean>>;
@@ -140,7 +140,7 @@ export function rendererAgentPickerView(
   ) as Partial<Record<ExternalRendererAgent, boolean>>;
   return {
     label: RENDERER_AGENT_LABELS[state.agent],
-    triggerDisabled: switching || state.phase === "locked" || agents.length < 2,
+    triggerDisabled: switching || agents.length < 2,
     nativeModelHidden: switching || state.agent !== "codex",
     optionDisabled,
     downloadVisible,
@@ -648,10 +648,9 @@ export function renderRendererAgentPicker(
   control.trigger.setAttribute("aria-busy", String(switching));
   control.trigger.setAttribute(
     "aria-label",
-    state.phase === "locked" ? `Agent: ${view.label}` : `Select Agent, current ${view.label}`,
+    `Select Agent, current ${view.label}`,
   );
-  control.trigger.title =
-    state.phase === "locked" ? `Agent: ${view.label} (locked)` : `Agent: ${view.label}`;
+  control.trigger.title = `Agent: ${view.label}`;
   control.trigger.style.cursor = control.trigger.disabled ? "not-allowed" : "pointer";
   control.trigger.style.opacity = control.trigger.disabled && !switching ? "0.72" : "1";
   control.iconSlot.style.display = switching ? "none" : "inline-flex";

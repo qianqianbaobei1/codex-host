@@ -57,11 +57,13 @@ export interface ExternalThread {
   thread: JsonObject;
   transportModelId: string;
   turns: JsonObject[];
+  priorTurns?: JsonObject[];
   historyHydrated: boolean;
   running: boolean;
   activeTurnId: HostTurnId | null;
   latestUsage: HostUsage | null;
   usageTurnId: HostTurnId | null;
+  usageByTurn: Map<HostTurnId, HostUsage>;
   projectedTurns: Map<HostTurnId, { projector: CodexTurnProjector }>;
   responseGates: Map<HostTurnId, TurnProjectionGate>;
   ephemeralTurnIds: Set<HostTurnId>;
@@ -82,6 +84,12 @@ export type ExternalThreadResolution =
   | { kind: "official" }
   | { kind: "external"; thread: ExternalThread; historyFresh: boolean }
   | { kind: "error"; error: ExternalThreadRpcError };
+
+export interface CachedExternalThread {
+  record: StoredThreadRecordV1;
+  thread: JsonObject;
+  turns: JsonObject[];
+}
 
 function nativeTurnKey(turn: HostThreadSnapshot["turns"][number]): string {
   const ref = turn.nativeTurnRef;
@@ -190,6 +198,7 @@ export class ExternalThreadRuntime {
   readonly #consumeOutputs: (thread: ExternalThread) => Promise<void>;
   readonly #diagnose: (error: unknown) => void;
   readonly #environment: NodeJS.ProcessEnv;
+  readonly #onRegistered: ((thread: ExternalThread) => void) | undefined;
   readonly #repository: ExternalThreadRepository;
   readonly #restores = new Map<string, Promise<ExternalThread>>();
   readonly #threads = new Map<string, ExternalThread>();
@@ -200,12 +209,14 @@ export class ExternalThreadRuntime {
     repository: ExternalThreadRepository;
     consumeOutputs(thread: ExternalThread): Promise<void>;
     diagnose(error: unknown): void;
+    onRegistered?: (thread: ExternalThread) => void;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment ?? process.env;
     this.#repository = input.repository;
     this.#consumeOutputs = input.consumeOutputs;
     this.#diagnose = input.diagnose;
+    this.#onRegistered = input.onRegistered;
   }
 
   get(threadId: string): ExternalThread | undefined {
@@ -236,6 +247,7 @@ export class ExternalThreadRuntime {
     requestedPermissionModeId?: HarnessPermissionModeId;
     transportModelId?: string;
     restoredState?: HarnessSessionState;
+    priorTurns?: JsonObject[];
   }): ExternalThread {
     const harnessId = input.record.harnessId as ExternalHarnessId;
     if (!this.#adapters.has(harnessId)) {
@@ -272,11 +284,13 @@ export class ExternalThreadRuntime {
       thread: input.thread,
       transportModelId: input.transportModelId ?? input.record.transportModelId,
       turns: input.turns,
+      ...(input.priorTurns ? { priorTurns: input.priorTurns } : {}),
       historyHydrated: true,
       running: false,
       activeTurnId: null,
       latestUsage: input.session.initialUsage,
       usageTurnId: null,
+      usageByTurn: new Map(),
       projectedTurns: new Map(),
       responseGates: new Map(),
       ephemeralTurnIds: new Set(),
@@ -285,6 +299,7 @@ export class ExternalThreadRuntime {
     };
     externalThread.outputTask = this.#consumeOutputs(externalThread);
     this.#threads.set(externalThread.id, externalThread);
+    this.#onRegistered?.(externalThread);
     return externalThread;
   }
 
@@ -297,6 +312,11 @@ export class ExternalThreadRuntime {
       thread: JsonObject;
       turns: JsonObject[];
       restoredState?: HarnessSessionState;
+      transportModelId?: string;
+      requestedModel?: HarnessModelRef;
+      requestedThinkingOptionId?: HarnessThinkingOptionId;
+      requestedPermissionModeId?: HarnessPermissionModeId;
+      priorTurns?: JsonObject[];
     },
   ): Promise<ExternalThread> {
     if (
@@ -332,10 +352,60 @@ export class ExternalThreadRuntime {
     if (record.state !== "ready" || !record.nativeSessionRef) {
       return {
         kind: "error",
-        error: { code: -32079, message: "External Native Session is unavailable" },
+        error: {
+          code: -32079,
+          message: "External Native Session is unavailable",
+        },
       };
     }
     return { kind: "external", record, thread: null };
+  }
+
+  /**
+   * Read adapter-owned restart-safe history without opening a native Session.
+   * The returned value is deliberately not registered as a live thread: the
+   * first command that needs execution still goes through `resolve()`, which
+   * owns the single real restore promise.
+   */
+  async readCached(
+    location: Extract<ExternalThreadLocation, { kind: "external" }>,
+  ): Promise<CachedExternalThread | null> {
+    if (location.thread || !location.record.nativeSessionRef) return null;
+    const adapter = this.#adapters.get(location.record.harnessId as ExternalHarnessId);
+    if (!adapter?.readCachedSnapshot) return null;
+    const snapshot = await adapter.readCachedSnapshot({
+      kind: "resume",
+      cwd: location.record.cwd,
+      environment: {
+        ...this.#environment,
+        [DELEGATION_THREAD_ID_ENV]: location.record.hostThreadId,
+      },
+      nativeRef: location.record.nativeSessionRef as NativeSessionRef,
+      knownTurnRefs: location.record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
+    });
+    if (!snapshot.ok || !snapshot.value) return null;
+    try {
+      const aligned = await this.#repository.alignSnapshot(location.record, snapshot.value);
+      const sessionId = await this.#repository.sessionTreeId(aligned.record);
+      return {
+        record: aligned.record,
+        turns: aligned.turns,
+        thread: externalThreadValue({
+          record: aligned.record,
+          turns: aligned.turns,
+          sessionId,
+        }),
+      };
+    } catch (error) {
+      this.#diagnose(error);
+      return null;
+    }
+  }
+
+  /** Start a normal restore in the background after a cache-first response. */
+  prewarm(threadId: string): void {
+    if (this.#threads.has(threadId) || this.#restores.has(threadId)) return;
+    void this.resolve(threadId).catch((error) => this.#diagnose(error));
   }
 
   async resolve(threadId: string): Promise<ExternalThreadResolution> {
@@ -371,7 +441,11 @@ export class ExternalThreadRuntime {
     const snapshot = await thread.session.readSnapshot();
     if (!snapshot.ok) return mapExternalThreadHarnessError(snapshot.error, "read");
     try {
-      const aligned = await this.#repository.alignSnapshot(thread.record, snapshot.value);
+      const aligned = await this.#repository.alignSnapshot(
+        thread.record,
+        snapshot.value,
+        thread.priorTurns,
+      );
       thread.record = aligned.record;
       thread.turns = aligned.turns;
       thread.historyHydrated = true;

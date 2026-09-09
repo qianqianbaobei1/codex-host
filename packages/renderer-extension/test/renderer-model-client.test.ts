@@ -139,6 +139,7 @@ describe("Renderer fixed Model request client", () => {
       "checkUpdate",
       "executeThreadCommand",
       "forkThread",
+      "handoverThread",
       "inspectHarness",
       "inspectThread",
       "inspectThreadCommands",

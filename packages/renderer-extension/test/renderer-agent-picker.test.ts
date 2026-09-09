@@ -45,16 +45,16 @@ describe("Renderer Agent picker presentation", () => {
     });
   });
 
-  it("hides the native Model for an external Agent and locks submitted selection", () => {
+  it("hides the native Model for an external Agent and keeps picker enabled when submitted", () => {
     expect(
       rendererAgentPickerView({ agent: "pi", phase: "locked" }, "ready", false, ["codex", "pi"], {
         pi: "ready",
       }),
     ).toEqual({
       label: "Pi",
-      triggerDisabled: true,
+      triggerDisabled: false,
       nativeModelHidden: true,
-      optionDisabled: { codex: true, pi: true },
+      optionDisabled: { codex: false, pi: false },
       downloadVisible: { pi: false },
       errorVisible: { pi: false },
     });

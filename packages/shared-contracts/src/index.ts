@@ -87,16 +87,24 @@ export type {
   ThreadCommandsInspectParams,
 } from "./harness-commands.js";
 export {
+  accountBalanceInfoSchema,
+  accountBalanceSnapshotSchema,
   accountCreditsProductUsageSchema,
   accountCreditsSnapshotSchema,
+  accountCreditsStatusSchema,
   threadUsageInspectionParamsSchema,
   threadUsageInspectionSchema,
+  threadUsageOwnerSchema,
   threadUsageSnapshotSchema,
 } from "./thread-usage.js";
 export type {
+  AccountBalanceInfo,
+  AccountBalanceSnapshot,
   AccountCreditsSnapshot,
+  AccountCreditsStatus,
   ThreadUsageInspection,
   ThreadUsageInspectionParams,
+  ThreadUsageOwner,
   ThreadUsageSnapshot,
 } from "./thread-usage.js";
 export {

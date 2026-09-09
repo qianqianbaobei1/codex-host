@@ -24,6 +24,7 @@ function stringValue(value: unknown): string | null {
 }
 
 function textFromUserItem(item: JsonObject): string {
+  if (typeof item.text === "string") return item.text;
   if (!Array.isArray(item.content)) return "";
   return item.content
     .flatMap((part) =>
@@ -47,7 +48,7 @@ function turnStatus(value: unknown): DelegationThreadStatus {
   return "completed";
 }
 
-function allVisibleMessages(turns: readonly JsonObject[]): DelegationMessage[] {
+export function allVisibleMessages(turns: readonly JsonObject[]): DelegationMessage[] {
   const messages: DelegationMessage[] = [];
   for (const turn of turns) {
     const turnId = stringValue(turn.id);
@@ -55,10 +56,9 @@ function allVisibleMessages(turns: readonly JsonObject[]): DelegationMessage[] {
     const agentItems = turn.items.filter(
       (item): item is JsonObject => isRecord(item) && item.type === "agentMessage",
     );
-    for (const item of turn.items) {
+    for (const [index, item] of turn.items.entries()) {
       if (!isRecord(item)) continue;
-      const id = stringValue(item.id);
-      if (!id) continue;
+      const id = stringValue(item.id) ?? stringValue(item.itemId) ?? `item-${turnId}-${index}`;
       if (item.type === "userMessage") {
         const text = textFromUserItem(item);
         if (text) messages.push({ id, turnId, role: "user", text });

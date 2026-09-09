@@ -36,6 +36,8 @@ const APP_SERVER_FLAG_OPTIONS = new Set([
 
 export interface RemoteAppServerSession {
   run(): Promise<number>;
+  /** Ends remote Desktop input without cancelling active work. */
+  disconnect(): void;
   /** Requests cancellation synchronously; run settles after owned resources are released. */
   close(): void;
 }
@@ -371,6 +373,7 @@ export function createRemoteAppServerWebSocketListener(input: {
     input.diagnosticOutput.write(`codexhost remote WebSocket server: ${error.message}\n`);
   });
   const sessions = new Set<Promise<unknown>>();
+  const sessionClosers = new Set<() => void>();
   let listening = false;
   let ownedSocketIdentity: UnixFileIdentity | null = null;
   let closing: Promise<void> | null = null;
@@ -386,8 +389,25 @@ export function createRemoteAppServerWebSocketListener(input: {
     });
     sendOutputFrames(socket, desktopOutput);
     let inputTail = Promise.resolve();
+    let sessionDisconnecting = false;
     let sessionClosing = false;
     let sessionFinished = false;
+    const disconnectSession = (): void => {
+      if (sessionDisconnecting || sessionClosing || sessionFinished) return;
+      sessionDisconnecting = true;
+      const disconnect = (): void => {
+        if (sessionClosing || sessionFinished) return;
+        try {
+          session.disconnect();
+        } catch (error) {
+          input.diagnosticOutput.write(
+            `codexhost remote app-server disconnect: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+          closeSession();
+        }
+      };
+      void inputTail.then(disconnect, disconnect);
+    };
     const closeSession = (): void => {
       desktopInput.destroy();
       if (sessionClosing || sessionFinished) return;
@@ -416,8 +436,11 @@ export function createRemoteAppServerWebSocketListener(input: {
       );
       void inputTail.catch(() => socket.close(1011, "Host Runtime input failed"));
     });
-    socket.once("close", closeSession);
-    socket.once("error", closeSession);
+    // A transport disconnect is not a user cancellation. End the Desktop input
+    // after accepted frames drain so AppServerHost can keep an active Turn alive
+    // until its real terminal event. Listener shutdown still uses closeSession.
+    socket.once("close", disconnectSession);
+    socket.once("error", disconnectSession);
     const running = session
       .run()
       .then((code) => {
@@ -435,8 +458,10 @@ export function createRemoteAppServerWebSocketListener(input: {
         sessionFinished = true;
         desktopOutput.end();
         sessions.delete(running);
+        sessionClosers.delete(closeSession);
       });
     sessions.add(running);
+    sessionClosers.add(closeSession);
   });
 
   return {
@@ -476,6 +501,8 @@ export function createRemoteAppServerWebSocketListener(input: {
     close() {
       if (closing) return closing;
       closing = (async () => {
+        const closingSessions = [...sessions];
+        for (const closeSession of sessionClosers) closeSession();
         for (const socket of webSockets.clients) socket.terminate();
         await new Promise<void>((resolve) => webSockets.close(() => resolve()));
         const closeServer = async (): Promise<void> => {
@@ -501,7 +528,7 @@ export function createRemoteAppServerWebSocketListener(input: {
         } else {
           await closeServer();
         }
-        await Promise.allSettled(sessions);
+        await Promise.allSettled(closingSessions);
         closed.resolve(undefined);
       })();
       return closing;

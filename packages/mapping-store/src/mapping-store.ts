@@ -18,15 +18,18 @@ import type { HostThreadId, HostTurnId } from "@codexhost/shared-contracts";
 
 import {
   storedDelegationRecordV1Schema,
+  storedExternalGoalV1Schema,
   storedThreadRecordV1Schema,
   type CommitReadyThreadInput,
   type CreateDelegationInput,
   type CreateProvisionalThreadInput,
   type DelegationStatus,
   type FindRecentDelegationInput,
+  type HandoverHarnessInput,
   type ReplaceReadySessionAfterLastTurnInput,
   type ReplaceReadySessionInput,
   type StoredDelegationRecordV1,
+  type StoredExternalGoalV1,
   type StoredThreadRecordV1,
   type StoredTurnMappingV1,
 } from "./records.js";
@@ -303,6 +306,46 @@ export class MappingStore {
     this.#requireInitialized();
     const record = this.#records.get(hostThreadId);
     return record ? cloneRecord(record) : null;
+  }
+
+  async getThreadGoal(hostThreadId: HostThreadId): Promise<StoredExternalGoalV1 | null> {
+    this.#requireInitialized();
+    const record = this.#records.get(hostThreadId);
+    if (!record) throw new MappingStoreError("THREAD_NOT_FOUND", "External Thread was not found");
+    return record.goal ? cloneRecord(record.goal) : null;
+  }
+
+  async setThreadGoal(
+    hostThreadId: HostThreadId,
+    goal: StoredExternalGoalV1,
+    expectedRevision?: number,
+  ): Promise<StoredThreadRecordV1> {
+    return this.#update(hostThreadId, (current) => {
+      if (expectedRevision !== undefined && current.goal?.revision !== expectedRevision) {
+        throw new MappingStoreError("MAPPING_CONFLICT", "External Goal revision is stale");
+      }
+      if (goal.harnessId !== current.harnessId) {
+        throw new MappingStoreError(
+          "MAPPING_CONFLICT",
+          "Goal Harness does not match Thread Harness",
+        );
+      }
+      return { ...current, goal: storedExternalGoalV1Schema.parse(goal) };
+    });
+  }
+
+  async clearThreadGoal(
+    hostThreadId: HostThreadId,
+    expectedRevision?: number,
+  ): Promise<StoredThreadRecordV1> {
+    return this.#update(hostThreadId, (current) => {
+      if (expectedRevision !== undefined && current.goal?.revision !== expectedRevision) {
+        throw new MappingStoreError("MAPPING_CONFLICT", "External Goal revision is stale");
+      }
+      const withoutGoal = { ...current };
+      delete withoutGoal.goal;
+      return withoutGoal;
+    });
   }
 
   async listThreads(): Promise<StoredThreadRecordV1[]> {
@@ -591,6 +634,30 @@ export class MappingStore {
     return this.#update(hostThreadId, (current) =>
       current.transportModelId === transportModelId ? null : { ...current, transportModelId },
     );
+  }
+
+  async handoverHarness(input: HandoverHarnessInput): Promise<StoredThreadRecordV1> {
+    return this.#update(input.hostThreadId, (current) => {
+      if (input.nativeSessionRef) {
+        return {
+          ...current,
+          harnessId: input.harnessId,
+          transportModelId: input.transportModelId,
+          nativeSessionRef: input.nativeSessionRef,
+        };
+      }
+
+      // A newly created Harness Session may publish its native identity only
+      // when its first turn starts. Never carry the previous Harness identity
+      // across the handover; keep the record provisional until that event.
+      const { nativeSessionRef: _oldNativeSessionRef, ...withoutNativeSession } = current;
+      return {
+        ...withoutNativeSession,
+        harnessId: input.harnessId,
+        state: "creating",
+        transportModelId: input.transportModelId,
+      };
+    });
   }
 
   async setArchived(hostThreadId: HostThreadId, archived: boolean): Promise<StoredThreadRecordV1> {

@@ -11,6 +11,7 @@ import type {
   SessionProjectionsBlock,
 } from "@deepseek-ai/dsh-host-apiproxy/api";
 import type { SessionId } from "@deepseek-ai/dsh-session/types";
+import type { AccountBalanceSnapshot } from "@codexhost/shared-contracts";
 
 import {
   HarnessOutputChannel,
@@ -120,6 +121,7 @@ import {
   projectTurnReason,
   structuredDiffs,
 } from "./projection.js";
+import { fetchDeepSeekBalance } from "./credits.js";
 
 export interface DeepSeekHarnessAdapterOptions extends DeepSeekHostConnectionOptions {
   toolOutputLimit?: number;
@@ -136,6 +138,7 @@ export interface DeepSeekHostConnectionLike {
 export interface DeepSeekHarnessAdapterDependencies {
   randomUUID(): string;
   createConnection(options: DeepSeekHostConnectionOptions): DeepSeekHostConnectionLike;
+  fetchBalance?(input: { environment?: NodeJS.ProcessEnv }): Promise<AccountBalanceSnapshot | null>;
 }
 
 interface ActiveTool {
@@ -1734,7 +1737,12 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   readonly #options: DeepSeekHarnessAdapterOptions;
   readonly #sessions = new Set<DeepSeekHarnessSession>();
   readonly #toolOutputLimit: number;
+  readonly #fetchBalance: (input: {
+    environment?: NodeJS.ProcessEnv;
+  }) => Promise<AccountBalanceSnapshot | null>;
   #closePromise: Promise<void> | null = null;
+  #balance: AccountBalanceSnapshot | null = null;
+  #balanceRefresh: Promise<AccountBalanceSnapshot | null> | null = null;
 
   constructor(
     options: DeepSeekHarnessAdapterOptions = {},
@@ -1746,7 +1754,31 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
       randomUUID,
       createConnection: (connectionOptions) => new DeepSeekHostConnection(connectionOptions),
     };
+    this.#fetchBalance =
+      this.#dependencies.fetchBalance ??
+      ((input) =>
+        fetchDeepSeekBalance(input.environment ? { environment: input.environment } : {}));
     this.#connection = this.#dependencies.createConnection(options);
+  }
+
+  balance(): AccountBalanceSnapshot | null {
+    return this.#balance;
+  }
+
+  refreshBalance(): Promise<AccountBalanceSnapshot | null> {
+    if (this.#closePromise) return Promise.resolve(this.#balance);
+    if (this.#balanceRefresh) return this.#balanceRefresh;
+    this.#balanceRefresh = this.#fetchBalance(
+      this.#options.environment ? { environment: this.#options.environment } : {},
+    )
+      .then((balance) => {
+        if (balance) this.#balance = balance;
+        return this.#balance;
+      })
+      .finally(() => {
+        this.#balanceRefresh = null;
+      });
+    return this.#balanceRefresh;
   }
 
   async inspect(): Promise<HarnessInspection> {

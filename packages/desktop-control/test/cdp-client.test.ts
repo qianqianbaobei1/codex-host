@@ -93,6 +93,59 @@ describe("CDP client", () => {
     ]);
   });
 
+  it("keeps page discovery working when a worker has an empty or missing URL", async () => {
+    const rawTargets = [
+      {
+        id: "worker-1",
+        type: "worker",
+        title: "",
+        url: "",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-1",
+      },
+      {
+        id: "worker-2",
+        type: "worker",
+        title: "background-worker",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-2",
+      },
+      {
+        id: "page-1",
+        type: "page",
+        title: "Codex",
+        url: "app://-/index.html",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+      },
+    ];
+    const fetchImpl: CdpFetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => rawTargets,
+    });
+    await expect(listCdpTargets("http://127.0.0.1:9222", fetchImpl)).resolves.toEqual([
+      {
+        id: "worker-1",
+        type: "worker",
+        title: "",
+        url: "",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-1",
+      },
+      {
+        id: "worker-2",
+        type: "worker",
+        title: "background-worker",
+        url: "",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-2",
+      },
+      {
+        id: "page-1",
+        type: "page",
+        title: "Codex",
+        url: "app://-/index.html",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+      },
+    ]);
+  });
+
   it("validates browser-level discovery metadata", async () => {
     const fetchImpl: CdpFetch = async (url) => ({
       ok: true,

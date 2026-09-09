@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { hostThreadIdSchema } from "./ids.js";
+import { harnessIdSchema, hostThreadIdSchema } from "./ids.js";
 
 const nonNegativeSafeIntegerSchema = z.number().int().safe().nonnegative();
 const finiteNonNegativeNumberSchema = z.number().finite().nonnegative();
@@ -92,6 +92,35 @@ export const accountCreditsSnapshotSchema = z
 
 export type AccountCreditsSnapshot = z.infer<typeof accountCreditsSnapshotSchema>;
 
+export const accountBalanceInfoSchema = z
+  .object({
+    currency: z.string().min(1),
+    totalBalance: z.number().finite().nonnegative(),
+    grantedBalance: z.number().finite().nonnegative().optional(),
+    toppedUpBalance: z.number().finite().nonnegative().optional(),
+  })
+  .strict();
+
+export type AccountBalanceInfo = z.infer<typeof accountBalanceInfoSchema>;
+
+export const accountBalanceSnapshotSchema = z
+  .object({ balances: z.array(accountBalanceInfoSchema).min(1) })
+  .strict();
+
+export type AccountBalanceSnapshot = z.infer<typeof accountBalanceSnapshotSchema>;
+
+export const accountCreditsStatusSchema = z.enum(["available", "unavailable", "unknown"]);
+export type AccountCreditsStatus = z.infer<typeof accountCreditsStatusSchema>;
+
+export const threadUsageOwnerSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    modelId: z.string().min(1).optional(),
+  })
+  .strict();
+
+export type ThreadUsageOwner = z.infer<typeof threadUsageOwnerSchema>;
+
 export const threadUsageInspectionParamsSchema = z
   .object({
     threadId: hostThreadIdSchema,
@@ -106,6 +135,10 @@ export const threadUsageInspectionSchema = z
     threadId: hostThreadIdSchema,
     usage: threadUsageSnapshotSchema.nullable(),
     accountCredits: accountCreditsSnapshotSchema.optional(),
+    accountBalance: accountBalanceSnapshotSchema.optional(),
+    accountBalanceStatus: accountCreditsStatusSchema.optional(),
+    accountCreditsStatus: accountCreditsStatusSchema.optional(),
+    owner: threadUsageOwnerSchema.optional(),
   })
   .strict();
 

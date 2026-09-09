@@ -108,6 +108,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual([]);
@@ -133,6 +134,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -158,6 +160,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -181,6 +184,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual(["pi", "claude-code", "deepseek-harness", "opencode", "grok", "omp"]);
@@ -206,6 +210,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual([]);
@@ -231,6 +236,7 @@ describe("Renderer Composer DOM behavior", () => {
           opencode: undefined,
           grok: undefined,
           omp: undefined,
+          antigravity: undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -288,6 +294,14 @@ describe("Renderer Composer DOM behavior", () => {
         "claude-code",
         { totalCostUsd: 0.168 },
         { usedPercent: 62, periodType: "five_hour" },
+      ),
+    ).toBe(false);
+    expect(shouldRetryExternalThreadUsage("antigravity", { totalCostUsd: 0 })).toBe(true);
+    expect(
+      shouldRetryExternalThreadUsage(
+        "antigravity",
+        { totalCostUsd: 0 },
+        { usedPercent: 25.6, periodType: "five_hour" },
       ),
     ).toBe(false);
     expect(rendererUsageRefreshDelay(0)).toBe(250);
@@ -1107,6 +1121,10 @@ describe("Renderer Composer DOM behavior", () => {
     ).toBe("inspect");
     expect(isLateConversationTarget(null, conversationTarget)).toBe(true);
     expect(lateConversationTargetResolution(null, conversationTarget, "draft")).toBe("inspect");
+    expect(isLateConversationTarget(conversationTarget, defaultTarget)).toBe(true);
+    expect(lateConversationTargetResolution(conversationTarget, defaultTarget, "locked")).toBe(
+      "inspect",
+    );
   });
 
   it("does not transfer an unsubmitted default draft when an existing conversation opens", () => {
