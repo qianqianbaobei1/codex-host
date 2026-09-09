@@ -91,6 +91,14 @@ import {
   type AntigravityPermissionMode,
 } from "./permission-modes.js";
 import { fetchAntigravityQuota } from "./quota.js";
+import {
+  ANTIGRAVITY_ACCOUNT_ID_ENV,
+  ANTIGRAVITY_THREAD_ID_ENV,
+  applyAntigravityAccountEnvironment,
+  antigravityRealHome,
+  type AntigravityAccount,
+  type AntigravityAccountsLoad,
+} from "./accounts.js";
 import { antigravityToolErrorMessage, isAntigravityPermissionDenial } from "./stream-events.js";
 import { parseToolArgs } from "./transcript.js";
 import {
@@ -106,6 +114,8 @@ import {
 export interface AntigravityAdapterOptions {
   command?: string;
   environment?: NodeJS.ProcessEnv;
+  /** Optional multi-account overlay; omitted means legacy single-account mode. */
+  accounts?: AntigravityAccountsLoad;
   startupTimeoutMs?: number;
   turnTimeoutMs?: number;
   idleTimeoutMs?: number;
@@ -215,6 +225,16 @@ function nonBlankString(value: unknown): value is string {
 
 function nonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+const LEGACY_ACCOUNT_KEY = "legacy";
+
+/** Tag the routed Session so every downstream `#environment()` call resolves the same account. */
+function withAntigravityAccountMarker<T extends OpenSessionInput>(input: T, accountId: string): T {
+  return {
+    ...input,
+    environment: { ...(input.environment ?? {}), [ANTIGRAVITY_ACCOUNT_ID_ENV]: accountId },
+  };
 }
 
 function errorMessage(error: unknown): string {
@@ -1388,9 +1408,11 @@ export class AntigravityAdapter implements HarnessAdapter {
   #inspectionPersistentLoad: Promise<void> | null = null;
   #inspectionPersistentWrite: Promise<void> | null = null;
   #closePromise: Promise<void> | null = null;
-  #credits: AccountCreditsSnapshot | null = null;
-  #creditsRefresh: Promise<AccountCreditsSnapshot | null> | null = null;
-  #creditsRefreshStartedAt = 0;
+  readonly #accounts: AntigravityAccountsLoad;
+  readonly #accountsRealHome: string;
+  readonly #creditsByAccount = new Map<string, AccountCreditsSnapshot>();
+  readonly #creditsRefreshByAccount = new Map<string, Promise<AccountCreditsSnapshot | null>>();
+  readonly #creditsRefreshStartedAt = new Map<string, number>();
 
   constructor(
     options: AntigravityAdapterOptions = {},
@@ -1400,10 +1422,20 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#createTransport =
       dependencies.createTransport ?? ((opts) => new AntigravityCliTransport(opts));
     this.#listModels = dependencies.listModels ?? defaultListModels;
-    this.#credits = readAntigravityCreditsSync();
+    this.#accounts = options.accounts ?? { mode: "legacy" };
+    this.#accountsRealHome = antigravityRealHome({ ...process.env, ...options.environment });
+    const initialCredits = readAntigravityCreditsSync();
+    if (initialCredits) this.#creditsByAccount.set(LEGACY_ACCOUNT_KEY, initialCredits);
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
+    return this.#inspectWithEnvironment(input, this.#environment());
+  }
+
+  async #inspectWithEnvironment(
+    input: InspectHarnessInput,
+    environment: NodeJS.ProcessEnv,
+  ): Promise<HarnessInspection> {
     if (this.#closePromise) {
       return {
         status: "unavailable",
@@ -1411,36 +1443,42 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     }
     const cwd = path.resolve(input.cwd ?? process.cwd());
+    const key = this.#inspectionKey(environment, cwd);
     await this.#loadPersistedInspectionCache();
-    const inFlight = this.#inspectionInFlight.get(cwd);
+    const inFlight = this.#inspectionInFlight.get(key);
     if (inFlight) return inFlight;
     if (!input.refresh) {
-      const cached = this.#inspectionCache.get(cwd);
+      const cached = this.#inspectionCache.get(key);
       if (cached) return cached;
-      const failure = this.#inspectionFailures.get(cwd);
+      const failure = this.#inspectionFailures.get(key);
       if (failure && failure.retryAt > Date.now()) return failure.inspection;
-      if (failure) this.#inspectionFailures.delete(cwd);
+      if (failure) this.#inspectionFailures.delete(key);
     }
 
-    const inspection = this.#inspectCatalog(cwd).then((result) => {
+    const inspection = this.#inspectCatalog(cwd, environment).then((result) => {
       if (result.status === "ready") {
-        this.#inspectionCache.set(cwd, result);
-        this.#inspectionFailures.delete(cwd);
+        this.#inspectionCache.set(key, result);
+        this.#inspectionFailures.delete(key);
         this.#persistInspectionCache();
       } else {
-        this.#inspectionFailures.set(cwd, {
+        this.#inspectionFailures.set(key, {
           inspection: result,
           retryAt: Date.now() + INSPECTION_FAILURE_COOLDOWN_MS,
         });
       }
       return result;
     });
-    this.#inspectionInFlight.set(cwd, inspection);
+    this.#inspectionInFlight.set(key, inspection);
     return inspection.finally(() => {
-      if (this.#inspectionInFlight.get(cwd) === inspection) {
-        this.#inspectionInFlight.delete(cwd);
+      if (this.#inspectionInFlight.get(key) === inspection) {
+        this.#inspectionInFlight.delete(key);
       }
     });
+  }
+
+  #inspectionKey(environment: NodeJS.ProcessEnv, cwd: string): string {
+    const accountId = this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
+    return `${accountId}\u0000${path.resolve(cwd)}`;
   }
 
   /**
@@ -1483,19 +1521,19 @@ export class AntigravityAdapter implements HarnessAdapter {
     }
   }
 
-  async #inspectCatalog(cwd: string): Promise<HarnessInspection> {
+  async #inspectCatalog(cwd: string, environment: NodeJS.ProcessEnv): Promise<HarnessInspection> {
     const startedAt = Date.now();
     let stage: HarnessInspection["status"] = "notInstalled";
     try {
       stage = "unavailable";
       resolveAntigravityExecutable({
         ...(this.#options.command ? { command: this.#options.command } : {}),
-        environment: this.#environment(),
+        environment,
       });
       const result = await this.#listModels({
         cwd,
         ...(this.#options.command ? { command: this.#options.command } : {}),
-        environment: this.#environment(),
+        environment,
       });
       const models = parseAntigravityModelsOutput(result.stdout);
       const catalog = normalizeAntigravityModelCatalog(models);
@@ -1517,36 +1555,63 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   credits(): AccountCreditsSnapshot | null {
-    if (!this.#credits) {
-      this.#credits = readAntigravityCreditsSync();
-    }
-    return this.#credits;
+    return this.#creditsFor(this.#creditsKey());
   }
 
   refreshCredits(): Promise<AccountCreditsSnapshot | null> {
-    if (this.#closePromise) return Promise.resolve(this.#credits);
-    if (this.#creditsRefresh) return this.#creditsRefresh;
-    const now = Date.now();
-    if (now - this.#creditsRefreshStartedAt < CREDITS_REFRESH_COOLDOWN_MS) {
-      return Promise.resolve(this.#credits);
+    const key = this.#creditsKey();
+    return this.#refreshCreditsFor(key, undefined);
+  }
+
+  #creditsKey(environment?: NodeJS.ProcessEnv): string {
+    return this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
+  }
+
+  #creditsFor(key: string): AccountCreditsSnapshot | null {
+    let credits = this.#creditsByAccount.get(key) ?? null;
+    // The statusline fallback is produced by the host-level agy process, so it
+    // only ever describes the legacy account.
+    if (!credits && key === LEGACY_ACCOUNT_KEY) {
+      credits = readAntigravityCreditsSync();
+      if (credits) this.#creditsByAccount.set(key, credits);
     }
-    this.#creditsRefreshStartedAt = now;
-    this.#creditsRefresh = this.#loadCredits().finally(() => {
-      this.#creditsRefresh = null;
+    return credits;
+  }
+
+  #refreshCreditsFor(
+    key: string,
+    environment?: NodeJS.ProcessEnv,
+  ): Promise<AccountCreditsSnapshot | null> {
+    if (this.#closePromise) return Promise.resolve(this.#creditsFor(key));
+    const inFlight = this.#creditsRefreshByAccount.get(key);
+    if (inFlight) return inFlight;
+    const now = Date.now();
+    if (now - (this.#creditsRefreshStartedAt.get(key) ?? 0) < CREDITS_REFRESH_COOLDOWN_MS) {
+      return Promise.resolve(this.#creditsFor(key));
+    }
+    this.#creditsRefreshStartedAt.set(key, now);
+    const refresh = this.#loadCredits(key, environment).finally(() => {
+      this.#creditsRefreshByAccount.delete(key);
     });
-    return this.#creditsRefresh;
+    this.#creditsRefreshByAccount.set(key, refresh);
+    return refresh;
   }
 
-  #scheduleCreditsRefresh(): void {
-    void this.refreshCredits();
+  #scheduleCreditsRefresh(environment?: NodeJS.ProcessEnv): void {
+    const key = this.#creditsKey(environment);
+    void this.#refreshCreditsFor(key, environment);
   }
 
-  async #loadCredits(): Promise<AccountCreditsSnapshot | null> {
+  async #loadCredits(
+    key: string,
+    environment?: NodeJS.ProcessEnv,
+  ): Promise<AccountCreditsSnapshot | null> {
     // Fusion: the CLI's own `--print=/usage` is the primary quota source; the
     // local statusline/snapshot files stay as a fallback when it is unavailable.
+    const resolvedEnvironment = environment ?? this.#environment();
     try {
       const quota = await fetchAntigravityQuota((arguments_) =>
-        this.#runAntigravityCommand(arguments_),
+        this.#runAntigravityCommand(arguments_, resolvedEnvironment),
       );
       if (quota) {
         // The Host validates against the shared credits contract; project the
@@ -1559,36 +1624,34 @@ export class AntigravityAdapter implements HarnessAdapter {
             ? { productUsage: [...quota.productUsage] }
             : {}),
         };
-        this.#credits = credits;
-        return this.#credits;
+        this.#creditsByAccount.set(key, credits);
+        return credits;
       }
     } catch {
       // Fall through to the filesystem-backed fallback below.
     }
-    try {
-      const snapshot = readAntigravityCreditsSync();
-      if (snapshot) this.#credits = snapshot;
-    } catch {
-      // Best-effort account telemetry
-    }
-    return this.#credits;
+    return this.#creditsFor(key);
   }
 
   /** Runs the Antigravity CLI once and resolves stdout (quota probes). */
-  #runAntigravityCommand(arguments_: readonly string[]): Promise<string> {
+  #runAntigravityCommand(
+    arguments_: readonly string[],
+    environment?: NodeJS.ProcessEnv,
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
+      const resolvedEnvironment = environment ?? this.#environment();
       let executable: string;
       try {
         executable = resolveAntigravityExecutable({
           ...(this.#options.command ? { command: this.#options.command } : {}),
-          environment: this.#environment(),
+          environment: resolvedEnvironment,
         });
       } catch (error) {
         reject(error);
         return;
       }
       const child = spawn(executable, [...arguments_], {
-        env: this.#environment(),
+        env: resolvedEnvironment,
         detached: process.platform !== "win32",
         windowsHide: true,
       });
@@ -1640,14 +1703,19 @@ export class AntigravityAdapter implements HarnessAdapter {
           retryable: false,
         },
       };
-    const prepared = this.#prepareTransport(input);
-    const cwd = path.resolve(input.cwd);
-    const cachedInspection = this.#inspectionCache.get(cwd);
+    const accountFailure = this.#accountsFailure();
+    if (accountFailure) return { ok: false, error: accountFailure };
+    const account = this.#resolveAccountForOpen(input);
+    const routed = account ? withAntigravityAccountMarker(input, account.id) : input;
+    const environment = this.#environment(routed.environment);
+    const prepared = this.#prepareTransport(routed);
+    const cwd = path.resolve(routed.cwd);
+    const cachedInspection = this.#inspectionCache.get(this.#inspectionKey(environment, cwd));
     let inspection: HarnessInspection;
     if (cachedInspection) {
       inspection = cachedInspection;
     } else {
-      inspection = await this.inspect({ cwd: input.cwd });
+      inspection = await this.#inspectWithEnvironment({ cwd: routed.cwd }, environment);
     }
     if (inspection.status !== "ready") {
       await this.#closePreparedTransport(prepared);
@@ -1663,12 +1731,19 @@ export class AntigravityAdapter implements HarnessAdapter {
           : {}),
       };
     });
-    if (input.kind === "create") {
-      const opened = await this.#openCreate(input, models, prepared);
-      if (opened.ok) this.#scheduleCreditsRefresh();
+    if (routed.kind === "create") {
+      const opened = await this.#openCreate(routed, models, prepared);
+      if (opened.ok) {
+        const bindingFailure = await this.#recordBinding(account, routed, opened.value);
+        if (bindingFailure) {
+          await opened.value.close().catch(() => undefined);
+          return { ok: false, error: bindingFailure };
+        }
+        this.#scheduleCreditsRefresh(environment);
+      }
       return opened;
     }
-    if (input.kind !== "resume") {
+    if (routed.kind !== "resume") {
       return {
         ok: false,
         error: {
@@ -1678,8 +1753,15 @@ export class AntigravityAdapter implements HarnessAdapter {
         },
       };
     }
-    const opened = await this.#openResume(input, models, prepared);
-    if (opened.ok) this.#scheduleCreditsRefresh();
+    const opened = await this.#openResume(routed, models, prepared);
+    if (opened.ok) {
+      const bindingFailure = await this.#recordBinding(account, routed, opened.value);
+      if (bindingFailure) {
+        await opened.value.close().catch(() => undefined);
+        return { ok: false, error: bindingFailure };
+      }
+      this.#scheduleCreditsRefresh(environment);
+    }
     return opened;
   }
 
@@ -1734,6 +1816,7 @@ export class AntigravityAdapter implements HarnessAdapter {
           for (const entry of (parsed as { entries: unknown[] }).entries) {
             if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
             const cwd = (entry as { cwd?: unknown }).cwd;
+            const accountId = (entry as { accountId?: unknown }).accountId;
             const updatedAtMs = (entry as { updatedAtMs?: unknown }).updatedAtMs;
             const inspection = harnessInspectionSchema.safeParse(
               (entry as { inspection?: unknown }).inspection,
@@ -1746,7 +1829,10 @@ export class AntigravityAdapter implements HarnessAdapter {
               inspection.success &&
               inspection.data.status === "ready"
             ) {
-              this.#inspectionCache.set(path.resolve(cwd), inspection.data);
+              this.#inspectionCache.set(
+                `${typeof accountId === "string" ? accountId : LEGACY_ACCOUNT_KEY}\u0000${path.resolve(cwd)}`,
+                inspection.data,
+              );
             }
           }
         } catch {
@@ -1762,11 +1848,15 @@ export class AntigravityAdapter implements HarnessAdapter {
     const filePath = this.#inspectionCachePath();
     if (!filePath || this.#inspectionCache.size === 0) return;
     const updatedAtMs = Date.now();
-    const entries = [...this.#inspectionCache.entries()].map(([cwd, inspection]) => ({
-      cwd,
-      inspection,
-      updatedAtMs,
-    }));
+    const entries = [...this.#inspectionCache.entries()].map(([key, inspection]) => {
+      const separator = key.indexOf("\u0000");
+      return {
+        accountId: separator >= 0 ? key.slice(0, separator) : LEGACY_ACCOUNT_KEY,
+        cwd: separator >= 0 ? key.slice(separator + 1) : key,
+        inspection,
+        updatedAtMs,
+      };
+    });
     const previous = this.#inspectionPersistentWrite ?? Promise.resolve();
     const write = previous
       .catch(() => undefined)
@@ -2064,11 +2154,82 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   #environment(explicit?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return resolveAntigravityProxyEnvironment({
+    const base = resolveAntigravityProxyEnvironment({
       ...process.env,
       ...this.#options.environment,
       ...explicit,
     });
+    const account = this.#resolveAccount(explicit);
+    if (!account) return base;
+    return applyAntigravityAccountEnvironment(base, account, this.#accountsRealHome);
+  }
+
+  /** Configured-but-broken accounts must fail closed instead of using the real HOME. */
+  #accountsFailure(): HarnessError | null {
+    if (this.#accounts.mode !== "invalid") return null;
+    return {
+      code: "unavailable",
+      message: `Antigravity multi-account configuration is invalid: ${this.#accounts.error.message}`,
+      retryable: false,
+    };
+  }
+
+  #resolveAccount(explicit?: NodeJS.ProcessEnv): AntigravityAccount | null {
+    if (this.#accounts.mode !== "multi") return null;
+    const store = this.#accounts.store;
+    const marker = explicit?.[ANTIGRAVITY_ACCOUNT_ID_ENV]?.trim();
+    if (marker) {
+      const marked = store.get(marker);
+      if (marked) return marked;
+    }
+    return store.resolveAccountForThread(explicit?.[ANTIGRAVITY_THREAD_ID_ENV]?.trim());
+  }
+
+  /**
+   * Resume prefers the account that owns the native Session, so a lost Thread
+   * binding can never move an existing conversation onto another account.
+   */
+  #resolveAccountForOpen(input: OpenSessionInput): AntigravityAccount | null {
+    if (this.#accounts.mode !== "multi") return null;
+    if (input.kind === "resume") {
+      const byNativeSession = this.#accounts.store.accountForNativeSession(
+        input.nativeRef.nativeSessionId,
+      );
+      if (byNativeSession) return byNativeSession;
+    }
+    return this.#resolveAccount(input.environment);
+  }
+
+  async #recordBinding(
+    account: AntigravityAccount | null,
+    input: OpenSessionInput,
+    session: HarnessSession,
+  ): Promise<HarnessError | null> {
+    if (!account || this.#accounts.mode !== "multi") return null;
+    const threadId = input.environment?.[ANTIGRAVITY_THREAD_ID_ENV]?.trim();
+    if (!threadId) return null;
+    const nativeSessionId = session.initialState.nativeRef?.nativeSessionId;
+    try {
+      await this.#accounts.store.bindThread({
+        threadId,
+        accountId: account.id,
+        ...(nativeSessionId ? { nativeSessionId } : {}),
+        state: nativeSessionId ? "committed" : "reserved",
+      });
+      return null;
+    } catch (error) {
+      // A single enabled account cannot route to the wrong account, so a failed
+      // metadata write must not break every new Thread. With several accounts we
+      // fail closed rather than risk resuming on the wrong one.
+      if (this.#accounts.store.list().filter((account) => account.enabled).length <= 1) {
+        return null;
+      }
+      return {
+        code: "unavailable",
+        message: `Antigravity account binding could not be persisted: ${errorMessage(error)}`,
+        retryable: false,
+      };
+    }
   }
 }
 

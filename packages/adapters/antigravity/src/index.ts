@@ -1,6 +1,30 @@
 export { AntigravityAdapter } from "./antigravity-adapter.js";
 export { ANTIGRAVITY_COMMAND_ENV, resolveAntigravityExecutable } from "./command.js";
 export {
+  ANTIGRAVITY_ACCOUNT_ID_ENV,
+  ANTIGRAVITY_ACCOUNTS_DIR,
+  ANTIGRAVITY_THREAD_ID_ENV,
+  AntigravityAccountStore,
+  antigravityAccountsFile,
+  antigravityAccountsRoot,
+  antigravityRealHome,
+  antigravityShadowHome,
+  applyAntigravityAccountEnvironment,
+  createEmptyAccountsFile,
+  ensureAntigravityShadowHome,
+  loadAntigravityAccountsSync,
+  resolveAntigravityHostAnchors,
+} from "./accounts.js";
+export type {
+  AntigravityAccount,
+  AntigravityAccountHealth,
+  AntigravityAccountsFileV1,
+  AntigravityAccountsLoad,
+  AntigravityHostAnchors,
+  AntigravityThreadBinding,
+  ShadowHomeReport,
+} from "./accounts.js";
+export {
   decodeAntigravityModelRef,
   encodeAntigravityModelRef,
   normalizeAntigravityModelCatalog,

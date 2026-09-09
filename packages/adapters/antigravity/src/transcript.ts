@@ -45,7 +45,7 @@ export function resolveAntigravityTranscriptPath(
   const root =
     environment.ANTIGRAVITY_APP_DATA_DIR ??
     environment.CODEXHOST_ANTIGRAVITY_DATA_DIR ??
-    path.join(os.homedir(), ".gemini", "antigravity-cli");
+    path.join(environment.HOME?.trim() || os.homedir(), ".gemini", "antigravity-cli");
   return path.join(root, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 }
 
