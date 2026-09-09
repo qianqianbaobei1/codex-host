@@ -52,4 +52,42 @@ describe("read-only Harness accounts", () => {
     });
     expect(await inspectHarnessAccounts([hung, malformed], [], 5)).toEqual({ accounts: [] });
   });
+
+  it("aggregates one row per selectable account and prefers inspectAccounts", async () => {
+    const inspectAccount = vi.fn(async () => snapshot);
+    const multi = Object.assign(adapter("multi-agent"), {
+      inspectAccount,
+      inspectAccounts: vi.fn(async () => [
+        { ...snapshot, accountId: "default", label: "本机", isDefault: true, selectable: true },
+        { ...snapshot, accountId: "work", label: "工作", isDefault: false, selectable: true },
+      ]),
+    });
+    const result = await inspectHarnessAccounts(
+      [multi],
+      [{ id: multi.harnessId, name: "Multi Agent", version: "1.0.0" }],
+    );
+    expect(result.accounts).toMatchObject([
+      {
+        harnessId: "multi-agent",
+        harnessName: "Multi Agent",
+        accountId: "default",
+        isDefault: true,
+      },
+      { harnessId: "multi-agent", harnessName: "Multi Agent", accountId: "work", isDefault: false },
+    ]);
+    expect(inspectAccount).not.toHaveBeenCalled();
+  });
+
+  it("drops malformed rows from a multi-account list and treats null as no rows", async () => {
+    const multi = Object.assign(adapter("multi-agent"), {
+      inspectAccounts: vi.fn(async () => [snapshot, { ...snapshot, accountId: "bad/id" }]),
+    });
+    expect(await inspectHarnessAccounts([multi], [])).toEqual({
+      accounts: [{ ...snapshot, harnessId: "multi-agent", harnessName: "multi-agent" }],
+    });
+    const empty = Object.assign(adapter("empty-agent"), {
+      inspectAccounts: vi.fn(async () => null),
+    });
+    expect(await inspectHarnessAccounts([empty], [])).toEqual({ accounts: [] });
+  });
 });

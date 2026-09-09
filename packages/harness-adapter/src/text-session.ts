@@ -560,6 +560,15 @@ export interface HarnessAdapter {
    * Implementations must bound requests and release inspection resources on close.
    */
   inspectAccount?(): Promise<HarnessAccountSnapshot | null>;
+  /**
+   * Multi-account Harnesses return one snapshot per selectable native account
+   * instead of a single current account. Implementations must probe accounts
+   * concurrently and bound total latency; a failed account is omitted rather
+   * than reported with fabricated quota.
+   */
+  inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[] | null>;
+  /** Select the default account used by newly created Threads. Existing Threads keep theirs. */
+  selectAccount?(accountId: string): Promise<void>;
   /** Capabilities safe to report before a native Session is opened. */
   readonly cachedThreadCapabilities?: HarnessSessionCapabilities;
 

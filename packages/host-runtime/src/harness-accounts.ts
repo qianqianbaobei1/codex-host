@@ -13,30 +13,34 @@ export async function inspectHarnessAccounts(
 ): Promise<HarnessAccountListResult> {
   const accounts = await Promise.all(
     [...adapters].map(async (adapter) => {
-      if (!adapter.inspectAccount) return null;
+      if (!adapter.inspectAccount && !adapter.inspectAccounts) return [];
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
+        const pending: Promise<unknown> = adapter.inspectAccounts
+          ? adapter.inspectAccounts()
+          : (adapter.inspectAccount?.() ?? Promise.resolve(null));
         const value = await Promise.race([
-          Promise.resolve().then(() => adapter.inspectAccount?.()),
+          pending,
           new Promise<null>((resolve) => {
             timer = setTimeout(() => resolve(null), timeoutMs);
           }),
         ]);
-        const parsed = harnessAccountSnapshotSchema.safeParse(value);
-        if (!parsed.success) return null;
-        return {
-          ...parsed.data,
-          harnessId: adapter.harnessId,
-          harnessName:
-            descriptors.find((plugin) => plugin.id === adapter.harnessId)?.name ??
-            adapter.harnessId,
-        };
+        if (value === null) return [];
+        const entries = Array.isArray(value) ? value : [value];
+        const harnessName =
+          descriptors.find((plugin) => plugin.id === adapter.harnessId)?.name ?? adapter.harnessId;
+        return entries.flatMap((entry) => {
+          const parsed = harnessAccountSnapshotSchema.safeParse(entry);
+          return parsed.success
+            ? [{ ...parsed.data, harnessId: adapter.harnessId, harnessName }]
+            : [];
+        });
       } catch {
-        return null;
+        return [];
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
     }),
   );
-  return { accounts: accounts.filter((account) => account !== null) };
+  return { accounts: accounts.flat() };
 }

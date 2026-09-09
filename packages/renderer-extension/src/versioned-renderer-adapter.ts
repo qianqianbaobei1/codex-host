@@ -1086,6 +1086,13 @@ export function installCurrentRendererAdapter(): {
       if (!client.listHarnessAccounts) throw new Error("Harness account inspection is unavailable");
       return client.listHarnessAccounts();
     },
+    selectHarnessAccount: (
+      input: Parameters<NonNullable<RendererModelClient["selectHarnessAccount"]>>[0],
+    ) => {
+      const client = currentModelClient();
+      if (!client.selectHarnessAccount) throw new Error("Harness account selection is unavailable");
+      return client.selectHarnessAccount(input);
+    },
     listCodexAccounts: () => currentModelClient().listCodexAccounts(),
     refreshCodexAccounts: () => {
       const client = currentModelClient();

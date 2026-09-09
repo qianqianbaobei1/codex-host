@@ -556,6 +556,94 @@ describe("AppServerHost installed Harness plugins", () => {
     }
   });
 
+  it("lists selectable Harness accounts and switches the default through the select RPC", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "codexhost-plugin-accounts-"));
+    const location = path.join(directory, "multi-agent");
+    mkdirSync(location);
+    writeFileSync(
+      path.join(directory, "enabled.json"),
+      JSON.stringify({ version: 1, enabled: ["multi-agent"] }),
+    );
+    writeFileSync(
+      path.join(location, "manifest.json"),
+      JSON.stringify({
+        manifestVersion: 1,
+        id: "multi-agent",
+        name: "Multi Agent",
+        version: "1.0.0",
+        adapterApiVersion: 1,
+        entry: "index.mjs",
+      }),
+    );
+    writeFileSync(
+      path.join(location, "index.mjs"),
+      `
+      import { FakeHarnessAdapter } from ${JSON.stringify(pathToFileURL(path.resolve("packages/harness-adapter/dist/testing.js")).href)};
+      export function createHarnessAdapter() {
+        const adapter = new FakeHarnessAdapter("multi-agent");
+        let selected = "default";
+        adapter.inspectAccounts = async () => [
+          { accountId: "default", label: "本机", isDefault: selected === "default", selectable: true, credits: { usedPercent: 25, periodType: "weekly" } },
+          { accountId: "work", label: "工作", isDefault: selected === "work", selectable: true, credits: { usedPercent: 80, periodType: "weekly" } },
+        ];
+        adapter.selectAccount = async (accountId) => { selected = accountId; };
+        return adapter;
+      }
+    `,
+    );
+    const fixture = createFixture({ pluginDirectory: directory, externalAdapters: new Map() });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 921,
+        method: "codexhost/harness/accounts/list",
+        params: {},
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 921))).toMatchObject({
+        result: {
+          accounts: [
+            { accountId: "default", isDefault: true, selectable: true, harnessId: "multi-agent" },
+            { accountId: "work", isDefault: false, selectable: true, harnessId: "multi-agent" },
+          ],
+        },
+      });
+
+      writeRequest(fixture.desktopInput, {
+        id: 922,
+        method: "codexhost/harness/accounts/select",
+        params: { harnessId: "multi-agent", accountId: "work" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 922))).toMatchObject({
+        result: {
+          accounts: [
+            { accountId: "default", isDefault: false },
+            { accountId: "work", isDefault: true },
+          ],
+        },
+      });
+
+      writeRequest(fixture.desktopInput, {
+        id: 923,
+        method: "codexhost/harness/accounts/select",
+        params: { harnessId: "multi-agent", accountId: "bad/id" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 923))).toMatchObject({
+        error: { code: -32602 },
+      });
+
+      writeRequest(fixture.desktopInput, {
+        id: 924,
+        method: "codexhost/harness/accounts/select",
+        params: { harnessId: "missing-agent", accountId: "work" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 924))).toMatchObject({
+        error: { code: -32077 },
+      });
+    } finally {
+      await stopFixture(fixture);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("binds DeepSeek Session Import after its Adapter has been dynamically loaded", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "codexhost-dynamic-import-"));
     const location = path.join(directory, "deepseek-harness");

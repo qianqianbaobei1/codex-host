@@ -2,11 +2,17 @@ import { z } from "zod";
 import { WORKSPACE_CONTRACT_VERSION } from "./version.js";
 
 export {
+  HARNESS_ACCOUNT_SELECT_METHOD,
   harnessAccountSnapshotSchema,
   harnessAccountListParamsSchema,
   harnessAccountListResultSchema,
+  harnessAccountSelectParamsSchema,
 } from "./harness-accounts.js";
-export type { HarnessAccountSnapshot, HarnessAccountListResult } from "./harness-accounts.js";
+export type {
+  HarnessAccountSnapshot,
+  HarnessAccountListResult,
+  HarnessAccountSelectParams,
+} from "./harness-accounts.js";
 
 export {
   HARNESS_PLUGIN_ROUTE_PREFIX,

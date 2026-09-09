@@ -31,7 +31,7 @@
 
 .settings-harness-account {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr);
+  grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr) auto;
   align-items: center;
   gap: 24px;
   padding: 24px;

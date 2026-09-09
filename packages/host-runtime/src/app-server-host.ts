@@ -25,6 +25,8 @@ import {
   accountCreditsSnapshotSchema,
   harnessAccountListParamsSchema,
   harnessAccountListResultSchema,
+  harnessAccountSelectParamsSchema,
+  HARNESS_ACCOUNT_SELECT_METHOD,
   type HarnessAccountListResult,
   codexAccountUsageParamsSchema,
   codexAccountUsageResultSchema,
@@ -868,13 +870,42 @@ export class AppServerHost {
             );
             return;
           }
-          this.#accountInspection ??= inspectHarnessAccounts(
-            this.#externalAdapters.values(),
-            this.#pluginDescriptors,
-          ).finally(() => {
-            this.#accountInspection = null;
-          });
-          const result = harnessAccountListResultSchema.parse(await this.#accountInspection);
+          const result = await this.#harnessAccountList();
+          await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
+        });
+        continue;
+      }
+      if (request.method === HARNESS_ACCOUNT_SELECT_METHOD) {
+        this.#dispatchDesktopRequest(async () => {
+          const params = harnessAccountSelectParamsSchema.safeParse(request.params);
+          if (!params.success) {
+            await this.#writer.json(
+              rpcError(request, -32602, "Invalid Harness account select params"),
+            );
+            return;
+          }
+          const adapter = this.#externalAdapters.get(params.data.harnessId);
+          if (!adapter?.selectAccount) {
+            await this.#writer.json(
+              rpcError(
+                request,
+                -32077,
+                `Harness '${params.data.harnessId}' does not support account selection`,
+              ),
+            );
+            return;
+          }
+          try {
+            await adapter.selectAccount(params.data.accountId);
+          } catch {
+            await this.#writer.json(
+              rpcError(request, -32079, "Harness account selection failed"),
+            );
+            return;
+          }
+          // The default changed, so the cached inspection is stale.
+          this.#accountInspection = null;
+          const result = await this.#harnessAccountList();
           await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
         });
         continue;
@@ -2756,6 +2787,16 @@ export class AppServerHost {
       return;
     }
     await this.#writeHarnessCommandCatalog(request, location.record.harnessId);
+  }
+
+  async #harnessAccountList(): Promise<HarnessAccountListResult> {
+    this.#accountInspection ??= inspectHarnessAccounts(
+      this.#externalAdapters.values(),
+      this.#pluginDescriptors,
+    ).finally(() => {
+      this.#accountInspection = null;
+    });
+    return harnessAccountListResultSchema.parse(await this.#accountInspection);
   }
 
   async #writeHarnessCommandCatalog(request: JsonRpcRequest, harnessId: HarnessId): Promise<void> {

@@ -233,6 +233,7 @@ export function createAccountsSettingsPage(
           ((!getClient()?.inspectCodexAccountUsage || !accounts.some((account) => account.email)) &&
             !getClient()?.listHarnessAccounts) ||
           harnessAccounts?.refreshing === true ||
+          harnessAccounts?.selecting === true ||
           [...usageByAccountId.values()].some((usage) => usage.status === "loading") ||
           accountBusy();
         const query = search.value.trim().toLocaleLowerCase();

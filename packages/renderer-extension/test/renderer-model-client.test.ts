@@ -305,6 +305,7 @@ describe("Renderer fixed Model request client", () => {
       "openHarnessWebUi",
       "readUpdateStatus",
       "refreshCodexAccounts",
+      "selectHarnessAccount",
       "selectThreadModel",
       "selectThreadPermissionMode",
       "selectThreadThinking",

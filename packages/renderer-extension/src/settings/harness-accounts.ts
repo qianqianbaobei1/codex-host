@@ -1,4 +1,7 @@
-import type { HarnessAccountListResult } from "@codexhost/shared-contracts";
+import type {
+  HarnessAccountListResult,
+  HarnessAccountSelectParams,
+} from "@codexhost/shared-contracts";
 import { KNOWN_RENDERER_AGENTS } from "../agent-selection-state.js";
 import { createRendererAgentIcon } from "../renderer-agent-icon.js";
 import { renderAccountUsage, type AccountUsageDisplay } from "./accounts-usage.js";
@@ -7,6 +10,7 @@ import type { RendererSettingsMessages } from "./localization.js";
 
 export interface RendererHarnessAccountClient {
   listHarnessAccounts?(): Promise<HarnessAccountListResult>;
+  selectHarnessAccount?(input: HarnessAccountSelectParams): Promise<HarnessAccountListResult>;
 }
 
 /** Read-only telemetry, deliberately separate from Codex Account IDs and mutations. */
@@ -29,8 +33,32 @@ export function mountHarnessAccounts(
   context.content.append(section);
   let accounts: HarnessAccountListResult["accounts"] = [];
   let refreshing = false;
+  let selecting = false;
   let query = "";
   let display: AccountUsageDisplay = "remaining";
+
+  const select = async (
+    harnessId: HarnessAccountListResult["accounts"][number]["harnessId"],
+    accountId: string,
+  ): Promise<void> => {
+    const client = getClient();
+    if (!client?.selectHarnessAccount || selecting || context.signal.aborted) return;
+    selecting = true;
+    render();
+    onChange();
+    try {
+      const result = await client.selectHarnessAccount({ harnessId, accountId });
+      if (!context.signal.aborted) accounts = result.accounts;
+    } catch {
+      // Older Hosts and unsupported Harnesses keep the previous rows.
+    } finally {
+      selecting = false;
+      if (!context.signal.aborted) {
+        render();
+        onChange();
+      }
+    }
+  };
 
   const render = (): void => {
     section.hidden = accounts.length === 0;
@@ -92,6 +120,26 @@ export function mountHarnessAccounts(
       person.append(identity);
       row.append(person);
       if (usage) row.append(usage);
+      const actions = document.createElement("div");
+      actions.className = "settings-account-actions";
+      const selectableId = account.accountId;
+      if (account.selectable && selectableId) {
+        if (account.isDefault) {
+          const badge = document.createElement("span");
+          badge.className = "settings-account-active";
+          badge.textContent = messages.accountDefaultBadge;
+          actions.append(badge);
+        } else {
+          const use = document.createElement("button");
+          use.type = "button";
+          use.className = "settings-account-action";
+          use.textContent = messages.accountUse;
+          use.disabled = selecting;
+          use.addEventListener("click", () => void select(account.harnessId, selectableId));
+          actions.append(use);
+        }
+      }
+      if (actions.childElementCount) row.append(actions);
       list.append(row);
     }
     if (accounts.length && !visible.length) {
@@ -104,6 +152,9 @@ export function mountHarnessAccounts(
   return {
     get refreshing() {
       return refreshing;
+    },
+    get selecting() {
+      return selecting;
     },
     update(nextQuery: string, nextDisplay: AccountUsageDisplay) {
       query = nextQuery;

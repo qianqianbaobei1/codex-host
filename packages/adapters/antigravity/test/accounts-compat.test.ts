@@ -79,6 +79,28 @@ function accountsValue(
 
 const MODELS_OUTPUT = "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n";
 
+/** Fake agy that answers `models` and a per-HOME `/usage` quota. */
+async function writeFakeAgyWithUsage(root: string): Promise<string> {
+  const file = path.join(root, "fake-agy-usage.sh");
+  await writeFile(
+    file,
+    `#!/bin/bash
+if [ "$1" = "--print=/usage" ]; then
+  case "$HOME" in
+    *"/work/"*) RF=0.10 ;;
+    *) RF=0.75 ;;
+  esac
+  printf '{"event":"command_result","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":%s}]}]}}}\n' "$RF"
+  exit 0
+fi
+printf 'gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n'
+`,
+    "utf8",
+  );
+  await chmod(file, 0o755);
+  return file;
+}
+
 describe("Antigravity multi-account compatibility gate (spawn level)", () => {
   it("legacy mode spawns with an unchanged environment", async () => {
     const root = await makeRoot("compat-legacy");
@@ -369,6 +391,60 @@ function fakeTransport(conversationId: string): AntigravityCliTransportLike {
     async close() {},
   };
 }
+
+describe("Antigravity account settings surface", () => {
+  it("reports one row per account and switches the default", async () => {
+    const root = await makeRoot("settings");
+    const realHome = path.join(root, "home");
+    await mkdir(realHome, { recursive: true });
+    const command = await writeFakeAgyWithUsage(root);
+    const store = new AntigravityAccountStore({
+      file: path.join(realHome, ".agy-accounts", "accounts.json"),
+      realHome,
+      value: accountsValue({
+        accounts: [
+          { id: "default", name: "本机", legacy: true, enabled: true },
+          { id: "work", name: "工作", enabled: true },
+        ],
+      }),
+    });
+    const adapter = new AntigravityAdapter({
+      command,
+      accounts: { mode: "multi", store },
+      environment: {
+        ...process.env,
+        HOME: realHome,
+        CODEXHOST_DATA_DIR: path.join(realHome, "data"),
+      },
+    });
+    try {
+      const rows = await adapter.inspectAccounts();
+      expect(rows).not.toBeNull();
+      if (!rows) return;
+      expect(rows.map((row) => row.accountId).sort()).toEqual(["default", "work"]);
+      expect(rows.every((row) => row.selectable === true)).toBe(true);
+      expect(rows.find((row) => row.accountId === "default")?.isDefault).toBe(true);
+      // remaining 0.75 -> 25% used; the shadow account reports 90% used.
+      expect(rows.find((row) => row.accountId === "default")?.credits.usedPercent).toBe(25);
+      expect(rows.find((row) => row.accountId === "work")?.credits.usedPercent).toBe(90);
+
+      await adapter.selectAccount("work");
+      expect(store.defaultAccount()?.id).toBe("work");
+      const after = await adapter.inspectAccounts();
+      expect(after?.find((row) => row.accountId === "work")?.isDefault).toBe(true);
+      expect(after?.find((row) => row.accountId === "default")?.isDefault).toBe(false);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("reports nothing when multi-account mode is not configured", async () => {
+    const adapter = new AntigravityAdapter();
+    expect(await adapter.inspectAccounts()).toBeNull();
+    await expect(adapter.selectAccount("work")).rejects.toThrow(/multi-account/u);
+    await adapter.close();
+  });
+});
 
 describe("Antigravity per-Thread account routing", () => {
   async function setup(): Promise<{

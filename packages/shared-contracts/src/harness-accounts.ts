@@ -9,6 +9,19 @@ export const harnessAccountSnapshotSchema = z
     label: z.string().trim().min(1).max(256).optional(),
     plan: z.string().trim().min(1).max(128).optional(),
     credits: accountCreditsSnapshotSchema,
+    /**
+     * Present only for Harnesses that expose more than one selectable native
+     * account. `accountId` is opaque and owned by the adapter.
+     */
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u)
+      .optional(),
+    isDefault: z.boolean().optional(),
+    selectable: z.boolean().optional(),
   })
   .strict();
 export type HarnessAccountSnapshot = z.infer<typeof harnessAccountSnapshotSchema>;
@@ -27,3 +40,19 @@ export const harnessAccountListResultSchema = z
   })
   .strict();
 export type HarnessAccountListResult = z.infer<typeof harnessAccountListResultSchema>;
+
+/** Select the default native account for a Harness that exposes selectable accounts. */
+export const HARNESS_ACCOUNT_SELECT_METHOD = "codexhost/harness/accounts/select" as const;
+
+export const harnessAccountSelectParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type HarnessAccountSelectParams = z.infer<typeof harnessAccountSelectParamsSchema>;

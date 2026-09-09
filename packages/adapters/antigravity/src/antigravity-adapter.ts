@@ -57,6 +57,7 @@ import {
   type JsonValue,
   type NativeSessionRef,
   type AccountCreditsSnapshot,
+  type HarnessAccountSnapshot,
 } from "@codexhost/shared-contracts";
 
 import {
@@ -1556,6 +1557,42 @@ export class AntigravityAdapter implements HarnessAdapter {
 
   credits(): AccountCreditsSnapshot | null {
     return this.#creditsFor(this.#creditsKey());
+  }
+
+  /**
+   * One row per configured account so the account settings page can show quota
+   * and switch the default. Accounts whose quota probe fails are omitted rather
+   * than shown with fabricated numbers.
+   */
+  async inspectAccounts(): Promise<readonly HarnessAccountSnapshot[] | null> {
+    if (this.#accounts.mode !== "multi") return null;
+    const store = this.#accounts.store;
+    const defaultAccountId = store.defaultAccount()?.id;
+    const rows = await Promise.all(
+      store
+        .list()
+        .filter((account) => account.enabled)
+        .map(async (account): Promise<HarnessAccountSnapshot | null> => {
+          const environment = this.#environment({ [ANTIGRAVITY_ACCOUNT_ID_ENV]: account.id });
+          const credits = await this.#refreshCreditsFor(account.id, environment).catch(() => null);
+          if (!credits) return null;
+          return {
+            accountId: account.id,
+            label: account.name,
+            isDefault: account.id === defaultAccountId,
+            selectable: true,
+            credits,
+          };
+        }),
+    );
+    return rows.filter((row): row is HarnessAccountSnapshot => row !== null);
+  }
+
+  async selectAccount(accountId: string): Promise<void> {
+    if (this.#accounts.mode !== "multi") {
+      throw new Error("Antigravity multi-account mode is not configured");
+    }
+    await this.#accounts.store.setDefaultAccount(accountId);
   }
 
   refreshCredits(): Promise<AccountCreditsSnapshot | null> {
