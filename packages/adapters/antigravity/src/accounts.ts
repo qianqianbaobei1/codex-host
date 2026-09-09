@@ -38,6 +38,8 @@ import {
   chmod,
   writeFile,
 } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -178,6 +180,53 @@ export interface ShadowHomeReport {
   skipped: string[];
 }
 
+const execFileAsync = promisify(execFile);
+
+/**
+ * macOS shows a blocking「找不到钥匙串」dialog when a process tries to store a
+ * credential and no keychain exists at `$HOME/Library/Keychains`. Creating a
+ * dedicated, unlocked, empty-password keychain per account keeps agy working
+ * without a prompt and without reaching the shared login keychain.
+ *
+ * `security create-keychain` also installs the new keychain as the user default
+ * and rewrites the user search list, so the previous configuration is restored
+ * unconditionally: this overlay must never change global keychain settings.
+ */
+async function createDarwinKeychain(file: string): Promise<void> {
+  const readSetting = async (arguments_: readonly string[]): Promise<string[]> => {
+    const { stdout } = await execFileAsync("security", [...arguments_]);
+    return stdout
+      .split("\n")
+      .map((line) => line.trim().replace(/^"|"$/gu, ""))
+      .filter(Boolean);
+  };
+  const previousDefault = await readSetting(["default-keychain", "-d", "user"]).catch(() => []);
+  const previousList = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
+  try {
+    // `-p ""` creates the keychain unlocked; `unlock-keychain -p ""` rejects the
+    // empty passphrase on current macOS, so it must not be called.
+    await execFileAsync("security", ["create-keychain", "-p", "", file]);
+    // Never auto-lock: a locked keychain would prompt again on the next write.
+    await execFileAsync("security", ["set-keychain-settings", file]).catch(() => undefined);
+  } finally {
+    if (previousList.length > 0) {
+      await execFileAsync("security", [
+        "list-keychains",
+        "-d",
+        "user",
+        "-s",
+        ...previousList,
+      ]).catch(() => undefined);
+    }
+    const previous = previousDefault[0];
+    if (previous) {
+      await execFileAsync("security", ["default-keychain", "-d", "user", "-s", previous]).catch(
+        () => undefined,
+      );
+    }
+  }
+}
+
 /**
  * Build (or repair) a shadow HOME. Everything in the real HOME is symlinked so
  * shell tools keep the user's git/ssh/gh/npm credentials, except:
@@ -191,6 +240,8 @@ export async function ensureAntigravityShadowHome(input: {
   realHome: string;
   shadowHome: string;
   shadowRoot: string;
+  /** Test seam; defaults to `security create-keychain` on macOS. */
+  createKeychain?: (file: string) => Promise<void>;
 }): Promise<ShadowHomeReport> {
   const realHome = path.resolve(input.realHome);
   const shadowHome = path.resolve(input.shadowHome);
@@ -200,6 +251,8 @@ export async function ensureAntigravityShadowHome(input: {
     mode: 0o700,
   });
   await mkdir(path.join(shadowHome, "Library"), { recursive: true, mode: 0o700 });
+  const keychainDirectory = path.join(shadowHome, "Library", "Keychains");
+  await mkdir(keychainDirectory, { recursive: true, mode: 0o700 });
 
   // Resolve AFTER creating the directories: on macOS `/var` is a symlink to
   // `/private/var`, so resolving first would compare a resolved source against
@@ -278,6 +331,28 @@ export async function ensureAntigravityShadowHome(input: {
   await linkChildren(path.join(realHome, "Library"), path.join(shadowHome, "Library"), "Library/", [
     "Keychains",
   ]);
+
+  // macOS shows a blocking「找不到钥匙串」dialog when agy stores a credential and
+  // no keychain exists at `$HOME/Library/Keychains`. A dedicated per-account
+  // keychain keeps agy working without a prompt and without reading the shared
+  // login keychain.
+  const keychainFile = path.join(keychainDirectory, "login.keychain-db");
+  if (
+    !(await lstat(keychainFile).then(
+      () => true,
+      () => false,
+    ))
+  ) {
+    const create =
+      input.createKeychain ??
+      (process.platform === "darwin" ? createDarwinKeychain : async () => undefined);
+    try {
+      await create(keychainFile);
+      linked.push("Library/Keychains/login.keychain-db");
+    } catch {
+      skipped.push("Library/Keychains/login.keychain-db");
+    }
+  }
 
   await chmod(shadowHome, 0o700).catch(() => undefined);
   return { linked, skipped };

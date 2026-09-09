@@ -136,10 +136,23 @@ describe("Antigravity shadow HOME", () => {
 
     const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
     const shadowHome = path.join(shadowRoot, "work", "home");
-    const report = await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot });
+    const report = await ensureAntigravityShadowHome({
+      realHome,
+      shadowHome,
+      shadowRoot,
+      createKeychain: async (file) => {
+        await writeFile(file, "fake keychain", "utf8");
+      },
+    });
 
     expect(report.linked).toEqual(
-      expect.arrayContaining([".ssh", ".gitconfig", ".gemini/config", "Library/Caches"]),
+      expect.arrayContaining([
+        ".ssh",
+        ".gitconfig",
+        ".gemini/config",
+        "Library/Caches",
+        "Library/Keychains/login.keychain-db",
+      ]),
     );
     expect(report.skipped).toEqual(
       expect.arrayContaining([
@@ -156,9 +169,11 @@ describe("Antigravity shadow HOME", () => {
     );
     // The shadow root must never appear inside the shadow HOME.
     await expect(lstat(path.join(shadowHome, ANTIGRAVITY_ACCOUNTS_DIR))).rejects.toThrow();
-    // The macOS keychain stays per account: sharing it would make every account
-    // resolve the same Google credential.
-    await expect(lstat(path.join(shadowHome, "Library", "Keychains"))).rejects.toThrow();
+    // The macOS keychain stays per account: a dedicated keychain prevents both
+    // credential sharing and the blocking「找不到钥匙串」dialog.
+    expect(
+      await readFile(path.join(shadowHome, "Library", "Keychains", "login.keychain-db"), "utf8"),
+    ).toBe("fake keychain");
     expect(await readlink(path.join(shadowHome, "Library", "Caches"))).toBe(
       path.join(realHome, "Library", "Caches"),
     );
@@ -166,6 +181,22 @@ describe("Antigravity shadow HOME", () => {
     const cli = await lstat(path.join(shadowHome, ".gemini", "antigravity-cli"));
     expect(cli.isDirectory()).toBe(true);
     expect(cli.isSymbolicLink()).toBe(false);
+    expect((await stat(shadowHome)).mode & 0o777).toBe(0o700);
+  });
+
+  it("tolerates a keychain that cannot be created", async () => {
+    const realHome = await makeRoot("shadow-keychain-fail");
+    const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+    const shadowHome = path.join(shadowRoot, "work", "home");
+    const report = await ensureAntigravityShadowHome({
+      realHome,
+      shadowHome,
+      shadowRoot,
+      createKeychain: async () => {
+        throw new Error("security unavailable");
+      },
+    });
+    expect(report.skipped).toContain("Library/Keychains/login.keychain-db");
     expect((await stat(shadowHome)).mode & 0o777).toBe(0o700);
   });
 
