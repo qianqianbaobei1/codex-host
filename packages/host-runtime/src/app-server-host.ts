@@ -2,7 +2,9 @@ import { AccountRateLimits } from "./codex-runtime/account-rate-limits.js";
 import { inspectHarnessAccounts } from "./harness-accounts.js";
 import type { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
+import { rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -101,6 +103,25 @@ import {
   type ExternalThreadResolution,
 } from "./external-thread-runtime.js";
 import { ExternalSteerError, ExternalTurnSteering } from "./external-turn-steering.js";
+import {
+  advanceGoalLoop,
+  createGoalLoop,
+  fromStoredGoal,
+  goalContinuePrompt,
+  goalSeedPrompt,
+  hasTurnProgress,
+  lastAgentMessageText,
+  parseGoalDecision,
+  parseGoalCommand,
+  setGoalStatus,
+  toStoredGoal,
+  toThreadGoal,
+  updateGoalActiveTime,
+  type GoalLoopState,
+  type ThreadGoal,
+  type ThreadGoalStatus,
+} from "./goal-loop.js";
+
 import { normalizeThreadTitle } from "./thread-title-normalizer.js";
 import {
   DELEGATION_CLI_PATH_ENV,
@@ -537,6 +558,8 @@ export class AppServerHost {
   #runningSubagentsByParent = new Map<string, Set<string>>();
   #pendingExternalCommandRequests = new Set<string>();
   #closeRequested = false;
+  #goalLoops = new Map<string, GoalLoopState>();
+  #goalContinuationTimers = new Map<string, NodeJS.Timeout>();
   #drainActiveWorkOnInputEnd = false;
   #desktopInputEnded = false;
 
@@ -1149,6 +1172,70 @@ export class AppServerHost {
         if (await this.#writeResolutionError(request, resolution)) continue;
         if (resolution.kind === "external") {
           await this.#interruptExternalTurn(request, resolution.thread, params.turnId);
+          continue;
+        }
+      }
+      if (request.method === "thread/goal/set") {
+        const params = requestObject(request);
+        const threadId = params.threadId;
+        const resolution =
+          typeof threadId === "string"
+            ? await this.#resolveExternalThread(threadId)
+            : ({ kind: "official" } as const);
+        if (await this.#writeResolutionError(request, resolution)) continue;
+        if (resolution.kind === "external") {
+          this.#traceGoal(
+            "own",
+            request.method,
+            typeof params.threadId === "string" ? params.threadId : undefined,
+          );
+          await this.#setExternalThreadGoal(request, resolution.thread);
+          continue;
+        }
+      }
+      if (request.method === "thread/goal/clear") {
+        const params = requestObject(request);
+        const threadId = params.threadId;
+        const resolution =
+          typeof threadId === "string"
+            ? await this.#resolveExternalThread(threadId)
+            : ({ kind: "official" } as const);
+        if (await this.#writeResolutionError(request, resolution)) continue;
+        if (resolution.kind === "external") {
+          this.#traceGoal(
+            "own",
+            request.method,
+            typeof params.threadId === "string" ? params.threadId : undefined,
+          );
+          await this.#clearExternalThreadGoal(request, resolution.thread);
+          continue;
+        }
+      }
+      if (request.method === "thread/goal/get") {
+        const params = requestObject(request);
+        const threadId = params.threadId;
+        const location =
+          typeof threadId === "string"
+            ? await this.#locateExternalThread(threadId)
+            : ({ kind: "official" } as const);
+        if (await this.#writeResolutionError(request, location)) continue;
+        if (location.kind === "external" && !location.thread) {
+          // Goal state is persisted in the Mapping Store. Reading it must not
+          // restore a native process or contact the upstream provider just to
+          // paint the native Goal UI for a cold historical Thread.
+          await this.#getCachedExternalThreadGoal(request, location.record);
+          this.#externalRuntime.prewarm(location.record.hostThreadId);
+          continue;
+        }
+        if (location.kind === "external") {
+          const thread = location.thread;
+          if (!thread) continue;
+          this.#traceGoal(
+            "own",
+            request.method,
+            typeof params.threadId === "string" ? params.threadId : undefined,
+          );
+          await this.#getExternalThreadGoal(request, thread);
           continue;
         }
       }
@@ -4105,6 +4192,7 @@ export class AppServerHost {
           : { type: "idle" },
       );
       this.#externalSteering.terminal(thread.id, event.turnId, event.outcome);
+      await this.#maybeContinueGoalLoop(thread, event.turnId).catch((error) => this.#diagnose(error));
     }
   }
 
@@ -4592,6 +4680,381 @@ export class AppServerHost {
     }
     await this.#writer.json(projection);
   }
+
+  #goalForThread(thread: ExternalThread): GoalLoopState | undefined {
+      const current = this.#goalLoops.get(thread.id);
+      if (current)
+          return current;
+      if (!thread.record.goal)
+          return undefined;
+      const restored = fromStoredGoal(thread.record.goal);
+      this.#goalLoops.set(thread.id, restored);
+      return restored;
+  }
+  async #persistGoal(thread: ExternalThread, goal: GoalLoopState): Promise<void> {
+      const expectedRevision = thread.record.goal?.revision;
+      const record = await this.#repository.setGoal(thread.id, toStoredGoal(goal, thread.harnessId), expectedRevision);
+      thread.record = record;
+      thread.thread.updatedAt = unixSeconds();
+  }
+  #cancelGoalContinuation(threadId: string): void {
+      const timer = this.#goalContinuationTimers.get(threadId);
+      if (timer)
+          clearTimeout(timer);
+      this.#goalContinuationTimers.delete(threadId);
+  }
+  #scheduleGoalContinuation(thread: ExternalThread, recovery = false, seed = false): void {
+      if (this.#goalContinuationTimers.has(thread.id))
+          return;
+      const timer = setTimeout(() => {
+          this.#goalContinuationTimers.delete(thread.id);
+          void (async () => {
+              const goal = this.#goalForThread(thread);
+              if (!goal || goal.status !== "active" || thread.running)
+                  return;
+              let prompt = seed ? goalSeedPrompt(goal) : goalContinuePrompt(goal);
+              if (recovery && goal.inFlightTurnId) {
+                  delete goal.inFlightTurnId;
+                  await this.#persistGoal(thread, goal);
+                  prompt = this.#goalRecoveryPrompt(goal);
+              }
+              await this.#startDelegatedExternalTurn(thread, prompt, randomUUID());
+          })().catch(async (error) => {
+              const goal = this.#goalForThread(thread);
+              if (goal && goal.status === "active") {
+                  setGoalStatus(goal, "blocked", Date.now(), "runtime_error");
+                  await this.#persistGoal(thread, goal).catch(() => undefined);
+                  this.#emitGoalUpdated(thread, goal);
+              }
+              this.#diagnose(error);
+          });
+      }, 0);
+      this.#goalContinuationTimers.set(thread.id, timer);
+  }
+  #goalUsageTokens(usage: HostUsage | null | undefined): number | undefined {
+      if (!usage)
+          return undefined;
+      if (usage.totalTokens !== undefined)
+          return usage.totalTokens;
+      if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
+          return usage.inputTokens + usage.outputTokens;
+      }
+      return undefined;
+  }
+  async #readGoalUsage(thread: ExternalThread, turnId: HostTurnId): Promise<number | undefined> {
+      const known = thread.usageByTurn.get(hostTurnIdSchema.parse(turnId));
+      if (known)
+          return this.#goalUsageTokens(known);
+      const usage = thread.session.readUsage
+          ? await thread.session.readUsage().catch(() => null)
+          : null;
+      if (usage) {
+          thread.latestUsage = usage;
+          thread.usageTurnId = hostTurnIdSchema.parse(turnId);
+          thread.usageByTurn.set(hostTurnIdSchema.parse(turnId), usage);
+          return this.#goalUsageTokens(usage);
+      }
+      if (thread.usageTurnId === turnId)
+          return this.#goalUsageTokens(thread.latestUsage);
+      return undefined;
+  }
+  #initializeGoalUsage(thread: ExternalThread, goal: GoalLoopState): void {
+      const current = this.#goalUsageTokens(thread.latestUsage);
+      if (current === undefined)
+          return;
+      goal.usageBaselineTokens = current;
+      goal.usageTotalTokens = current;
+  }
+  #accountGoalUsage(goal: GoalLoopState, currentTotal: number | undefined): number {
+      if (currentTotal === undefined)
+          return 0;
+      if (goal.usageBaselineTokens === undefined)
+          goal.usageBaselineTokens = currentTotal;
+      const previous = goal.usageTotalTokens ?? goal.usageBaselineTokens;
+      const delta = Math.max(0, currentTotal - previous);
+      goal.usageTotalTokens = Math.max(previous, currentTotal);
+      goal.tokensUsed += delta;
+      return delta;
+  }
+  #goalDecisionMatches(goal: GoalLoopState, decision: ReturnType<typeof parseGoalDecision>): boolean {
+      return Boolean(decision &&
+          (!decision.goalId || decision.goalId === goal.goalId) &&
+          (decision.goalRevision === undefined || decision.goalRevision === goal.revision));
+  }
+  async #hasCompletionEvidence(thread: ExternalThread, decision: NonNullable<ReturnType<typeof parseGoalDecision>>): Promise<boolean> {
+      for (const evidence of decision.completionEvidence) {
+          const type = evidence.type;
+          if (type === "loopx-audit") {
+              if (evidence.status === "pass")
+                  return true;
+              continue;
+          }
+          if (type === "command") {
+              if (evidence.exit_code === 0 || evidence.exitCode === 0)
+                  return true;
+              continue;
+          }
+          if (type === "research-source") {
+              if (typeof evidence.uri !== "string" || evidence.uri.trim().length === 0)
+                  continue;
+              try {
+                  if (new URL(evidence.uri).protocol.length > 0)
+                      return true;
+              }
+              catch {
+                  // An invalid source URI is not completion evidence.
+              }
+              continue;
+          }
+          if (type !== "file" && type !== "artifact")
+              continue;
+          if (typeof evidence.path !== "string" || evidence.path.trim().length === 0)
+              continue;
+          const resolved = path.resolve(thread.cwd, evidence.path);
+          const relative = path.relative(thread.cwd, resolved);
+          if (relative.startsWith("..") || path.isAbsolute(relative))
+              continue;
+          try {
+              await stat(resolved);
+              return true;
+          }
+          catch {
+              // The model named an artifact that is not present on disk.
+          }
+      }
+      return false;
+  }
+  async #maybeContinueGoalLoop(thread: ExternalThread, completedTurnId: HostTurnId): Promise<void> {
+      const goal = this.#goalForThread(thread);
+      if (!goal || goal.lastCompletedTurnId === completedTurnId)
+          return;
+      if (goal.inFlightTurnId !== completedTurnId)
+          return;
+      delete goal.inFlightTurnId;
+      goal.lastCompletedTurnId = completedTurnId;
+      const lastTurn = thread.turns[thread.turns.length - 1];
+      const response = lastAgentMessageText(lastTurn);
+      const parsedDecision = parseGoalDecision(response);
+      const decision = this.#goalDecisionMatches(goal, parsedDecision) ? parsedDecision : null;
+      const currentTotal = await this.#readGoalUsage(thread, completedTurnId);
+      this.#accountGoalUsage(goal, currentTotal);
+      if (goal.status !== "active") {
+          await this.#persistGoal(thread, goal);
+          this.#emitGoalUpdated(thread, goal);
+          return;
+      }
+      if (goal.tokenBudget !== undefined && goal.tokensUsed >= goal.tokenBudget) {
+          setGoalStatus(goal, "budget_limited", Date.now(), "token_budget");
+          await this.#persistGoal(thread, goal);
+          this.#emitGoalUpdated(thread, goal);
+          return;
+      }
+      if (decision?.kind === "complete" && (await this.#hasCompletionEvidence(thread, decision))) {
+          goal.loopTurnCount += 1;
+          goal.lastProgressAtMs = Date.now();
+          setGoalStatus(goal, "complete");
+          await this.#persistGoal(thread, goal);
+          this.#emitGoalUpdated(thread, goal);
+          return;
+      }
+      const failed = this.#lastTurnFailed(lastTurn);
+      const progress = !failed && hasTurnProgress(lastTurn, decision);
+      const blocker = failed
+          ? "turn_failed"
+          : decision?.kind === "blocked"
+              ? decision.blockerFingerprint
+              : decision?.kind === "complete"
+                  ? "completion_audit_failed"
+                  : undefined;
+      const status = advanceGoalLoop(goal, 0, progress, Date.now(), blocker);
+      await this.#persistGoal(thread, goal);
+      this.#emitGoalUpdated(thread, goal);
+      if (status === "active")
+          this.#scheduleGoalContinuation(thread);
+  }
+  /** True when the most recent completed Turn ended in failure rather than an agent reply. */
+  #lastTurnFailed(lastTurn: unknown): boolean {
+      return isRecord(lastTurn) && lastTurn.status === "failed";
+  }
+  /** Trace how a desktop thread/goal RPC was routed (stderr + a stable temp file). */
+  #traceGoal(action: string, method: string, threadId: string | null | undefined): void {
+      const line = `codexhost goal-${action} §threads ${method} threadId=${JSON.stringify(threadId ?? null)} pid=${process.pid}`;
+      void this.#options.diagnosticOutput.write(`${line}\n`);
+      try {
+          appendFileSync(`${tmpdir()}/codexhost-goal-diag.log`, `${new Date().toISOString()} ${line}\n`, "utf8");
+      }
+      catch {
+          // Diagnostics must never crash the request loop.
+      }
+  }
+  #goalRecoveryPrompt(goal: GoalLoopState): string {
+      const budgetLine = goal.tokenBudget !== undefined ? `\n\n总 token 预算 ${goal.tokenBudget} 不变。` : "";
+      return [
+          `【自主目标续做 · 上一轮被中断】目标仍是：${goal.objective}${budgetLine}`,
+          "上一轮在未产生最终回复前被超时中断。请先核对目前磁盘/对话中已落地的进度",
+          "（已改的文件、已跑通的部分），挑出最近一个真正未完成且仍可继续的子任务，",
+          "从那里继续推进；不要从零重复已经做完的工作。",
+          "彻底完成时提供 completion_evidence；确实无法继续时提供 blocker_fingerprint。",
+      ].join("\n");
+  }
+  #emitGoalUpdated(thread: ExternalThread, goal: GoalLoopState): void {
+      void this.#writer.json({
+          method: "thread/goal/updated",
+          params: {
+              threadId: thread.id,
+              goal: toThreadGoal(goal),
+          },
+      });
+  }
+  #emitGoalCleared(threadId: string): void {
+      void this.#writer.json({
+          method: "thread/goal/cleared",
+          params: {
+              threadId,
+          },
+      });
+  }
+  async #setExternalThreadGoal(request: JsonRpcRequest, thread: ExternalThread): Promise<void> {
+      const params = requestObject(request);
+      const rawObjective = typeof params.objective === "string" ? params.objective.trim() : undefined;
+      const rawStatus = typeof params.status === "string" ? params.status : undefined;
+      const rawBudget = params.tokenBudget;
+      if (rawBudget !== undefined &&
+          (typeof rawBudget !== "number" || !Number.isSafeInteger(rawBudget) || rawBudget <= 0)) {
+          await this.#writer.json(rpcError(request, -32602, "tokenBudget must be a positive integer"));
+          return;
+      }
+      const goal = this.#goalForThread(thread);
+      if (rawObjective) {
+          if (rawStatus && rawStatus !== "active") {
+              await this.#writer.json(rpcError(request, -32602, "A new objective can only be set with status active"));
+              return;
+          }
+          if (thread.running) {
+              await this.#writer.json(rpcError(request, -32072, "Pause the External Goal before replacing its objective"));
+              return;
+          }
+          let nextGoal;
+          try {
+              nextGoal = createGoalLoop(rawObjective, rawBudget);
+          }
+          catch (error) {
+              await this.#writer.json(rpcError(request, -32602, errorMessage(error)));
+              return;
+          }
+          this.#initializeGoalUsage(thread, nextGoal);
+          this.#goalLoops.set(thread.id, nextGoal);
+          try {
+              await this.#persistGoal(thread, nextGoal);
+          }
+          catch (error) {
+              this.#goalLoops.delete(thread.id);
+              await this.#writer.json(rpcError(request, -32081, `External Goal could not be persisted: ${errorMessage(error)}`));
+              return;
+          }
+          this.#emitGoalUpdated(thread, nextGoal);
+          await this.#writer.json(rpcEnvelope(request, { result: { goal: toThreadGoal(nextGoal) } }));
+          this.#scheduleGoalContinuation(thread, false, true);
+          return;
+      }
+      if (rawStatus) {
+          if (!goal) {
+              await this.#writer.json(rpcError(request, -32602, "No active goal found for thread"));
+              return;
+          }
+          const allowed = new Set<string>([
+              "active",
+              "paused",
+              "blocked",
+              "usage_limited",
+              "budget_limited",
+              "complete",
+          ]);
+          if (!allowed.has(rawStatus)) {
+              await this.#writer.json(rpcError(request, -32602, `Unsupported Goal status '${rawStatus}'`));
+              return;
+          }
+          const status = rawStatus as ThreadGoalStatus;
+          const reason = status === "paused"
+              ? "user_pause"
+              : status === "blocked"
+                  ? "runtime_error"
+                  : status === "usage_limited"
+                      ? "usage_limit"
+                      : status === "budget_limited"
+                          ? "token_budget"
+                          : undefined;
+          setGoalStatus(goal, status, Date.now(), reason);
+          if (status !== "active")
+              this.#cancelGoalContinuation(thread.id);
+          try {
+              await this.#persistGoal(thread, goal);
+          }
+          catch (error) {
+              await this.#writer.json(rpcError(request, -32081, `External Goal could not be persisted: ${errorMessage(error)}`));
+              return;
+          }
+          this.#emitGoalUpdated(thread, goal);
+          await this.#writer.json(rpcEnvelope(request, { result: { goal: toThreadGoal(goal) } }));
+          if (status === "paused" ||
+              status === "complete" ||
+              status === "blocked" ||
+              status === "usage_limited" ||
+              status === "budget_limited") {
+              if (thread.running && thread.activeTurnId) {
+                  await thread.session
+                      .execute({ type: "turn.cancel", turnId: thread.activeTurnId })
+                      .catch(() => undefined);
+              }
+          }
+          else if (status === "active" && !thread.running) {
+              this.#scheduleGoalContinuation(thread, Boolean(goal.inFlightTurnId));
+          }
+          return;
+      }
+      if (!goal) {
+          await this.#writer.json(rpcError(request, -32602, "Objective or status is required for thread/goal/set"));
+          return;
+      }
+      await this.#writer.json(rpcEnvelope(request, { result: { goal: toThreadGoal(goal) } }));
+  }
+  async #clearExternalThreadGoal(request: JsonRpcRequest, thread: ExternalThread): Promise<void> {
+      const goal = this.#goalForThread(thread);
+      this.#cancelGoalContinuation(thread.id);
+      try {
+          thread.record = await this.#repository.clearGoal(thread.id, goal?.revision);
+      }
+      catch (error) {
+          await this.#writer.json(rpcError(request, -32081, `External Goal could not be cleared: ${errorMessage(error)}`));
+          return;
+      }
+      this.#goalLoops.delete(thread.id);
+      if (thread.running && thread.activeTurnId) {
+          await thread.session
+              .execute({ type: "turn.cancel", turnId: thread.activeTurnId })
+              .catch(() => undefined);
+      }
+      this.#emitGoalCleared(thread.id);
+      await this.#writer.json(rpcEnvelope(request, { result: {} }));
+  }
+  async #getExternalThreadGoal(request: JsonRpcRequest, thread: ExternalThread): Promise<void> {
+      const goal = this.#goalForThread(thread);
+      if (!goal) {
+          await this.#writer.json(rpcEnvelope(request, { result: { goal: null } }));
+          return;
+      }
+      if (goal.status === "active") {
+          updateGoalActiveTime(goal);
+      }
+      await this.#writer.json(rpcEnvelope(request, { result: { goal: toThreadGoal(goal) } }));
+  }
+  async #getCachedExternalThreadGoal(request: JsonRpcRequest, record: StoredThreadRecordV1): Promise<void> {
+      const goal = record.goal ? fromStoredGoal(record.goal) : null;
+      await this.#writer.json(rpcEnvelope(request, {
+          result: { goal: goal ? toThreadGoal(goal) : null },
+      }));
+  }
+
 
   #dispatchDesktopRequest(run: () => Promise<void>): void {
     void run().catch((error) => this.#diagnose(error));
