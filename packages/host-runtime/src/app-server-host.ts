@@ -759,6 +759,9 @@ export class AppServerHost {
       await this.#codexRuntimePool.close();
       this.#externalRuntime.clear();
       this.#pendingOfficialTurnStarts.clear();
+      for (const timer of this.#goalContinuationTimers.values()) clearTimeout(timer);
+      this.#goalContinuationTimers.clear();
+      this.#goalLoops.clear();
       this.#routeObservationTracker.clear();
       this.#unregisterDelegationApi?.();
       this.#unregisterDelegationApi = undefined;
@@ -3506,6 +3509,8 @@ export class AppServerHost {
       return;
     }
     this.#externalRuntime.remove(location.record.hostThreadId);
+    this.#cancelGoalContinuation(location.record.hostThreadId);
+    this.#goalLoops.delete(location.record.hostThreadId);
     this.#routeObservationTracker.forgetThread(location.record.hostThreadId);
     if (!thread) {
       await this.#writer.json(rpcEnvelope(request, { result: {} }));
@@ -3935,6 +3940,13 @@ export class AppServerHost {
       resolve: cancellationGate.resolve,
     };
     thread.responseGates.set(turnId, gate);
+    // A user interrupt pauses any active External Goal loop.
+    const goal = this.#goalForThread(thread);
+    if (goal && goal.status === "active") {
+      setGoalStatus(goal, "paused", Date.now(), "user_interrupt");
+      await this.#persistGoal(thread, goal).catch((error) => this.#diagnose(error));
+      this.#emitGoalUpdated(thread, goal);
+    }
     const result = await thread.session.execute({ type: "turn.cancel", turnId });
     if (!result.ok) {
       try {
