@@ -1178,6 +1178,10 @@ export class AppServerHost {
           continue;
         }
       }
+      if (request.method === "codexhost/thread/handover") {
+        await this.#handleThreadHandover(request);
+        continue;
+      }
       if (request.method === "thread/goal/set") {
         const params = requestObject(request);
         const threadId = params.threadId;
@@ -3495,6 +3499,52 @@ export class AppServerHost {
       method: "thread/name/updated",
       params: { threadId: location.record.hostThreadId, threadName: name },
     });
+  }
+
+  async #handleThreadHandover(request: JsonRpcRequest): Promise<void> {
+    const params = isRecord(request.params) ? request.params : null;
+    const parsed = hostThreadIdSchema.safeParse(params?.threadId);
+    if (!parsed.success) {
+      await this.#writer.json(
+        rpcError(request, -32602, "Invalid Thread handover params: valid threadId required"),
+      );
+      return;
+    }
+    const threadId = parsed.data;
+    const resolution = await this.#resolveExternalThread(threadId);
+    if (resolution.kind === "external") {
+      const thread = resolution.thread;
+      try {
+        if (thread.session) {
+          await thread.session.close().catch((err: unknown) => this.#diagnose(err));
+          await thread.outputTask.catch((err: unknown) => this.#diagnose(err));
+        }
+      } catch (error) {
+        this.#diagnose(error);
+      }
+      try {
+        await this.#repository.removeThread(threadId);
+      } catch (error) {
+        this.#diagnose(error);
+      }
+      this.#externalRuntime.remove(threadId);
+      this.#cancelGoalContinuation(threadId);
+      this.#goalLoops.delete(threadId);
+      this.#routeObservationTracker.forgetThread(threadId);
+      await this.#writer
+        .json({ method: THREAD_USAGE_UPDATED_METHOD, params: { threadId } })
+        .catch(() => undefined);
+    } else {
+      try {
+        await this.#repository.removeThread(threadId);
+      } catch (error) {
+        this.#diagnose(error);
+      }
+      this.#cancelGoalContinuation(threadId);
+      this.#goalLoops.delete(threadId);
+      this.#routeObservationTracker.forgetThread(threadId);
+    }
+    await this.#writer.json(rpcEnvelope(request, { result: { ok: true } }));
   }
 
   async #deleteExternalThread(
