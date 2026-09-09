@@ -45,6 +45,7 @@ import {
 } from "./renderer-composer-dom.js";
 import { rendererHarnessMessages } from "./renderer-harness-localization.js";
 import { RendererCodexAccountState } from "./renderer-codex-account-state.js";
+import { RendererHarnessAccountState } from "./renderer-harness-account-state.js";
 import {
   decodeAntigravityTransportModelId,
   decodeClaudeTransportModelId,
@@ -160,6 +161,7 @@ export { resolveCodexAccountSelection } from "./renderer-codex-account-state.js"
 
 interface HostHarnessAvailabilityState {
   codexAccounts: RendererCodexAccountState | null;
+  harnessAccounts: RendererHarnessAccountState | null;
   availability: HarnessAvailability;
   errors: HarnessAvailabilityErrors;
   webUi: HarnessWebUiAvailability;
@@ -692,6 +694,7 @@ export function installRendererBindingProbe(
   };
   const createHostHarnessAvailabilityState = (): HostHarnessAvailabilityState => ({
     codexAccounts: null,
+    harnessAccounts: null,
     availability: Object.fromEntries(
       externalAgents.map((agent) => [agent, "checking"]),
     ) as HarnessAvailability,
@@ -734,6 +737,16 @@ export function installRendererBindingProbe(
   };
   const composerCodexAccounts = (composer: Element): RendererCodexAccountState | null =>
     codexAccountsForHost(mountedByComposer.get(composer)?.hostId ?? null);
+  const harnessAccountsForHost = (hostId: string | null): RendererHarnessAccountState | null => {
+    if (!hostId) return null;
+    const client = modelClientForHost(hostId);
+    if (!client) return null;
+    const state = hostHarnessAvailabilityState(hostId);
+    if (state.harnessAccounts?.client !== client) {
+      state.harnessAccounts = new RendererHarnessAccountState(client);
+    }
+    return state.harnessAccounts;
+  };
   let activeAvailabilityHostId = "local";
   const activeHarnessAvailabilityState = (): HostHarnessAvailabilityState =>
     hostHarnessAvailabilityState(activeAvailabilityHostId);
@@ -790,9 +803,29 @@ export function installRendererBindingProbe(
     );
   };
 
+  const harnessAccountUsageLabel = (credits: AccountCreditsSnapshot): string => {
+    const used = Math.round(credits.usedPercent);
+    return settingsLifecycle.locale === "zh-CN" ? `已用 ${used}%` : `${used}% used`;
+  };
+
   const renderMounted = (mounted: MountedComposer): void => {
     const state = controller.get(mounted.composer);
     const accounts = composerCodexAccounts(mounted.composer);
+    const harnessAccounts = harnessAccountsForHost(mounted.hostId);
+    const harnessRows = harnessAccounts?.accounts ?? [];
+    const harnessEntries = harnessRows
+      .filter((account) => account.harnessId === "antigravity" && account.accountId)
+      .map((account) => {
+        const id = account.accountId ?? "";
+        return {
+          id,
+          label: account.label ?? account.email ?? id,
+          ...(account.credits ? { secondary: harnessAccountUsageLabel(account.credits) } : {}),
+        };
+      });
+    const selectedHarnessAccountId =
+      harnessRows.find((account) => account.harnessId === "antigravity" && account.isDefault)
+        ?.accountId ?? null;
     const selectedCodexAccountId =
       state.phase === "locked" ||
       (controller.isSubmissionPending(mounted.composer) && state.codexAccountId)
@@ -803,6 +836,7 @@ export function installRendererBindingProbe(
       controller.get(mounted.composer),
       adapterStatus.state,
       accounts?.switching === true ||
+        harnessAccounts?.switching === true ||
         controller.isSwitching(mounted.composer) ||
         mounted.ownershipStatus === "loading",
       activeHarnessAvailabilityState().availability,
@@ -816,6 +850,8 @@ export function installRendererBindingProbe(
         active: account.accountId === selectedCodexAccountId,
       })),
       mounted.ownershipStatus === "error",
+      harnessEntries,
+      selectedHarnessAccountId,
     );
     if (mounted.control.usage) {
       mounted.control.usage.onOpen = () => {
@@ -1989,6 +2025,53 @@ export function installRendererBindingProbe(
     }
   };
 
+  const loadHarnessAccounts = async (): Promise<void> => {
+    const hostId = activeModelHostId();
+    const state = harnessAccountsForHost(hostId);
+    if (!state) return;
+    await state.refresh();
+    if (disposed || harnessAccountsForHost(hostId) !== state) return;
+    for (const mounted of mountedByComposer.values()) {
+      if (mounted.hostId !== hostId) continue;
+      renderMounted(mounted);
+    }
+  };
+
+  const selectHarnessAccount = async (
+    mounted: MountedComposer,
+    accountId: string,
+  ): Promise<void> => {
+    const hostId = mounted.hostId;
+    const state = harnessAccountsForHost(hostId);
+    const entry = state?.accounts.find((account) => account.accountId === accountId);
+    if (
+      !state?.client.selectHarnessAccount ||
+      state.switching ||
+      !entry?.harnessId ||
+      controller.get(mounted.composer).phase === "locked"
+    ) {
+      return;
+    }
+    const harnessId = entry.harnessId;
+    state.switching = true;
+    for (const candidate of mountedByComposer.values()) {
+      if (candidate.hostId === hostId) renderMounted(candidate);
+    }
+    try {
+      const result = await state.client.selectHarnessAccount({ harnessId, accountId });
+      if (!disposed && harnessAccountsForHost(hostId) === state) state.accounts = result.accounts;
+    } catch {
+      // Unsupported or failed selection keeps the previous rows.
+    } finally {
+      state.switching = false;
+      if (!disposed && harnessAccountsForHost(hostId) === state) {
+        for (const candidate of mountedByComposer.values()) {
+          if (candidate.hostId === hostId) renderMounted(candidate);
+        }
+      }
+    }
+  };
+
   const openInstallPage = (agent: ExternalRendererAgent): void => {
     const url = RENDERER_AGENT_INSTALL_URLS[agent];
     window.open(url, "_blank", "noopener,noreferrer");
@@ -2312,8 +2395,14 @@ export function installRendererBindingProbe(
         if (!composer.isConnected || !mounted) return;
         await selectCodexAccount(mounted, accountId);
       },
+      async (accountId) => {
+        const mounted = mountedByComposer.get(composer);
+        if (!composer.isConnected || !mounted) return;
+        await selectHarnessAccount(mounted, accountId);
+      },
       () => {
         void loadCodexAccounts();
+        void loadHarnessAccounts();
       },
       (modelId) => {
         const mounted = mountedByComposer.get(composer);

@@ -14,6 +14,11 @@ import {
   type RendererCodexAccountGroupControl,
   type RendererCodexAccountOptionControl,
 } from "./renderer-codex-account-options.js";
+import {
+  createRendererHarnessAccountGroup,
+  type RendererHarnessAccountEntry,
+  type RendererHarnessAccountGroupControl,
+} from "./renderer-harness-account-options.js";
 import { createRendererAgentIcon, RENDERER_AGENT_LABELS } from "./renderer-agent-icon.js";
 import { requestConnectionsPageFocus } from "./settings/connections-page.js";
 import {
@@ -32,6 +37,7 @@ function pickerGroupMessages(): Pick<
 > & {
   readonly codexAccountsLabel: string;
   readonly manageCodexAccountsLabel: string;
+  readonly manageHarnessAccountsLabel: string;
   readonly ownershipErrorLabel: string;
 } {
   const languages = typeof navigator !== "undefined" ? navigator.languages : [];
@@ -41,6 +47,8 @@ function pickerGroupMessages(): Pick<
     codexAccountsLabel: "Codex",
     manageCodexAccountsLabel:
       messages.locale === "zh-CN" ? "管理 Codex 账号" : "Manage Codex Accounts",
+    manageHarnessAccountsLabel:
+      messages.locale === "zh-CN" ? "管理 AGY 账号" : "Manage Antigravity Accounts",
     ownershipErrorLabel:
       messages.locale === "zh-CN"
         ? "无法确认会话的 Agent；重新聚焦窗口以重试"
@@ -113,6 +121,8 @@ export interface RendererAgentPickerControl {
   codexAccountOptions: Map<string, RendererCodexAccountOptionControl>;
   codexAccountContainer: HTMLElement;
   codexAccountGroup: RendererCodexAccountGroupControl;
+  harnessAccountContainer: HTMLElement;
+  harnessAccountGroup: RendererHarnessAccountGroupControl;
   selectCodexAccount(accountId: string): void;
   close(): void;
   dispose(): void;
@@ -222,6 +232,7 @@ export function mountRendererAgentPicker(
   onSelect: (agent: RendererAgent) => void,
   onDownload: (agent: ExternalRendererAgent) => void,
   onSelectCodexAccount: (accountId: string) => void,
+  onSelectHarnessAccount: (accountId: string) => void,
   onOpen?: () => void,
   groupPreference: AgentGroupPreferenceStore = getSharedAgentGroupPreferenceStore(),
 ): RendererAgentPickerControl {
@@ -334,6 +345,22 @@ export function mountRendererAgentPicker(
   const codexAccountOptions = codexAccountGroup.options;
   const codexAccountContainer = codexAccountGroup.root;
   trigger.append(codexAccountGroup.badge);
+
+  const harnessAccountGroup = createRendererHarnessAccountGroup({
+    ownerDocument: document,
+    accountsLabel: RENDERER_AGENT_LABELS.antigravity,
+    manageAccountsLabel: groupMessages.manageHarnessAccountsLabel,
+    onSelect(accountId) {
+      close();
+      trigger.focus();
+      onSelectHarnessAccount(accountId);
+    },
+    onManage() {
+      close();
+      openSettingsPage("accounts", trigger);
+    },
+  });
+  const harnessAccountContainer = harnessAccountGroup.root;
 
   const focusOption = (position: "first" | "last" | "selected"): void => {
     const available = [
@@ -604,6 +631,7 @@ export function mountRendererAgentPicker(
       const row = rowsByAgent.get(agent);
       if (row) mainChildren.push(row);
       if (agent === "codex") mainChildren.push(codexAccountContainer);
+      if (agent === "antigravity") mainChildren.push(harnessAccountContainer);
     }
     mainGroup.replaceChildren(...mainChildren);
     moreRows.replaceChildren(
@@ -691,6 +719,8 @@ export function mountRendererAgentPicker(
     codexAccountOptions,
     codexAccountContainer,
     codexAccountGroup,
+    harnessAccountContainer,
+    harnessAccountGroup,
     selectCodexAccount: onSelectCodexAccount,
     close,
     dispose() {
@@ -716,6 +746,8 @@ export function renderRendererAgentPicker(
   availability: AgentAvailability = {},
   codexAccounts: readonly CodexAccountSummary[] = [],
   ownershipError = false,
+  harnessAccounts: readonly RendererHarnessAccountEntry[] = [],
+  harnessAccountId: string | null = null,
 ): RendererAgentPickerView {
   control.codexAccounts = [...codexAccounts];
   const codexOption = control.options.codex;
@@ -748,6 +780,14 @@ export function renderRendererAgentPicker(
     selectedAccountId: state.agent === "codex" ? (activeAccount?.accountId ?? null) : null,
     disabled: switching || state.phase === "locked",
     showBadge: state.agent === "codex" && codexAccounts.length > 1,
+  });
+  control.harnessAccountGroup.render({
+    entries: harnessAccounts,
+    selectedId: harnessAccountId,
+    disabled: switching || state.phase === "locked",
+    // Like the Codex group: the rows belong to their Agent entry, so they stay
+    // visible whether or not that Agent is the current one.
+    visible: true,
   });
   control.trigger.title = ownershipError
     ? pickerGroupMessages().ownershipErrorLabel

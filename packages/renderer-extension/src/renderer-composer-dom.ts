@@ -16,6 +16,7 @@ import {
   renderRendererAgentPicker,
   type RendererAgentPickerControl,
 } from "./renderer-agent-picker.js";
+import type { RendererHarnessAccountEntry } from "./renderer-harness-account-options.js";
 import {
   mountRendererModelPicker,
   renderRendererModelPicker,
@@ -605,6 +606,7 @@ export function mountComposerAgentControl(
   onSelect: (agent: RendererAgent) => void,
   onDownload: (agent: ExternalRendererAgent) => void,
   onSelectCodexAccount: (accountId: string) => Promise<void> | void,
+  onSelectHarnessAccount: (accountId: string) => Promise<void> | void,
   onOpenProviderPicker: () => void,
   onSelectModel: (modelId: string) => void,
   onSelectThinking: (thinkingOptionId: string) => void,
@@ -627,6 +629,7 @@ export function mountComposerAgentControl(
     onSelect,
     onDownload,
     onSelectCodexAccount,
+    onSelectHarnessAccount,
     onOpenProviderPicker,
   );
   const modelPicker = mountRendererModelPicker(composerId, onSelectModel, onSelectThinking);
@@ -687,6 +690,8 @@ export function renderComposerAgentControl(
   locale: RendererSettingsLocale = "en",
   codexAccounts: readonly CodexAccountSummary[] = [],
   ownershipError = false,
+  harnessAccounts: readonly RendererHarnessAccountEntry[] = [],
+  harnessAccountId: string | null = null,
 ): void {
   if (control.usage === null) {
     control.usage = mountRendererUsageControl(control.composerId, locale);
@@ -727,6 +732,8 @@ export function renderComposerAgentControl(
     availability,
     codexAccounts,
     ownershipError,
+    harnessAccounts,
+    harnessAccountId,
   );
   reconcileComposerNativeControls(
     control,
