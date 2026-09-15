@@ -42,6 +42,8 @@ export async function buildHarnessPlugin({ pluginRoot, outputRoot, allowedRuntim
     treeShaking: true,
     charset: "utf8",
     legalComments: "none",
+    minify: true,
+    keepNames: true,
     banner: {
       js: 'import { createRequire as __codexhostCreateRequire } from "node:module"; const require = __codexhostCreateRequire(import.meta.url);',
     },
