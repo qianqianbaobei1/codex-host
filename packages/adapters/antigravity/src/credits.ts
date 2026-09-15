@@ -36,6 +36,36 @@ function clampPercent(num: number): number {
   return Math.min(100, Math.max(0, round1(num)));
 }
 
+function quotaProductMatchesModel(product: string, modelId: string | undefined): boolean {
+  const normalized = product.trim().toLowerCase();
+  const thirdParty = /\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(
+    (modelId ?? "").trim().toLowerCase(),
+  );
+  if (thirdParty) {
+    return /\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(normalized);
+  }
+  return /gemini|native|first[- ]party|自有/u.test(normalized);
+}
+
+/**
+ * Whether a cached quota snapshot still has capacity for the requested model
+ * group. The top-level summary can describe another group (for example a
+ * Claude/GPT weekly bucket while the user is selecting Gemini), so callers
+ * must prefer the product-level bucket when it is available.
+ */
+export function antigravityQuotaAvailableForModel(
+  credits: AccountCreditsSnapshot | null | undefined,
+  modelId?: string,
+): boolean {
+  if (!credits) return true;
+  const products = credits.productUsage ?? [];
+  const scoped = modelId
+    ? products.filter((product) => quotaProductMatchesModel(product.product, modelId))
+    : products;
+  if (scoped.length > 0) return scoped.some((product) => product.usagePercent < 100);
+  return credits.usedPercent < 100;
+}
+
 function normalizeIsoReset(resetTime: unknown, resetInSeconds?: unknown): string | undefined {
   if (typeof resetTime === "string" && resetTime.trim().length > 0) {
     const parsed = Date.parse(resetTime);
@@ -172,13 +202,15 @@ export function projectAntigravityRawQuota(
   };
 
   if (preferredGroup === "3p") {
+    addProduct("3P 5-hour limit", threeP5h);
     addProduct("3P Weekly limit", threePWeekly);
     addProduct("Gemini 5-hour limit", gemini5h);
-    addProduct("Weekly limit", geminiWeekly);
+    addProduct("Gemini Weekly limit", geminiWeekly);
   } else {
-    addProduct("Weekly limit", geminiWeekly);
-    addProduct("3P Weekly limit", threePWeekly);
+    addProduct("Gemini 5-hour limit", gemini5h);
+    addProduct("Gemini Weekly limit", geminiWeekly);
     addProduct("3P 5-hour limit", threeP5h);
+    addProduct("3P Weekly limit", threePWeekly);
   }
 
   const candidate: AccountCreditsSnapshot = {
@@ -243,13 +275,15 @@ export function projectAntigravitySnapshotQuota(
   };
 
   if (preferredGroup === "3p") {
-    addProduct("3P Weekly limit", claudeGptWeekly);
+    addProduct("Claude and GPT models · 5-hour limit", claudeGpt5h);
+    addProduct("Claude and GPT models · Weekly limit", claudeGptWeekly);
     addProduct("Gemini 5-hour limit", gemini5h);
-    addProduct("Weekly limit", geminiWeekly);
+    addProduct("Gemini Weekly limit", geminiWeekly);
   } else {
-    addProduct("Weekly limit", geminiWeekly);
-    addProduct("3P Weekly limit", claudeGptWeekly);
-    addProduct("3P 5-hour limit", claudeGpt5h);
+    addProduct("Gemini 5-hour limit", gemini5h);
+    addProduct("Gemini Weekly limit", geminiWeekly);
+    addProduct("Claude and GPT models · 5-hour limit", claudeGpt5h);
+    addProduct("Claude and GPT models · Weekly limit", claudeGptWeekly);
   }
 
   const candidate: AccountCreditsSnapshot = {
@@ -279,6 +313,23 @@ export interface AntigravityCreditsPathOptions {
   scriptPath?: string | undefined;
   preferredGroup?: "gemini" | "3p" | undefined;
   allowExpired?: boolean | undefined;
+  expectedEmail?: string | undefined;
+}
+
+function matchExpectedEmail(text: string, expectedEmail?: string): boolean {
+  if (!expectedEmail) return true;
+  try {
+    const obj = JSON.parse(text);
+    return Boolean(
+      obj &&
+      typeof obj === "object" &&
+      typeof obj.email === "string" &&
+      obj.email &&
+      obj.email.trim().toLowerCase() === expectedEmail.trim().toLowerCase(),
+    );
+  } catch {
+    return false;
+  }
 }
 
 function resolvePaths(options?: AntigravityCreditsPathOptions): {
@@ -314,8 +365,10 @@ export function readAntigravityCreditsSync(
   if (rawPath && fs.existsSync(rawPath)) {
     try {
       const rawText = fs.readFileSync(rawPath, "utf-8");
-      const credits = parseAntigravityQuotaPayload(rawText, preferredGroup);
-      if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      if (matchExpectedEmail(rawText, options?.expectedEmail)) {
+        const credits = parseAntigravityQuotaPayload(rawText, preferredGroup);
+        if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      }
     } catch {
       // Ignore read error, fall through to snapshot
     }
@@ -324,8 +377,10 @@ export function readAntigravityCreditsSync(
   if (snapshotPath && fs.existsSync(snapshotPath)) {
     try {
       const snapshotText = fs.readFileSync(snapshotPath, "utf-8");
-      const credits = parseAntigravityQuotaPayload(snapshotText, preferredGroup);
-      if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      if (matchExpectedEmail(snapshotText, options?.expectedEmail)) {
+        const credits = parseAntigravityQuotaPayload(snapshotText, preferredGroup);
+        if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      }
     } catch {
       // Ignore read error
     }
@@ -342,8 +397,10 @@ export async function readAntigravityCredits(
   if (rawPath) {
     try {
       const rawText = await fs.promises.readFile(rawPath, "utf-8");
-      const credits = parseAntigravityQuotaPayload(rawText, preferredGroup);
-      if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      if (matchExpectedEmail(rawText, options?.expectedEmail)) {
+        const credits = parseAntigravityQuotaPayload(rawText, preferredGroup);
+        if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      }
     } catch {
       // Ignore read error, fall through to snapshot
     }
@@ -352,8 +409,10 @@ export async function readAntigravityCredits(
   if (snapshotPath) {
     try {
       const snapshotText = await fs.promises.readFile(snapshotPath, "utf-8");
-      const credits = parseAntigravityQuotaPayload(snapshotText, preferredGroup);
-      if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      if (matchExpectedEmail(snapshotText, options?.expectedEmail)) {
+        const credits = parseAntigravityQuotaPayload(snapshotText, preferredGroup);
+        if (credits && (allowExpired || !isSnapshotExpired(credits))) return credits;
+      }
     } catch {
       // Ignore read error
     }

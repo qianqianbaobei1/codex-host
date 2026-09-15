@@ -38,6 +38,8 @@ interface RendererCreditsMessages {
   readonly fiveHour: string;
   readonly sevenDay: string;
   readonly account: string;
+  readonly geminiGroup: string;
+  readonly threePGroup: string;
 }
 
 const ENGLISH_CREDITS_MESSAGES: RendererCreditsMessages = Object.freeze({
@@ -49,6 +51,8 @@ const ENGLISH_CREDITS_MESSAGES: RendererCreditsMessages = Object.freeze({
   fiveHour: "5-hour limit",
   sevenDay: "7-day limit",
   account: "Account limit",
+  geminiGroup: "Gemini",
+  threePGroup: "3P",
 });
 
 const CHINESE_CREDITS_MESSAGES: RendererCreditsMessages = Object.freeze({
@@ -60,6 +64,8 @@ const CHINESE_CREDITS_MESSAGES: RendererCreditsMessages = Object.freeze({
   fiveHour: "5 小时额度",
   sevenDay: "7 天额度",
   account: "账号额度",
+  geminiGroup: "Gemini",
+  threePGroup: "3P 模型",
 });
 
 function rendererCreditsMessages(locale: RendererSettingsLocale): RendererCreditsMessages {
@@ -108,46 +114,84 @@ export function creditsPeriodLabel(
   return messages.account;
 }
 
+export function isAntigravityProductList(products: readonly { product: string }[]): boolean {
+  return products.some((p) => {
+    const n = p.product.trim().toLowerCase();
+    return /gemini|\b3p\b|claude.*gpt|gpt.*claude|first[- ]party|third[- ]party/u.test(n);
+  });
+}
+
 function productLabel(product: string, locale: RendererSettingsLocale): string {
   if (product === "GrokBuild") return "Build";
   if (product === "GrokChat") return "Chat";
   if (product === "GrokImagine") return "Imagine";
   if (product === "GrokVoice") return "Voice";
   const messages = rendererCreditsMessages(locale);
-  if (product === "5-hour window") return messages.fiveHour;
-  if (product === "7-day window") return messages.sevenDay;
-  if (product.endsWith(" · 5-hour window")) {
-    return `${product.slice(0, -"5-hour window".length)}${messages.fiveHour}`;
+  const normalized = product.trim().toLowerCase();
+  if (
+    (/^5(?:[- ]?hour|h)|five[- ]?hour/u.test(normalized) && /limit|window/u.test(normalized)) ||
+    normalized === "5-hour window" ||
+    normalized === "5-hour limit"
+  ) {
+    return messages.fiveHour;
   }
-  if (product.endsWith(" · 7-day window")) {
-    return `${product.slice(0, -"7-day window".length)}${messages.sevenDay}`;
+  if (
+    (/^7(?:[- ]?day)/u.test(normalized) && /limit|window/u.test(normalized)) ||
+    normalized === "7-day window" ||
+    normalized === "7-day limit"
+  ) {
+    return messages.sevenDay;
+  }
+  if (
+    (/^weekly|week/u.test(normalized) && /limit|window/u.test(normalized)) ||
+    normalized === "weekly window" ||
+    normalized === "weekly limit"
+  ) {
+    return messages.weekly;
+  }
+  if (product.endsWith(" · 5-hour window") || product.endsWith(" · 5-hour limit")) {
+    const prefix = product.split(" · ")[0];
+    return `${prefix} · ${messages.fiveHour}`;
+  }
+  if (product.endsWith(" · 7-day window") || product.endsWith(" · 7-day limit")) {
+    const prefix = product.split(" · ")[0];
+    return `${prefix} · ${messages.sevenDay}`;
+  }
+  if (product.endsWith(" · Weekly window") || product.endsWith(" · Weekly limit")) {
+    const prefix = product.split(" · ")[0];
+    return `${prefix} · ${messages.sevenDay}`;
   }
   return product;
 }
 
 function toneColor(tone: RendererCreditsTone): string {
-  if (tone === "hot") return "#c45c4a";
-  if (tone === "warn") return "#c9a227";
-  return "#3d9a64";
+  if (tone === "hot") return "#dc2626";
+  if (tone === "warn") return "#d97706";
+  return "color-mix(in srgb, currentColor 68%, transparent)";
 }
 
 function remainingPercent(usedPercent: number): number {
   return Math.min(100, Math.max(0, 100 - usedPercent));
 }
 
-function renderCreditsBar(usagePercent: number, color: string): HTMLDivElement {
+function renderCreditsBar(
+  usagePercent: number,
+  color: string,
+  tone: RendererCreditsTone,
+): HTMLDivElement {
   const track = document.createElement("div");
   track.dataset.codexhostCreditsBar = "";
-  track.style.height = "5px";
-  track.style.borderRadius = "3px";
-  track.style.background = "color-mix(in srgb, currentColor 15%, transparent)";
+  track.style.height = "2.5px";
+  track.style.borderRadius = "2px";
+  track.style.background = "color-mix(in srgb, currentColor 8%, transparent)";
   track.style.overflow = "hidden";
   const fill = document.createElement("span");
   fill.style.display = "block";
   fill.style.height = "100%";
-  fill.style.borderRadius = "3px";
+  fill.style.borderRadius = "2px";
   fill.style.width = `${Math.min(100, Math.max(0, usagePercent))}%`;
-  fill.style.background = color;
+  fill.style.background =
+    tone === "ok" ? "color-mix(in srgb, currentColor 68%, transparent)" : color;
   track.append(fill);
   return track;
 }
@@ -167,117 +211,189 @@ function renderCreditsMeter(
   locale: RendererSettingsLocale,
   messages: RendererCreditsMessages,
   resetsAt: string | undefined,
-  featured: boolean,
 ): HTMLDivElement {
-  const color = toneColor(rendererCreditsTone(usagePercent));
+  const tone = rendererCreditsTone(usagePercent);
+  const color = toneColor(tone);
   const remaining = remainingPercent(usagePercent);
   const meter = document.createElement("div");
-  meter.style.display = "grid";
-  meter.style.gap = "6px";
+  meter.style.display = "flex";
+  meter.style.flexDirection = "column";
+  meter.style.gap = "4px";
   meter.style.boxSizing = "border-box";
-  meter.style.marginBottom = "0";
-  meter.style.padding = featured ? "8px 0 9px" : "7px 0 8px";
-  meter.style.borderBottom = "1px solid color-mix(in srgb, currentColor 12%, transparent)";
+  meter.style.margin = "0";
+  meter.style.padding = "0";
   meter.setAttribute("aria-label", periodLabel);
 
   const top = document.createElement("div");
   top.style.display = "flex";
-  top.style.alignItems = "flex-start";
+  top.style.alignItems = "baseline";
   top.style.justifyContent = "space-between";
-  top.style.gap = "12px";
+  top.style.gap = "8px";
 
-  // Same left-label / right-percent column order as each tile below, so the
-  // reset line always lands under its own label instead of zig-zagging sides.
-  const left = document.createElement("div");
   const label = document.createElement("div");
   label.textContent = periodLabel;
-  label.style.fontSize = featured ? "12.5px" : "12px";
-  label.style.fontWeight = "600";
-  left.append(label);
-  if (resetsAt) {
-    const reset = document.createElement("div");
-    reset.textContent = resetLabel(resetsAt, locale, messages);
-    reset.style.marginTop = "2px";
-    reset.style.fontSize = "10.5px";
-    reset.style.color = "color-mix(in srgb, currentColor 62%, transparent)";
-    reset.style.fontVariantNumeric = "tabular-nums";
-    left.append(reset);
-  }
+  label.style.fontSize = "12px";
+  label.style.fontWeight = "500";
+  label.style.color = "var(--settings-text, currentColor)";
+  label.style.whiteSpace = "nowrap";
+  label.style.overflow = "hidden";
+  label.style.textOverflow = "ellipsis";
 
   const value = document.createElement("div");
   value.style.display = "flex";
   value.style.alignItems = "baseline";
-  value.style.gap = "4px";
-  value.style.color = color;
+  value.style.gap = "3px";
+  value.style.color = tone === "ok" ? "currentColor" : color;
+  value.style.whiteSpace = "nowrap";
+
   const remainingLabel = document.createElement("span");
-  remainingLabel.textContent = messages.remaining;
+  remainingLabel.textContent = `${messages.remaining} `;
   remainingLabel.style.fontSize = "10.5px";
-  remainingLabel.style.fontWeight = "500";
-  remainingLabel.style.opacity = "0.78";
+  remainingLabel.style.fontWeight = "400";
+  remainingLabel.style.opacity = "0.75";
+
   const remainingValue = document.createElement("span");
   remainingValue.textContent = formatRendererCreditsPercent(remaining);
-  remainingValue.style.fontSize = featured ? "19px" : "16px";
-  remainingValue.style.fontWeight = "650";
+  remainingValue.style.fontSize = "13px";
+  remainingValue.style.fontWeight = "600";
   remainingValue.style.fontVariantNumeric = "tabular-nums";
   remainingValue.style.lineHeight = "1";
   value.append(remainingLabel, remainingValue);
 
-  top.append(left, value);
+  top.append(label, value);
 
-  meter.append(top, renderCreditsBar(remaining, color));
+  meter.append(top, renderCreditsBar(remaining, color, tone));
+
+  if (resetsAt) {
+    const reset = document.createElement("div");
+    reset.textContent = resetLabel(resetsAt, locale, messages);
+    reset.style.fontSize = "10.5px";
+    reset.style.color = "color-mix(in srgb, currentColor 55%, transparent)";
+    reset.style.fontVariantNumeric = "tabular-nums";
+    reset.style.lineHeight = "1.2";
+    meter.append(reset);
+  }
+
   return meter;
 }
 
-function renderCreditsHeader(
+export interface RendererCreditsOptions {
+  readonly agent?: string;
+  readonly modelId?: string | null;
+}
+
+interface ResolvedCreditMeter {
+  readonly label: string;
+  readonly usagePercent: number;
+  readonly resetsAt?: string;
+}
+
+export function resolveAdaptiveMeters(
   credits: AccountCreditsSnapshot,
   locale: RendererSettingsLocale,
   messages: RendererCreditsMessages,
-): HTMLDivElement {
-  return renderCreditsMeter(
-    creditsPeriodLabel(credits.periodType, locale),
-    credits.usedPercent,
-    locale,
-    messages,
-    credits.resetsAt,
-    true,
-  );
-}
+  options?: RendererCreditsOptions,
+): {
+  readonly meters: readonly ResolvedCreditMeter[];
+  readonly headlineUsage: number;
+} {
+  const products = credits.productUsage ?? [];
+  const isAntigravity = options?.agent === "antigravity" || isAntigravityProductList(products);
 
-function renderCreditsTile(
-  label: string,
-  usagePercent: number,
-  locale: RendererSettingsLocale,
-  messages: RendererCreditsMessages,
-  resetsAt?: string,
-): HTMLDivElement {
-  return renderCreditsMeter(label, usagePercent, locale, messages, resetsAt, false);
-}
+  if (isAntigravity && products.length > 0) {
+    const is3PModel = Boolean(options?.modelId && /claude|gpt|\b3p\b/i.test(options.modelId));
+    const targetGroup = is3PModel ? "other" : "own";
+    const groupName = is3PModel ? messages.threePGroup : messages.geminiGroup;
 
-function renderDetails(
-  popover: HTMLDivElement,
-  credits: AccountCreditsSnapshot,
-  locale: RendererSettingsLocale,
-): void {
-  const messages = rendererCreditsMessages(locale);
-  popover.setAttribute("aria-label", messages.details);
-  popover.replaceChildren();
-  const meters = [renderCreditsHeader(credits, locale, messages)];
-  const tiles = (credits.productUsage ?? []).map((product) =>
-    renderCreditsTile(
-      productLabel(product.product, locale),
-      product.usagePercent,
-      locale,
-      messages,
-      product.resetsAt,
-    ),
-  );
-  meters.push(...tiles);
-  const lastMeter = meters.at(-1);
-  if (lastMeter) {
-    lastMeter.style.marginBottom = "0";
-    lastMeter.style.borderBottom = "0";
+    const matchesTargetGroup = (p: string): boolean => {
+      const n = p.trim().toLowerCase();
+      if (targetGroup === "other") {
+        return /\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(n);
+      }
+      return (
+        /gemini|native|first[- ]party|自有/u.test(n) ||
+        /^(weekly|5[- ]?hour|7[- ]?day) (limit|window)/u.test(n)
+      );
+    };
+
+    let fiveHourBucket: { usagePercent: number; resetsAt?: string } | null = null;
+    let weeklyBucket: { usagePercent: number; resetsAt?: string } | null = null;
+
+    for (const p of products) {
+      if (!matchesTargetGroup(p.product)) continue;
+      const n = p.product.trim().toLowerCase();
+      const is5h = /5(?:[- ]?hour|h)|five[- ]?hour/u.test(n);
+      const isWeekly = /7(?:[- ]?day)|weekly|week/u.test(n);
+
+      if (is5h && (!fiveHourBucket || p.usagePercent > fiveHourBucket.usagePercent)) {
+        fiveHourBucket = {
+          usagePercent: p.usagePercent,
+          ...(p.resetsAt ? { resetsAt: p.resetsAt } : {}),
+        };
+      }
+      if (isWeekly && (!weeklyBucket || p.usagePercent > weeklyBucket.usagePercent)) {
+        weeklyBucket = {
+          usagePercent: p.usagePercent,
+          ...(p.resetsAt ? { resetsAt: p.resetsAt } : {}),
+        };
+      }
+    }
+
+    if (targetGroup === "own" && !fiveHourBucket && credits.periodType === "five_hour") {
+      fiveHourBucket = {
+        usagePercent: credits.usedPercent,
+        ...(credits.resetsAt ? { resetsAt: credits.resetsAt } : {}),
+      };
+    }
+    if (
+      targetGroup === "own" &&
+      !weeklyBucket &&
+      (credits.periodType === "weekly" || credits.periodType === "seven_day")
+    ) {
+      weeklyBucket = {
+        usagePercent: credits.usedPercent,
+        ...(credits.resetsAt ? { resetsAt: credits.resetsAt } : {}),
+      };
+    }
+
+    const meters: ResolvedCreditMeter[] = [];
+    if (fiveHourBucket) {
+      meters.push({
+        label: `${messages.fiveHour} (${groupName})`,
+        usagePercent: fiveHourBucket.usagePercent,
+        ...(fiveHourBucket.resetsAt ? { resetsAt: fiveHourBucket.resetsAt } : {}),
+      });
+    }
+    if (weeklyBucket) {
+      meters.push({
+        label: `${messages.sevenDay} (${groupName})`,
+        usagePercent: weeklyBucket.usagePercent,
+        ...(weeklyBucket.resetsAt ? { resetsAt: weeklyBucket.resetsAt } : {}),
+      });
+    }
+
+    if (meters.length > 0) {
+      const headline = fiveHourBucket
+        ? fiveHourBucket.usagePercent
+        : (weeklyBucket?.usagePercent ?? credits.usedPercent);
+      return { meters, headlineUsage: headline };
+    }
   }
-  popover.append(...meters);
+
+  const meters: ResolvedCreditMeter[] = [
+    {
+      label: credits.label ?? creditsPeriodLabel(credits.periodType, locale),
+      usagePercent: credits.usedPercent,
+      ...(credits.resetsAt ? { resetsAt: credits.resetsAt } : {}),
+    },
+    ...products.map((product) => ({
+      label: productLabel(product.product, locale),
+      usagePercent: product.usagePercent,
+      ...(product.resetsAt ? { resetsAt: product.resetsAt } : {}),
+    })),
+  ];
+
+  return { meters, headlineUsage: credits.usedPercent };
 }
 
 function popoverIsOpen(popover: HTMLDivElement): boolean {
@@ -290,7 +406,7 @@ function popoverIsOpen(popover: HTMLDivElement): boolean {
 
 function positionPopover(control: Pick<RendererCreditsControl, "trigger" | "popover">): void {
   const triggerRect = control.trigger.getBoundingClientRect();
-  const width = Math.min(300, Math.max(240, window.innerWidth - 24));
+  const width = Math.min(218, Math.max(200, window.innerWidth - 24));
   const left = Math.max(12, Math.min(triggerRect.left, window.innerWidth - width - 12));
   control.popover.style.width = `${width}px`;
   control.popover.style.left = `${left}px`;
@@ -378,13 +494,16 @@ export function mountRendererCreditsControl(composerId: string): RendererCredits
   popover.hidden = typeof popover.showPopover !== "function";
   popover.style.position = "fixed";
   popover.style.inset = "auto";
-  popover.style.width = "280px";
-  popover.style.maxWidth = "min(300px, calc(100vw - 24px))";
-  popover.style.padding = "10px 12px";
+  popover.style.width = "218px";
+  popover.style.maxWidth = "min(218px, calc(100vw - 24px))";
+  popover.style.padding = "10px 14px";
   applyRendererPopoverChrome(popover);
-  popover.style.borderRadius = "10px";
+  popover.style.borderRadius = "12px";
   popover.style.boxShadow =
-    "light-dark(0 6px 18px rgba(15, 23, 42, 0.14), 0 10px 24px rgba(0, 0, 0, 0.32))";
+    "light-dark(0 4px 16px rgba(0, 0, 0, 0.08), 0 8px 24px rgba(0, 0, 0, 0.28))";
+  popover.style.display = "flex";
+  popover.style.flexDirection = "column";
+  popover.style.gap = "10px";
   popover.style.font = "13px/1.35 system-ui, sans-serif";
   popover.style.letterSpacing = "0";
   popover.style.zIndex = "2147483647";
@@ -466,24 +585,35 @@ export function renderRendererCreditsControl(
   control: RendererCreditsControl,
   accountCredits: AccountCreditsSnapshot | null,
   locale: RendererSettingsLocale = "en",
+  options?: RendererCreditsOptions,
 ): boolean {
   if (accountCredits === null) {
     control.root.style.display = "none";
     closePopover(control);
     return false;
   }
-  const remaining = remainingPercent(accountCredits.usedPercent);
+  const messages = rendererCreditsMessages(locale);
+  const { meters, headlineUsage } = resolveAdaptiveMeters(
+    accountCredits,
+    locale,
+    messages,
+    options,
+  );
+
+  const remaining = remainingPercent(headlineUsage);
   const percent = formatRendererCreditsPercent(remaining);
-  const title = `${creditsPeriodLabel(accountCredits.periodType)} ${percent}`;
-  const tone = rendererCreditsTone(accountCredits.usedPercent);
+  const title = `${meters[0]?.label ?? creditsPeriodLabel(accountCredits.periodType, locale)} ${percent}`;
+  const tone = rendererCreditsTone(headlineUsage);
   const ringSlot = control.trigger.querySelector<HTMLElement>("[data-codexhost-credits-ring]");
   const label = control.trigger.querySelector<HTMLElement>("[data-codexhost-credits-label]");
   if (ringSlot) {
     ringSlot.replaceChildren(
       createRendererUsageRing(remaining, {
         size: 14,
-        strokeWidth: 2.4,
-        color: toneColor(tone),
+        strokeWidth: 2,
+        color:
+          tone === "ok" ? "color-mix(in srgb, currentColor 68%, transparent)" : toneColor(tone),
+        trackColor: "color-mix(in srgb, currentColor 10%, transparent)",
       }),
     );
   }
@@ -491,6 +621,9 @@ export function renderRendererCreditsControl(
   control.root.style.display = "inline-flex";
   control.trigger.setAttribute("aria-label", title);
   control.trigger.title = title;
-  renderDetails(control.popover, accountCredits, locale);
+  control.popover.setAttribute("aria-label", messages.details);
+  control.popover.replaceChildren(
+    ...meters.map((m) => renderCreditsMeter(m.label, m.usagePercent, locale, messages, m.resetsAt)),
+  );
   return true;
 }

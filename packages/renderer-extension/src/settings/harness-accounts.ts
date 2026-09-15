@@ -330,25 +330,23 @@ export function mountHarnessAccounts(
       identity.className = "settings-harness-account__identity";
       const name = document.createElement("strong");
       name.className = "settings-account-email";
-      const accountName = account.email ?? account.label;
-      name.textContent = accountName ?? account.harnessName;
+      const accountTitle = account.label ?? account.email ?? account.harnessName;
+      name.textContent = accountTitle;
       name.title = name.textContent;
       identity.append(name);
       const metadata = document.createElement("div");
       metadata.className = "settings-account-metadata";
-      if (accountName) {
-        const harness = document.createElement("span");
-        harness.className = "settings-account-provider";
-        harness.textContent = account.harnessName;
-        metadata.append(harness);
-      }
+      const subtitleText = account.label && account.email ? account.email : account.harnessName;
+      const subtitle = document.createElement("span");
+      subtitle.className = "settings-account-provider";
+      subtitle.textContent = subtitleText;
+      subtitle.title = subtitleText;
+      metadata.append(subtitle);
       if (account.plan) {
-        if (accountName) {
-          const separator = document.createElement("span");
-          separator.textContent = "·";
-          separator.setAttribute("aria-hidden", "true");
-          metadata.append(separator);
-        }
+        const separator = document.createElement("span");
+        separator.textContent = "·";
+        separator.setAttribute("aria-hidden", "true");
+        metadata.append(separator);
         const plan = document.createElement("span");
         plan.className = "settings-account-plan";
         plan.textContent = account.plan;
@@ -511,7 +509,7 @@ export function mountHarnessAccounts(
         removeBtn.title = messages.accountDelete;
         removeBtn.setAttribute(
           "aria-label",
-          `${messages.accountDelete}: ${accountName ?? account.harnessName}`,
+          `${messages.accountDelete}: ${accountTitle ?? account.harnessName}`,
         );
         removeBtn.disabled = selecting || loggingInAccountId !== null || deletingAccountId !== null;
         removeBtn.append(createRendererSettingsIcon("trash", 16));

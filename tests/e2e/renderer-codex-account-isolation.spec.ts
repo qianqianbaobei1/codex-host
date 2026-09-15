@@ -15,7 +15,7 @@ const { outputFiles } = await build({
       let routeReady = !globalThis.delayedHost;
       const calls = [];
       const pending = new Map();
-      const paused = new Set();
+      const paused = new Set(globalThis.initialPaused ?? []);
       const accounts = (host) => ["default", "other"].map((accountId) => ({
         accountId, label: host + "-" + accountId,
         email: host + "-" + accountId + "@example.com",
@@ -172,7 +172,7 @@ const browserBundle = outputFiles[0]?.text;
 if (!browserBundle) throw new Error("Account isolation bundle was not generated");
 const browserBundleText: string = browserBundle;
 
-async function setup(page: Page, options: Record<string, boolean> = {}): Promise<void> {
+async function setup(page: Page, options: Record<string, unknown> = {}): Promise<void> {
   await page.setContent("<!doctype html><body></body>");
   await page.evaluate((flags) => Object.assign(globalThis, flags), options);
   await page.addScriptTag({ content: browserBundleText });
@@ -326,12 +326,11 @@ test("a delayed account selection cannot apply a local override to a new Host po
 test("late local Account and quota responses cannot overwrite the remote Composer", async ({
   page,
 }) => {
-  await setup(page);
+  await setup(page, { initialPaused: ["local:usage:default"] });
   await action(page, "pause", "local:usage:default");
-  await action(page, "focus");
-  await waitForPending(page, "local:usage:default");
   await action(page, "pause", "local:accounts");
   await action(page, "focus");
+  await waitForPending(page, "local:usage:default");
   await waitForPending(page, "local:accounts");
   await action(page, "switchHost", "remote");
   await expect(page.locator(trigger)).toHaveAttribute("title", /remote-default/);

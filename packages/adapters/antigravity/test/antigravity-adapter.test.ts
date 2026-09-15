@@ -1097,4 +1097,157 @@ describe("AntigravityAdapter", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("treats completed turn with transient network retry error as succeeded without surfacing error banner", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-net-retry-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transport: AntigravityCliTransportLike = {
+      conversationId: "conv-net-retry-1",
+      logPath: null,
+      async start() {
+        return { conversationId: "conv-net-retry-1", cwd: root, model: MODEL };
+      },
+      async setModel(model: string) {
+        return { conversationId: "conv-net-retry-1", cwd: root, model };
+      },
+      async setEffort() {
+        return { conversationId: "conv-net-retry-1", cwd: root, model: MODEL };
+      },
+      async setPermissionMode() {
+        return { conversationId: "conv-net-retry-1", cwd: root, model: MODEL };
+      },
+      async runTurn(_text, onStep) {
+        onStep({ stepType: "agent_response", textDelta: "Full response generated after retry." });
+        return {
+          conversationId: "conv-net-retry-1",
+          status: "ERROR",
+          error:
+            'API error (attempt 2): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": read tcp 127.0.0.1:50999->127.0.0.1:7897: read: connection reset by peer',
+          response: "Full response generated after retry.",
+          numTurns: 1,
+        };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport, listModels },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const outputs = waitForTurn(session);
+      const command: TurnStartCommand = {
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("turn-net-retry-1"),
+        input: [{ type: "text", text: "Hello" }],
+      };
+      await session.execute(command);
+      const events = await outputs;
+      const completedEvent = events.find(
+        (e) => e.kind === "event" && e.event.type === "turn.completed",
+      );
+      expect(completedEvent).toBeDefined();
+      if (completedEvent && completedEvent.kind === "event" && completedEvent.event.type === "turn.completed") {
+        expect(completedEvent.event.outcome.status).toBe("succeeded");
+        expect((completedEvent.event.outcome as { error?: unknown }).error).toBeUndefined();
+      }
+      await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reroutes transient network error steps during streaming to reasoning instead of agent text", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-net-stream-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transport: AntigravityCliTransportLike = {
+      conversationId: "conv-net-stream-1",
+      logPath: null,
+      async start() {
+        return { conversationId: "conv-net-stream-1", cwd: root, model: MODEL };
+      },
+      async setModel(model: string) {
+        return { conversationId: "conv-net-stream-1", cwd: root, model };
+      },
+      async setEffort() {
+        return { conversationId: "conv-net-stream-1", cwd: root, model: MODEL };
+      },
+      async setPermissionMode() {
+        return { conversationId: "conv-net-stream-1", cwd: root, model: MODEL };
+      },
+      async runTurn(_text, onStep) {
+        onStep({ stepType: "thinking", thinkingDelta: "Analyzing..." });
+        // Simulating a transient error step that agy might send
+        onStep({
+          stepType: "error",
+          message: 'API error (attempt 1): request failed: unexpected EOF',
+        });
+        onStep({ stepType: "agent_response", textDelta: "Here is the valid answer." });
+        return {
+          conversationId: "conv-net-stream-1",
+          status: "SUCCESS",
+          response: "Here is the valid answer.",
+          numTurns: 1,
+        };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport: () => transport, listModels },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const outputs = waitForTurn(session);
+      const command: TurnStartCommand = {
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("turn-net-stream-1"),
+        input: [{ type: "text", text: "Question" }],
+      };
+      await session.execute(command);
+      const events = await outputs;
+
+      // Reasoning should contain the retry notification
+      const reasoningAppends = events.filter(
+        (e) =>
+          e.kind === "event" &&
+          e.event.type === "item.updated" &&
+          e.event.update.type === "text.append" &&
+          e.event.update.text.includes("网络连接出现波动"),
+      );
+      expect(reasoningAppends.length).toBeGreaterThan(0);
+
+      // Agent message text should NOT contain "API error"
+      const agentItems = events.filter(
+        (e) =>
+          e.kind === "event" &&
+          e.event.type === "item.started" &&
+          e.event.item.type === "agentMessage",
+      );
+      expect(agentItems.length).toBeGreaterThan(0);
+
+      await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+

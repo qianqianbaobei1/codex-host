@@ -100,7 +100,11 @@ export function readNewThreadAgentPreference(
   storage: PreferenceStorage | null = rendererStorage(),
 ): RendererAgent | undefined {
   const agent = readPreference(storage)?.lastAgent;
-  return agent && enabledAgents.has(agent) ? agent : undefined;
+  // External Harness availability depends on local login, quota, network and
+  // provider policy. Never let a persisted external choice make every new
+  // Thread unusable after a restart; the in-memory controller still preserves
+  // the last choice during the current renderer lifetime.
+  return agent === "codex" && enabledAgents.has(agent) ? agent : undefined;
 }
 
 export function readNewThreadExternalConfigurationPreference(

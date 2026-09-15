@@ -54,6 +54,7 @@ const { outputFiles } = await build({
                         harnessName: "Antigravity CLI",
                         accountId: "default",
                         label: "个人账号",
+                        email: "lure10572@gmail.com",
                         isDefault: true,
                         selectable: true,
                         credits: {
@@ -72,6 +73,7 @@ const { outputFiles } = await build({
                         harnessName: "Antigravity CLI",
                         accountId: "work",
                         label: "情倩工作",
+                        email: "lucywang027@gmail.com",
                         isDefault: false,
                         selectable: true,
                         credits: {

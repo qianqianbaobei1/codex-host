@@ -53,6 +53,7 @@ interface ModelOptionControl {
   button: HTMLButtonElement;
   check: HTMLElement;
   searchText: string;
+  hasThinkingOptions: boolean;
 }
 
 interface ThinkingOptionControl {
@@ -488,7 +489,8 @@ export function mountRendererModelPicker(
     // Keep the parent menu open while the Host confirms the selection. The
     // renderer enters `selecting` immediately, and closing both layers here
     // makes the picker look like it lost state during a slow model switch.
-    closeModelMenu();
+    if (control.options.get(target.dataset.modelId)?.hasThinkingOptions) closeModelMenu();
+    else close();
     trigger.focus();
     onSelectModel(target.dataset.modelId);
   };
@@ -633,6 +635,7 @@ function rebuildOptions(control: RendererModelPickerControl, view: RendererModel
       button,
       check,
       searchText: `${model.label} ${model.ref.id}`.toLowerCase(),
+      hasThinkingOptions: (model.supportedThinkingOptionIds?.length ?? 0) > 0,
     });
     control.modelMenu.append(button);
   }

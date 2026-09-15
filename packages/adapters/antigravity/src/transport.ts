@@ -105,6 +105,7 @@ interface AntigravityActiveTurn {
   resolve(result: AntigravityResultEvent): void;
   reject(error: AntigravityTransportError): void;
   onStep(step: AntigravityStepUpdate): void;
+  lastReportedAttempt?: number;
 }
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
@@ -122,6 +123,27 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
  */
 const QUOTA_EXHAUSTED_PATTERN =
   /RESOURCE_EXHAUSTED|Individual quota reached|quota (?:is )?(?:reached|exhausted)/iu;
+
+const RETRY_PATTERN =
+  /(?:Run:\s*)?attempt\s+(\d+)\s+failed.*?(?:retrying(?:\s*in\s*([^\r\n,\)]+))?|retrying)|API error \(attempt\s+(\d+)\)/iu;
+
+function formatRetryWait(waitStr?: string): string {
+  if (!waitStr) return "";
+  const match = waitStr.trim().match(/^([\d\.]+)\s*(ms|s|m|h)?/i);
+  if (!match || !match[1]) return waitStr.trim();
+  const val = parseFloat(match[1]);
+  const unit = (match[2] || "s").toLowerCase();
+  if (unit === "s") {
+    return `${val < 10 ? val.toFixed(1) : Math.round(val)} 秒`;
+  }
+  if (unit === "m") {
+    return `${Math.round(val)} 分钟`;
+  }
+  if (unit === "ms") {
+    return `${Math.round(val)} 毫秒`;
+  }
+  return waitStr.trim();
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -698,6 +720,7 @@ export class AntigravityCliTransport {
     child.stderr.on("data", (chunk: string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk}`);
       this.#failTurnOnQuotaExhaustion(chunk);
+      this.#handleStderrRetryNotice(chunk);
     });
     child.once("error", (error) => this.#handleProcessError(error, child));
     child.once("exit", (code, signal) => this.#handleProcessExit(child, code, signal));
@@ -772,6 +795,35 @@ export class AntigravityCliTransport {
     active.reject(normalized);
     this.#reportFault(normalized);
     void this.#terminate("SIGTERM").catch(() => undefined);
+  }
+
+  /**
+   * Sniff retry diagnostics emitted on stderr when AGY hits network disconnects
+   * or rate-limits, notifying the user via reasoning/thinking and keeping
+   * activity refreshed so the idle watchdog does not abort the Turn.
+   */
+  #handleStderrRetryNotice(chunk: string): void {
+    const active = this.#activeTurn;
+    if (!active) return;
+    const match = chunk.match(RETRY_PATTERN);
+    if (!match) return;
+
+    // A retry log confirms the child process is actively working/backoff-retrying.
+    this.#pokeActivity();
+
+    const attemptStr = match[1] ?? match[3];
+    const attempt = attemptStr ? parseInt(attemptStr, 10) : 1;
+    if (active.lastReportedAttempt === attempt) {
+      return;
+    }
+    active.lastReportedAttempt = attempt;
+
+    const wait = formatRetryWait(match[2]);
+    const waitInfo = wait ? `，将在 ${wait}后重试` : "";
+    active.onStep({
+      stepType: "thinking",
+      thinkingDelta: `\n> ⚡ 网络连接出现波动，正在自动重试（第 ${attempt} 次${waitInfo}）...\n`,
+    });
   }
 
   #handleProcessError(error: unknown, child: ChildProcessWithoutNullStreams): void {

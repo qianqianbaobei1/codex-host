@@ -9,6 +9,7 @@ import {
   AntigravityAccountStore,
   type AntigravityAccountsFileV1,
 } from "../src/accounts.js";
+import { nativeSessionRefSchema } from "@codexhost/shared-contracts";
 import {
   AntigravityAdapter,
   type AntigravityCliTransportLike,
@@ -601,6 +602,45 @@ describe("Antigravity per-Thread account routing", () => {
     }
   });
 
+  it("skips a default account whose cached quota is exhausted", async () => {
+    const { realHome, cwd, store, environment } = await setup();
+    await store.setDefaultAccount("work");
+    const accountDirectory = path.join(realHome, ".agy-accounts", "work");
+    await mkdir(accountDirectory, { recursive: true });
+    await writeFile(
+      path.join(accountDirectory, "quota-snapshot.json"),
+      JSON.stringify({
+        accountId: "work",
+        credits: {
+          usedPercent: 100,
+          periodType: "five_hour",
+          productUsage: [{ product: "Gemini 5-hour limit", usagePercent: 100 }],
+        },
+      }),
+      "utf8",
+    );
+    let captured: NodeJS.ProcessEnv | undefined;
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      {
+        listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
+        createTransport: (options) => {
+          captured = options.environment;
+          return fakeTransport("conv-quota-fallback");
+        },
+      },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect(captured?.HOME).toBe(realHome);
+      await opened.value.close();
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it("resume follows the native Session owner, not a stale Thread binding", async () => {
     const { realHome, cwd, store, environment } = await setup();
     await store.bindThread({ threadId: "thread-owner", accountId: "work", state: "committed" });
@@ -647,6 +687,68 @@ describe("Antigravity per-Thread account routing", () => {
       if (!opened.ok) return;
       expect(captured?.HOME).toBe(path.join(realHome, ".agy-accounts", "work", "home"));
       await opened.value.close();
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("reads cached history from the native Session owner's account", async () => {
+    const { realHome, cwd, store, environment } = await setup();
+    await store.bindThread({
+      threadId: "owner-thread",
+      accountId: "work",
+      nativeSessionId: "native-cache",
+      state: "committed",
+    });
+    const baseEnvironment = { ...environment };
+    delete baseEnvironment.CODEXHOST_DATA_DIR;
+    const historyDirectory = path.join(
+      realHome,
+      ".codex",
+      "codexhost-cache",
+      "antigravity-history",
+    );
+    await mkdir(historyDirectory, { recursive: true });
+    await writeFile(
+      path.join(historyDirectory, "cache-thread.json"),
+      `${JSON.stringify({
+        formatVersion: 1,
+        nativeSessionId: "native-cache",
+        turns: [
+          {
+            nativeTurnRef: {
+              harnessId: "antigravity",
+              nativeSessionId: "native-cache",
+              nativeTurnKey: "native-cache:turn:1",
+              formatVersion: 1,
+            },
+            input: [{ type: "text", text: "cached" }],
+            items: [],
+            outcome: { status: "succeeded" },
+          },
+        ],
+      })}\n`,
+      "utf8",
+    );
+    const adapter = new AntigravityAdapter({
+      accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
+      environment: baseEnvironment,
+    });
+    try {
+      const result = await adapter.readCachedSnapshot({
+        kind: "resume",
+        cwd,
+        environment: { ...baseEnvironment, CODEXHOST_THREAD_ID: "cache-thread" },
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "antigravity",
+          nativeSessionId: "native-cache",
+          formatVersion: 1,
+        }),
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok || !result.value) throw new Error("Cached history was not returned");
+      expect(result.value.turns[0]?.input[0]?.text).toBe("cached");
     } finally {
       await adapter.close();
     }
@@ -708,6 +810,46 @@ describe("Antigravity per-Thread account routing", () => {
       const rows = await adapter.inspectAccounts();
       const workRow = rows?.find((r) => r.accountId === "work");
       expect(workRow?.credits?.usedPercent).toBe(20);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("does not use the global quota files for a multi-account listing", async () => {
+    const { store, environment } = await setup();
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      { listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }) },
+    );
+    try {
+      const rows = await adapter.inspectAccounts();
+      expect(rows?.every((row) => row.credits === undefined)).toBe(true);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("rejects an account snapshot carrying another account's identity", async () => {
+    const { store, realHome, environment } = await setup();
+    await store.setEmail("work", "lucy@example.com");
+    const snapshotFile = path.join(realHome, ".agy-accounts", "work", "quota-snapshot.json");
+    await mkdir(path.dirname(snapshotFile), { recursive: true });
+    await writeFile(
+      snapshotFile,
+      JSON.stringify({
+        accountId: "work",
+        email: "other@example.com",
+        credits: { usedPercent: 20, periodType: "five_hour" },
+      }),
+      "utf8",
+    );
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      { listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }) },
+    );
+    try {
+      const workRow = (await adapter.inspectAccounts())?.find((row) => row.accountId === "work");
+      expect(workRow?.credits).toBeUndefined();
     } finally {
       await adapter.close();
     }

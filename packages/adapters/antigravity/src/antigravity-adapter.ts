@@ -5,7 +5,14 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -74,7 +81,7 @@ import {
   resolveAntigravityExecutable,
   resolveAntigravityProxyEnvironment,
 } from "./command.js";
-import { readAntigravityCreditsSync } from "./credits.js";
+import { antigravityQuotaAvailableForModel, readAntigravityCreditsSync } from "./credits.js";
 import { pollAntigravityContextUsage } from "./context-usage.js";
 import { projectAntigravityFileChange } from "./file-change.js";
 import { loadAntigravitySnapshot, mergeAntigravityHistoryTurns } from "./history.js";
@@ -107,7 +114,11 @@ import {
   type AntigravityAccountsLoad,
   type AntigravityKeychainRelease,
 } from "./accounts.js";
-import { antigravityToolErrorMessage, isAntigravityPermissionDenial } from "./stream-events.js";
+import {
+  antigravityToolErrorMessage,
+  isAntigravityPermissionDenial,
+  isTransientNetworkErrorMessage,
+} from "./stream-events.js";
 import { parseToolArgs } from "./transcript.js";
 import {
   AntigravityCliTransport,
@@ -482,7 +493,7 @@ function stepToolOutput(step: AntigravityStepUpdate): unknown {
 }
 
 function isSuccessfulStatus(status: string): boolean {
-  return status === "SUCCESS";
+  return status === "SUCCESS" || status === "COMPLETED";
 }
 
 function isCancelledStatus(status: string): boolean {
@@ -757,19 +768,36 @@ class AntigravityHarnessSession implements HarnessSession {
       // surfaced error; the failed tool item already carries the detail.
       const deniedEmptyTurn =
         active.permissionDenial !== null && !active.agent && !active.agentText;
-      const outcome = deniedEmptyTurn
-        ? {
-            status: "failed" as const,
-            error: this.#permissionDeniedError(),
-          }
-        : isSuccessfulStatus(result.status)
-          ? ({ status: "succeeded" } satisfies TurnOutcome)
-          : isCancelledStatus(result.status)
-            ? ({
-                status: "cancelled",
-                reason: result.error ?? "Cancelled by user",
-              } satisfies TurnOutcome)
-            : ({ status: "failed", error: errorFromResult(result) } satisfies TurnOutcome);
+      const hasResponse =
+        (typeof result.response === "string" && result.response.trim().length > 0) ||
+        active.agentText.trim().length > 0;
+      const isTransientNetErr =
+        typeof result.error === "string" && isTransientNetworkErrorMessage(result.error);
+
+      let outcome: TurnOutcome;
+      if (deniedEmptyTurn) {
+        outcome = {
+          status: "failed" as const,
+          error: this.#permissionDeniedError(),
+        };
+      } else if (isSuccessfulStatus(result.status)) {
+        outcome = { status: "succeeded" };
+        if (result.error && isTransientNetworkErrorMessage(result.error)) {
+          delete result.error;
+        }
+      } else if (isCancelledStatus(result.status)) {
+        outcome = {
+          status: "cancelled",
+          reason: result.error ?? "Cancelled by user",
+        };
+      } else if (hasResponse && (isTransientNetErr || !result.error)) {
+        // If the Turn produced assistant output and the error was an underlying network retry
+        // or EOF glitch, treat the Turn as succeeded so the UI does not display an error banner.
+        outcome = { status: "succeeded" };
+        delete result.error;
+      } else {
+        outcome = { status: "failed", error: errorFromResult(result) };
+      }
       await this.#persistLedger(active, result, outcome);
       this.#completeTurn(active, outcome, result);
       this.#recordSidecarTurn(active, outcome, result);
@@ -886,8 +914,12 @@ class AntigravityHarnessSession implements HarnessSession {
         (typeof step.content === "string" ? step.content : undefined) ??
         (typeof step.message === "string" ? step.message : undefined);
       if (textCandidate) {
-        this.#completeReasoning(active, { status: "succeeded" });
-        this.#appendOrSyncAgentText(active, textCandidate, hasExplicitDelta);
+        if (isTransientNetworkErrorMessage(textCandidate)) {
+          this.#appendReasoning(active, "\n> ⚡ 网络连接出现波动，正在自动重试...\n");
+        } else {
+          this.#completeReasoning(active, { status: "succeeded" });
+          this.#appendOrSyncAgentText(active, textCandidate, hasExplicitDelta);
+        }
       }
     }
     if (step.stepType !== "tool") return;
@@ -1482,6 +1514,7 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly #creditsRefreshStartedAt = new Map<string, number>();
   readonly #accountCooldownUntil = new Map<string, number>();
   readonly #loginMonitors = new Map<string, Promise<void>>();
+  readonly #accountEmails = new Map<string, string>();
 
   constructor(
     options: AntigravityAdapterOptions = {},
@@ -1498,8 +1531,10 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#listModels = dependencies.listModels ?? defaultListModels;
     this.#accounts = options.accounts ?? { mode: "legacy" };
     this.#accountsRealHome = antigravityRealHome({ ...process.env, ...options.environment });
-    const initialCredits = readAntigravityCreditsSync();
-    if (initialCredits) this.#creditsByAccount.set(LEGACY_ACCOUNT_KEY, initialCredits);
+    if (this.#accounts.mode !== "multi") {
+      const initialCredits = readAntigravityCreditsSync();
+      if (initialCredits) this.#creditsByAccount.set(LEGACY_ACCOUNT_KEY, initialCredits);
+    }
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
@@ -1606,7 +1641,18 @@ export class AntigravityAdapter implements HarnessAdapter {
     input: ResumeSessionInput,
   ): Promise<HarnessResult<HostThreadSnapshot | null>> {
     try {
-      const environment = this.#environment(input.environment);
+      const nativeOwner =
+        this.#accounts.mode === "multi"
+          ? this.#accounts.store.accountForNativeSession(input.nativeRef.nativeSessionId)
+          : null;
+      const environment = this.#environment(
+        nativeOwner
+          ? {
+              ...(input.environment ?? {}),
+              [ANTIGRAVITY_ACCOUNT_ID_ENV]: nativeOwner.id,
+            }
+          : input.environment,
+      );
       const history = await AntigravityHistory.open({
         environment,
         nativeSessionId: input.nativeRef.nativeSessionId,
@@ -1680,6 +1726,45 @@ export class AntigravityAdapter implements HarnessAdapter {
     return this.#creditsFor(this.#creditsKey());
   }
 
+  #resolveAccountEmail(account: AntigravityAccount): string | undefined {
+    if (account.email) return account.email;
+    const cached = this.#accountEmails.get(account.id);
+    if (cached) return cached;
+    const logDir = account.legacy
+      ? path.join(this.#accountsRealHome, ".gemini", "antigravity-cli", "log")
+      : path.join(
+          antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
+          account.id,
+          "home",
+          ".gemini",
+          "antigravity-cli",
+          "log",
+        );
+    try {
+      if (existsSync(logDir)) {
+        const files = readdirSync(logDir)
+          .filter((f) => f.startsWith("cli-") && f.endsWith(".log"))
+          .sort()
+          .reverse();
+        for (const f of files.slice(0, 5)) {
+          const content = readFileSync(path.join(logDir, f), "utf8");
+          const m = /applyAuthResult:\s*email=([^\s,]+)/u.exec(content);
+          if (m?.[1]) {
+            const email = m[1].trim();
+            this.#accountEmails.set(account.id, email);
+            if (this.#accounts.mode === "multi") {
+              void this.#accounts.store.setEmail(account.id, email).catch(() => undefined);
+            }
+            return email;
+          }
+        }
+      }
+    } catch {
+      // Ignore read errors
+    }
+    return undefined;
+  }
+
   /**
    * One row per configured account. Listing accounts is metadata-only: it must
    * never run AGY or trigger OAuth just to paint the picker.
@@ -1694,9 +1779,11 @@ export class AntigravityAdapter implements HarnessAdapter {
         .filter((account) => account.enabled)
         .map(async (account): Promise<HarnessAccountSnapshot> => {
           const credits = this.#creditsFor(account.id);
+          const email = this.#resolveAccountEmail(account);
           return {
             accountId: account.id,
             label: account.name,
+            ...(email ? { email } : {}),
             isDefault: account.id === defaultAccountId,
             selectable: this.#isAccountUsable(account),
             authState: account.state ?? "ready",
@@ -1880,7 +1967,10 @@ export class AntigravityAdapter implements HarnessAdapter {
     return this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
   }
 
-  #readAccountSnapshotSync(accountId: string): AccountCreditsSnapshot | null {
+  #readAccountSnapshotSync(
+    accountId: string,
+    expectedEmail?: string,
+  ): AccountCreditsSnapshot | null {
     try {
       const snapshotPath = path.join(
         antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
@@ -1890,6 +1980,18 @@ export class AntigravityAdapter implements HarnessAdapter {
       if (!existsSync(snapshotPath)) return null;
       const text = readFileSync(snapshotPath, "utf8");
       const parsed = JSON.parse(text);
+      if (isRecord(parsed) && "credits" in parsed) {
+        if (parsed.accountId !== accountId) return null;
+        if (
+          expectedEmail &&
+          (typeof parsed.email !== "string" ||
+            parsed.email.trim().toLowerCase() !== expectedEmail.trim().toLowerCase())
+        ) {
+          return null;
+        }
+        const envelopeCredits = accountCreditsSnapshotSchema.safeParse(parsed.credits);
+        return envelopeCredits.success ? envelopeCredits.data : null;
+      }
       const result = accountCreditsSnapshotSchema.safeParse(parsed);
       return result.success ? result.data : null;
     } catch {
@@ -1898,13 +2000,33 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   #writeAccountSnapshotSync(accountId: string, credits: AccountCreditsSnapshot): void {
+    if (this.#accounts.mode !== "multi") return;
     try {
-      const snapshotPath = path.join(
+      const account = this.#accounts.store.get(accountId);
+      if (!account) return;
+      const accountDir = path.join(
         antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
         accountId,
-        "quota-snapshot.json",
       );
-      writeFileSync(snapshotPath, JSON.stringify(credits, null, 2), "utf8");
+      if (!existsSync(accountDir)) {
+        mkdirSync(accountDir, { recursive: true, mode: 0o700 });
+      }
+      const snapshotPath = path.join(accountDir, "quota-snapshot.json");
+      writeFileSync(
+        snapshotPath,
+        JSON.stringify(
+          {
+            accountId,
+            ...(account.email ? { email: account.email } : {}),
+            credits,
+          },
+          null,
+          2,
+        ),
+        { encoding: "utf8", mode: 0o600 },
+      );
+      chmodSync(accountDir, 0o700);
+      chmodSync(snapshotPath, 0o600);
     } catch {
       // Ignore write errors
     }
@@ -1912,16 +2034,16 @@ export class AntigravityAdapter implements HarnessAdapter {
 
   #creditsFor(key: string): AccountCreditsSnapshot | null {
     let credits = this.#creditsByAccount.get(key) ?? null;
-    // The statusline fallback is produced by the host-level agy process, so it
-    // only ever describes the legacy account (including a configured
-    // multi-account entry explicitly marked as legacy).
-    const account = this.#accounts.mode === "multi" ? this.#accounts.store.get(key) : null;
-    if (!credits && (key === LEGACY_ACCOUNT_KEY || account?.legacy === true)) {
-      credits = readAntigravityCreditsSync();
+    if (!credits && this.#accounts.mode === "multi") {
+      const account = this.#accounts.store.get(key);
+      credits = this.#readAccountSnapshotSync(key, account?.email);
       if (credits) this.#creditsByAccount.set(key, credits);
     }
-    if (!credits && account && !account.legacy) {
-      credits = this.#readAccountSnapshotSync(account.id);
+    // In multi-account mode the global /tmp files are intentionally never a
+    // fallback: they have no stable account ownership and are overwritten by
+    // whichever AGY process ran most recently.
+    if (!credits && this.#accounts.mode !== "multi" && key === LEGACY_ACCOUNT_KEY) {
+      credits = readAntigravityCreditsSync();
       if (credits) this.#creditsByAccount.set(key, credits);
     }
     return credits;
@@ -1979,9 +2101,7 @@ export class AntigravityAdapter implements HarnessAdapter {
             : {}),
         };
         this.#creditsByAccount.set(key, credits);
-        if (key !== LEGACY_ACCOUNT_KEY) {
-          this.#writeAccountSnapshotSync(key, credits);
-        }
+        this.#writeAccountSnapshotSync(key, credits);
         return credits;
       }
     } catch {
@@ -2084,6 +2204,24 @@ export class AntigravityAdapter implements HarnessAdapter {
         error: {
           code: "unavailable",
           message: `Antigravity account '${account.name}' is unavailable or in cooldown`,
+          retryable: true,
+        },
+      };
+    }
+    if (
+      account &&
+      this.#accounts.mode === "multi" &&
+      input.kind === "create" &&
+      !this.#accountCanUseModel(
+        account,
+        input.model ? this.#requestedModelSlug(input.model) : undefined,
+      )
+    ) {
+      return {
+        ok: false,
+        error: {
+          code: "unavailable",
+          message: `Antigravity account '${account.name}' has no remaining quota for the selected Model; switch accounts or wait for the quota to reset`,
           retryable: true,
         },
       };
@@ -2647,6 +2785,8 @@ export class AntigravityAdapter implements HarnessAdapter {
    */
   #resolveAccountForOpen(input: OpenSessionInput): AntigravityAccount | null {
     if (this.#accounts.mode !== "multi") return null;
+    const requestedModel =
+      input.kind === "create" ? this.#requestedModelSlug(input.model) : undefined;
     const marker = input.environment?.[ANTIGRAVITY_ACCOUNT_ID_ENV]?.trim();
     if (marker) return this.#accounts.store.get(marker);
     if (input.kind === "resume") {
@@ -2664,9 +2804,20 @@ export class AntigravityAdapter implements HarnessAdapter {
       const candidates = preferred
         ? [preferred, ...this.#accounts.store.list()]
         : this.#accounts.store.list();
-      return candidates.find((candidate) => this.#isAccountUsable(candidate)) ?? null;
+      return (
+        candidates.find((candidate) => this.#accountCanUseModel(candidate, requestedModel)) ?? null
+      );
     }
     return this.#resolveAccount(input.environment);
+  }
+
+  #requestedModelSlug(model: HarnessModelRef | undefined): string | undefined {
+    if (!model) return undefined;
+    try {
+      return decodeAntigravityModelRef(model);
+    } catch {
+      return undefined;
+    }
   }
 
   #isAccountUsable(account: AntigravityAccount): boolean {
@@ -2676,6 +2827,13 @@ export class AntigravityAdapter implements HarnessAdapter {
       this.#accountCooldownUntil.delete(account.id);
     }
     return this.#accounts.mode === "multi" ? this.#accounts.store.isUsable(account) : true;
+  }
+
+  #accountCanUseModel(account: AntigravityAccount, modelId?: string): boolean {
+    return (
+      this.#isAccountUsable(account) &&
+      antigravityQuotaAvailableForModel(this.#creditsFor(account.id), modelId)
+    );
   }
 
   async #recordBinding(

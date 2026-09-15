@@ -34,6 +34,8 @@ import {
   shouldReloadExternalCatalogAfterAvailabilityRefresh,
   shouldRetryExternalThreadUsage,
   shouldTransferComposerState,
+  rendererAntigravityGeminiRemainingPercent,
+  rendererAntigravityQuotaAvailableForModel,
 } from "../src/renderer-binding-probe.js";
 import {
   editorForElement,
@@ -56,6 +58,66 @@ import {
 } from "../src/renderer-usage-control.js";
 
 describe("Renderer connection diagnostics", () => {
+  it("uses Gemini model windows instead of the global leading quota for account rows", () => {
+    const credits = {
+      usedPercent: 67.65,
+      productUsage: [
+        { product: "Gemini Models · Weekly window", usagePercent: 34.13 },
+        { product: "Gemini Models · 5-hour window", usagePercent: 0.01 },
+        { product: "Claude and GPT models · Weekly window", usagePercent: 67.65 },
+      ],
+    };
+
+    expect(rendererAntigravityGeminiRemainingPercent(credits)).toBeCloseTo(65.87, 2);
+    expect(
+      rendererAntigravityGeminiRemainingPercent({
+        usedPercent: 100,
+        productUsage: [
+          { product: "Gemini Models · Weekly window", usagePercent: 27.07 },
+          { product: "Gemini Models · 5-hour window", usagePercent: 100 },
+          { product: "Claude and GPT models · Weekly window", usagePercent: 0 },
+        ],
+      }),
+    ).toBe(0);
+    expect(
+      rendererAntigravityQuotaAvailableForModel(
+        {
+          usedPercent: 100,
+          productUsage: [
+            { product: "Gemini Models · 5-hour window", usagePercent: 100 },
+            { product: "Claude and GPT models · 5-hour window", usagePercent: 0 },
+          ],
+        },
+        "Gemini 3.8 Flash",
+      ),
+    ).toBe(false);
+    expect(
+      rendererAntigravityQuotaAvailableForModel(
+        {
+          usedPercent: 100,
+          productUsage: [
+            { product: "Gemini Models · 5-hour window", usagePercent: 100 },
+            { product: "Claude and GPT models · 5-hour window", usagePercent: 0 },
+          ],
+        },
+        "Claude Sonnet",
+      ),
+    ).toBe(true);
+    expect(
+      rendererAntigravityGeminiRemainingPercent({
+        label: "Gemini Models · Weekly window",
+        usedPercent: 34,
+        productUsage: [],
+      }),
+    ).toBe(66);
+    expect(
+      rendererAntigravityGeminiRemainingPercent({
+        usedPercent: 99,
+        productUsage: [{ product: "Claude and GPT models · Weekly window", usagePercent: 99 }],
+      }),
+    ).toBeNull();
+  });
+
   it("round trips Kiro effort without reviving a choice cleared by the native model", () => {
     const model = harnessModelRefSchema.parse({ id: "adjustable" });
     const high = harnessThinkingOptionIdSchema.parse("high");

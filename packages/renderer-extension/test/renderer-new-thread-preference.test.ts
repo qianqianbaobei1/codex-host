@@ -10,6 +10,8 @@ import { describe, expect, it } from "vitest";
 import {
   RENDERER_NEW_THREAD_PREFERENCE_KEY,
   readNewThreadExternalConfigurationPreference,
+  readNewThreadAgentPreference,
+  writeNewThreadAgentPreference,
   writeNewThreadExternalConfigurationPreference,
 } from "../src/renderer-new-thread-preference.js";
 
@@ -46,6 +48,13 @@ const permissionModes = harnessPermissionModeCatalogSchema.parse({
 });
 
 describe("Renderer new-Thread external configuration preference", () => {
+  it("does not restore an external Agent as the default after a restart", () => {
+    const storage = memoryStorage();
+    writeNewThreadAgentPreference("grok", storage);
+
+    expect(readNewThreadAgentPreference(new Set(["codex", "grok"]), storage)).toBeUndefined();
+  });
+
   it("persists and restores the Grok Permission Mode with Model and Thinking", () => {
     const storage = memoryStorage();
     const permissionModeId = harnessPermissionModeIdSchema.parse("auto");

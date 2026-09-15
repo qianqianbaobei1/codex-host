@@ -110,9 +110,11 @@ export function normalizeCodexMarkdown(
     if (next === linkStart) {
       const parsed = parseMarkdownLink(text, linkStart);
       if (!parsed) {
-        // Not a valid link start, emit character and advance
+        // Not a valid link start, emit character and advance. The scan index
+        // must always move forward or the whole loop livelocks while appending
+        // to `output` until the heap is exhausted.
         output += text[linkStart];
-        index = linkStart + 1;
+        index = Math.max(linkStart + 1, index + 1);
         continue;
       }
 
@@ -189,7 +191,10 @@ function findNextLinkCandidate(text: string, start: number): number {
     }
     // Check if preceded by ` e.g. `[label](dest)`
     if (bracket > 0 && text[bracket - 1] === "`") {
-      return bracket - 1;
+      // Never report a candidate before the caller's current scan position:
+      // once the scan has resumed past the backtick, `bracket - 1` would stall
+      // the caller's index forever (e.g. "`[y/N]`").
+      return Math.max(bracket - 1, start);
     }
     return bracket;
   }

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  antigravityQuotaAvailableForModel,
   parseAntigravityQuotaPayload,
   projectAntigravityRawQuota,
   projectAntigravitySnapshotQuota,
@@ -11,6 +12,31 @@ import {
 } from "../src/credits.js";
 
 describe("Antigravity credits", () => {
+  it("scopes account availability to the selected model group", () => {
+    const credits = {
+      usedPercent: 100,
+      periodType: "five_hour" as const,
+      productUsage: [
+        { product: "Gemini Models · 5-hour window", usagePercent: 100 },
+        { product: "Gemini Models · Weekly window", usagePercent: 27.1 },
+        { product: "Claude and GPT models · 5-hour window", usagePercent: 0 },
+      ],
+    };
+
+    expect(antigravityQuotaAvailableForModel(credits, "gemini-3.8-flash")).toBe(true);
+    expect(antigravityQuotaAvailableForModel(credits, "claude-sonnet-4-6")).toBe(true);
+    expect(
+      antigravityQuotaAvailableForModel(
+        {
+          usedPercent: 100,
+          periodType: "five_hour" as const,
+          productUsage: [{ product: "Gemini Models · 5-hour window", usagePercent: 100 }],
+        },
+        "gemini-3.8-flash",
+      ),
+    ).toBe(false);
+  });
+
   it("projects quota from raw statusline json correctly", () => {
     const rawPayload = {
       quota: {
@@ -44,19 +70,24 @@ describe("Antigravity credits", () => {
     expect(credits?.resetsAt).toBe("2026-09-03T05:01:41.000Z");
     expect(credits?.productUsage).toEqual([
       {
-        product: "Weekly limit",
-        usagePercent: 39.6,
-        resetsAt: "2026-09-07T06:34:34.000Z",
+        product: "Gemini 5-hour limit",
+        usagePercent: 25.6,
+        resetsAt: "2026-09-03T05:01:41.000Z",
       },
       {
-        product: "3P Weekly limit",
-        usagePercent: 64,
-        resetsAt: "2026-09-09T02:34:17.000Z",
+        product: "Gemini Weekly limit",
+        usagePercent: 39.6,
+        resetsAt: "2026-09-07T06:34:34.000Z",
       },
       {
         product: "3P 5-hour limit",
         usagePercent: 0,
         resetsAt: "2026-09-03T07:19:47.000Z",
+      },
+      {
+        product: "3P Weekly limit",
+        usagePercent: 64,
+        resetsAt: "2026-09-09T02:34:17.000Z",
       },
     ]);
 
@@ -65,9 +96,10 @@ describe("Antigravity credits", () => {
     expect(threePCredits?.periodType).toBe("five_hour");
     expect(threePCredits?.usedPercent).toBe(0); // 3p-5h is remaining 1 => 0% used
     expect(threePCredits?.resetsAt).toBe("2026-09-03T07:19:47.000Z");
-    expect(threePCredits?.productUsage?.[0]?.product).toBe("3P Weekly limit");
-    expect(threePCredits?.productUsage?.[1]?.product).toBe("Gemini 5-hour limit");
-    expect(threePCredits?.productUsage?.[2]?.product).toBe("Weekly limit");
+    expect(threePCredits?.productUsage?.[0]?.product).toBe("3P 5-hour limit");
+    expect(threePCredits?.productUsage?.[1]?.product).toBe("3P Weekly limit");
+    expect(threePCredits?.productUsage?.[2]?.product).toBe("Gemini 5-hour limit");
+    expect(threePCredits?.productUsage?.[3]?.product).toBe("Gemini Weekly limit");
   });
 
   it("projects quota from snapshot format", () => {
@@ -92,8 +124,10 @@ describe("Antigravity credits", () => {
     expect(credits).not.toBeNull();
     expect(credits?.periodType).toBe("five_hour");
     expect(credits?.usedPercent).toBe(25.6);
-    expect(credits?.productUsage?.[0]?.product).toBe("Weekly limit");
-    expect(credits?.productUsage?.[0]?.usagePercent).toBe(39.6);
+    expect(credits?.productUsage?.[0]?.product).toBe("Gemini 5-hour limit");
+    expect(credits?.productUsage?.[0]?.usagePercent).toBe(25.6);
+    expect(credits?.productUsage?.[1]?.product).toBe("Gemini Weekly limit");
+    expect(credits?.productUsage?.[1]?.usagePercent).toBe(39.6);
   });
 
   it("returns null for malformed or empty payloads", () => {
@@ -130,6 +164,34 @@ describe("Antigravity credits", () => {
       // Without allowExpired, since 2026-09-03T12:00:00Z is in the past, it should reject expired data
       const expiredSync = readAntigravityCreditsSync({ rawPath });
       expect(expiredSync).toBeNull();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a global quota file without the expected account identity", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-credits-identity-test-"));
+    try {
+      const rawPath = path.join(tmpDir, "agy_statusline_raw.json");
+      const snapshotPath = path.join(tmpDir, "agy_quota_snapshot.json");
+      fs.writeFileSync(
+        rawPath,
+        JSON.stringify({
+          email: "lucy@example.com",
+          quota: { "gemini-5h": { remaining_fraction: 0.25 } },
+        }),
+      );
+      fs.writeFileSync(
+        snapshotPath,
+        JSON.stringify({ groups: { gemini: { five_hour: { remaining_percent: 25 } } } }),
+      );
+
+      const options = { rawPath, snapshotPath, expectedEmail: "lure@example.com" };
+      expect(readAntigravityCreditsSync(options)).toBeNull();
+      await expect(readAntigravityCredits(options)).resolves.toBeNull();
+      expect(
+        readAntigravityCreditsSync({ ...options, expectedEmail: "lucy@example.com" })?.usedPercent,
+      ).toBe(75);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

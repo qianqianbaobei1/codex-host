@@ -43,14 +43,14 @@
 
 .settings-harness-account {
   display: grid;
-  grid-template-columns: 28% 44% 28%;
+  grid-template-columns: minmax(160px, 220px) 1fr auto;
   align-items: center;
   gap: 16px;
-  padding: 20px 24px;
+  padding: 18px 20px;
   background: light-dark(#ffffff, #232326);
   border: 1px solid light-dark(#e8e8eb, #36363b);
   border-radius: 12px;
-  min-height: 88px;
+  min-height: 84px;
   box-sizing: border-box;
   transition:
     border-color 0.15s ease,
@@ -76,7 +76,7 @@
 
 .settings-harness-account__identity > .settings-account-email {
   display: block;
-  max-width: 24ch;
+  max-width: 22ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -111,14 +111,18 @@
 }
 
 .settings-harness-account .settings-account-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
   flex-wrap: nowrap;
   white-space: nowrap;
   gap: 8px;
+  min-width: max-content;
 }
 
 .settings-harness-account .settings-account-action {
-  padding: 6px 12px;
-  min-height: 32px;
+  padding: 5px 10px;
+  min-height: 28px;
   font-size: 12px;
   font-weight: 500;
   border-radius: 6px;
@@ -126,6 +130,7 @@
   background: light-dark(#ffffff, #2a2a2e);
   color: var(--settings-text);
   cursor: pointer;
+  white-space: nowrap;
   transition: all 0.15s ease;
 }
 
@@ -138,23 +143,24 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 24px;
-  padding: 0 10px;
+  height: 22px;
+  padding: 0 8px;
   font-size: 11px;
   font-weight: 500;
   border-radius: 9999px;
   color: light-dark(#66548e, #bdb4ff);
   background: light-dark(#f4f0fb, #aca0ff12);
   border: 1px solid light-dark(#dfd5f1, #aca0ff24);
+  white-space: nowrap;
 }
 
 .settings-harness-account .settings-account-delete {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
-  min-height: 32px;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
   padding: 0;
   border-radius: 6px;
   border: 1px solid transparent;

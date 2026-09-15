@@ -769,7 +769,11 @@ export function renderComposerAgentControl(
   control.harnessCommands.root.hidden = state.agent === "codex";
   control.harnessCommands.root.style.display = state.agent === "codex" ? "none" : "inline-flex";
   if (state.agent === "codex") control.harnessCommands.close();
-  renderRendererCreditsControl(control.credits, accountCredits, locale);
+  const selectedModelId = modelView.selected?.id ?? modelView.resolvedModelLabel ?? null;
+  renderRendererCreditsControl(control.credits, accountCredits, locale, {
+    agent: state.agent,
+    modelId: selectedModelId,
+  });
 }
 
 export function disposeComposerAgentControl(control: ComposerAgentControl): void {

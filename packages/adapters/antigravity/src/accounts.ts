@@ -30,7 +30,7 @@
  * malformed file is reported as `invalid` and callers must fail closed rather
  * than silently falling back to the real HOME.
  */
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -41,7 +41,7 @@ import {
   chmod,
   writeFile,
 } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
@@ -69,6 +69,7 @@ export type AntigravityAccountHealth = "ready" | "cooldown" | "needs_login" | "d
 export interface AntigravityAccount {
   id: string;
   name: string;
+  email?: string;
   /** The legacy account keeps using the real HOME; its sessions never migrate. */
   legacy?: boolean;
   enabled: boolean;
@@ -205,6 +206,69 @@ let activeKeychainLease: {
  * and rewrites the user search list, so the previous configuration is restored
  * unconditionally: this overlay must never change global keychain settings.
  */
+export function darwinUserLoginKeychain(environment: NodeJS.ProcessEnv = process.env): string {
+  return path.join(antigravityRealHome(environment), "Library", "Keychains", "login.keychain-db");
+}
+
+function sanitizeDarwinKeychainList(list: readonly string[], realLogin: string): string[] {
+  const filtered = list.filter((p) => !p.includes(".agy-accounts"));
+  if (filtered.length === 0 && existsSync(realLogin)) {
+    return [realLogin];
+  }
+  return filtered;
+}
+
+let darwinExitHookRegistered = false;
+function registerDarwinExitHook(): void {
+  if (darwinExitHookRegistered || process.platform !== "darwin") return;
+  darwinExitHookRegistered = true;
+  process.once("exit", () => {
+    try {
+      restoreDarwinUserKeychain(process.env, true);
+    } catch {
+      // Ignore errors on process exit
+    }
+  });
+}
+
+export function restoreDarwinUserKeychain(
+  environment: NodeJS.ProcessEnv = process.env,
+  force = false,
+): void {
+  if (process.platform !== "darwin") return;
+  // A live AGY session owns the selected keychain. Restoring the user's
+  // keychain while that session is still running would make its next Keychain
+  // Services lookup use a different account. The exit hook passes `force` so
+  // a crashed/terminating Host still repairs the global setting.
+  if (activeKeychainLease && !force) return;
+  try {
+    const realLogin = darwinUserLoginKeychain(environment);
+    if (!existsSync(realLogin)) return;
+    const rawDefault = execFileSync("security", ["default-keychain", "-d", "user"], {
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    }).trim();
+    const rawList = execFileSync("security", ["list-keychains", "-d", "user"], {
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    })
+      .split("\n")
+      .map((l) => l.trim().replace(/^"|"$/gu, ""))
+      .filter(Boolean);
+    const sanitizedList = sanitizeDarwinKeychainList(rawList, realLogin);
+    if (rawDefault.includes(".agy-accounts") || !rawList.includes(realLogin)) {
+      execFileSync("security", ["list-keychains", "-d", "user", "-s", ...sanitizedList], {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      execFileSync("security", ["default-keychain", "-d", "user", "-s", realLogin], {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    }
+  } catch {
+    // Ignore keychain query/restore errors
+  }
+}
+
 async function createDarwinKeychain(file: string): Promise<void> {
   const readSetting = async (arguments_: readonly string[]): Promise<string[]> => {
     const { stdout } = await execFileAsync("security", [...arguments_]);
@@ -213,8 +277,13 @@ async function createDarwinKeychain(file: string): Promise<void> {
       .map((line) => line.trim().replace(/^"|"$/gu, ""))
       .filter(Boolean);
   };
-  const previousDefault = await readSetting(["default-keychain", "-d", "user"]).catch(() => []);
-  const previousList = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
+  const realLogin = darwinUserLoginKeychain();
+  const previousDefaultRaw = await readSetting(["default-keychain", "-d", "user"]).catch(() => []);
+  const previousListRaw = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
+  const previousList = sanitizeDarwinKeychainList(previousListRaw, realLogin);
+  const previousDefault = previousDefaultRaw[0]?.includes(".agy-accounts")
+    ? realLogin
+    : (previousDefaultRaw[0] ?? realLogin);
   try {
     // `-p ""` creates the keychain unlocked; `unlock-keychain -p ""` rejects the
     // empty passphrase on current macOS, so it must not be called.
@@ -231,11 +300,14 @@ async function createDarwinKeychain(file: string): Promise<void> {
         ...previousList,
       ]).catch(() => undefined);
     }
-    const previous = previousDefault[0];
-    if (previous) {
-      await execFileAsync("security", ["default-keychain", "-d", "user", "-s", previous]).catch(
-        () => undefined,
-      );
+    if (previousDefault) {
+      await execFileAsync("security", [
+        "default-keychain",
+        "-d",
+        "user",
+        "-s",
+        previousDefault,
+      ]).catch(() => undefined);
     }
   }
 }
@@ -249,6 +321,7 @@ async function createDarwinKeychain(file: string): Promise<void> {
  */
 async function acquireDarwinKeychain(file: string): Promise<AntigravityKeychainRelease> {
   if (process.platform !== "darwin") return async () => undefined;
+  registerDarwinExitHook();
   const operation = keychainOperation.then(async () => {
     if (activeKeychainLease) {
       if (activeKeychainLease.file !== file) {
@@ -263,14 +336,21 @@ async function acquireDarwinKeychain(file: string): Promise<AntigravityKeychainR
           .map((line) => line.trim().replace(/^"|"$/gu, ""))
           .filter(Boolean);
       };
-      const previousDefault = await readSetting(["default-keychain", "-d", "user"]);
-      const previousList = await readSetting(["list-keychains", "-d", "user"]);
+      const realLogin = darwinUserLoginKeychain();
+      const previousDefaultRaw = await readSetting(["default-keychain", "-d", "user"]).catch(
+        () => [],
+      );
+      const previousListRaw = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
+      const previousList = sanitizeDarwinKeychainList(previousListRaw, realLogin);
+      const previousDefault = previousDefaultRaw[0]?.includes(".agy-accounts")
+        ? realLogin
+        : (previousDefaultRaw[0] ?? realLogin);
       await execFileAsync("security", ["list-keychains", "-d", "user", "-s", file]);
       await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file]);
       activeKeychainLease = {
         file,
         count: 1,
-        previousDefault,
+        previousDefault: [previousDefault],
         previousList,
       };
     }
@@ -457,6 +537,9 @@ export function loadAntigravityAccountsSync(
   } = {},
 ): AntigravityAccountsLoad {
   const environment = input.environment ?? process.env;
+  if (process.platform === "darwin") {
+    restoreDarwinUserKeychain(environment);
+  }
   const realHome = antigravityRealHome(environment);
   const file = input.file ?? antigravityAccountsFile(environment);
   let raw: string;
@@ -528,11 +611,15 @@ function validateAccountsFile(parsed: unknown): ValidationResult {
     if (account.cooldownUntil !== undefined && typeof account.cooldownUntil !== "string") {
       return { ok: false, reason: `account '${id}' has an invalid cooldownUntil` };
     }
+    if (account.email !== undefined && typeof account.email !== "string") {
+      return { ok: false, reason: `account '${id}' has an invalid email` };
+    }
     accounts.push({
       id,
       name: account.name,
       enabled: account.enabled,
       ...(account.legacy === true ? { legacy: true } : {}),
+      ...(typeof account.email === "string" ? { email: account.email } : {}),
       ...(typeof account.state === "string" ? { state: account.state } : {}),
       ...(typeof account.cooldownUntil === "string"
         ? { cooldownUntil: account.cooldownUntil }
@@ -754,6 +841,9 @@ export class AntigravityAccountStore {
     account: AntigravityAccount,
     options: { manageDarwinKeychain?: boolean } = {},
   ): Promise<string> {
+    if (process.platform === "darwin") {
+      restoreDarwinUserKeychain();
+    }
     const home = this.homeFor(account);
     if (account.legacy === true || this.#shadowReady.has(account.id)) return home;
     await ensureAntigravityShadowHome({
@@ -767,7 +857,10 @@ export class AntigravityAccountStore {
   }
 
   async acquireKeychainIsolation(account: AntigravityAccount): Promise<AntigravityKeychainRelease> {
-    if (account.legacy === true || process.platform !== "darwin") return async () => undefined;
+    if (process.platform !== "darwin") return async () => undefined;
+    if (account.legacy === true) {
+      return acquireDarwinKeychain(darwinUserLoginKeychain());
+    }
     const home = await this.ensureHome(account);
     const file = path.join(home, "Library", "Keychains", "login.keychain-db");
     if (
@@ -876,6 +969,16 @@ export class AntigravityAccountStore {
       throw new Error(`Unknown Antigravity account '${accountId}'`);
     await this.#mutate(async () => {
       this.#defaultAccountId = accountId;
+      await this.#persist();
+    });
+  }
+
+  async setEmail(accountId: string, email: string): Promise<void> {
+    const account = this.#accounts.get(accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
+    if (account.email === email) return;
+    await this.#mutate(async () => {
+      account.email = email;
       await this.#persist();
     });
   }

@@ -62,7 +62,10 @@ const { outputFiles } = await build({
       const send = document.createElement("button");
       send.type = "submit";
       toolbar.append(context, send);
-      composer.append(editor, toolbar);
+      const portal = document.createElement("div");
+      portal.setAttribute("data-above-composer-portal", "true");
+      portal.setAttribute("data-above-composer-conversation-id", threadId);
+      composer.append(editor, portal, toolbar);
       document.body.append(composer);
 
       const threadInspection = {
@@ -128,7 +131,7 @@ const { outputFiles } = await build({
   format: "iife",
   platform: "browser",
   target: "es2024",
-  loader: { ".css": "text", ".png": "dataurl" },
+  loader: { ".css": "text", ".png": "dataurl", ".svg": "dataurl" },
   write: false,
 });
 

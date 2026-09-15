@@ -4,6 +4,7 @@ import {
   creditsPeriodLabel,
   formatRendererCreditsReset,
   rendererCreditsTone,
+  resolveAdaptiveMeters,
 } from "../src/renderer-credits-control.js";
 import { formatRendererCreditsPercent } from "../src/renderer-usage-control.js";
 
@@ -66,5 +67,69 @@ describe("Renderer credits control", () => {
         minute: "2-digit",
       }),
     );
+  });
+
+  it("adapts Antigravity credits to the active model group (Scheme A)", () => {
+    const antigravityCredits = {
+      usedPercent: 40.3,
+      periodType: "five_hour" as const,
+      productUsage: [
+        { product: "Gemini Models · Weekly window", usagePercent: 15.7 },
+        { product: "Gemini Models · 5-hour window", usagePercent: 40.3 },
+        { product: "Claude and GPT models · Weekly window", usagePercent: 67.6 },
+        { product: "Claude and GPT models · 5-hour window", usagePercent: 0 },
+      ],
+    };
+
+    // When Gemini model is active, show only Gemini limits in Chinese
+    const geminiResolved = resolveAdaptiveMeters(
+      antigravityCredits,
+      "zh-CN",
+      {
+        remaining: "剩余",
+        resets: "重置",
+        details: "账号额度详情",
+        weekly: "周额度",
+        monthly: "月额度",
+        fiveHour: "5 小时额度",
+        sevenDay: "7 天额度",
+        account: "账号额度",
+        geminiGroup: "Gemini",
+        threePGroup: "3P 模型",
+      },
+      { agent: "antigravity", modelId: "Gemini 3.8 Flash (High)" },
+    );
+
+    expect(geminiResolved.meters).toHaveLength(2);
+    expect(geminiResolved.meters[0]?.label).toBe("5 小时额度 (Gemini)");
+    expect(geminiResolved.meters[0]?.usagePercent).toBe(40.3);
+    expect(geminiResolved.meters[1]?.label).toBe("7 天额度 (Gemini)");
+    expect(geminiResolved.meters[1]?.usagePercent).toBe(15.7);
+    expect(geminiResolved.headlineUsage).toBe(40.3);
+
+    // When 3P model is active, show only 3P limits
+    const threePResolved = resolveAdaptiveMeters(
+      antigravityCredits,
+      "zh-CN",
+      {
+        remaining: "剩余",
+        resets: "重置",
+        details: "账号额度详情",
+        weekly: "周额度",
+        monthly: "月额度",
+        fiveHour: "5 小时额度",
+        sevenDay: "7 天额度",
+        account: "账号额度",
+        geminiGroup: "Gemini",
+        threePGroup: "3P 模型",
+      },
+      { agent: "antigravity", modelId: "Claude 3.7 Sonnet" },
+    );
+
+    expect(threePResolved.meters).toHaveLength(2);
+    expect(threePResolved.meters[0]?.label).toBe("5 小时额度 (3P 模型)");
+    expect(threePResolved.meters[0]?.usagePercent).toBe(0);
+    expect(threePResolved.meters[1]?.label).toBe("7 天额度 (3P 模型)");
+    expect(threePResolved.meters[1]?.usagePercent).toBe(67.6);
   });
 });

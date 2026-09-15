@@ -213,7 +213,7 @@ describe("AntigravityCliTransport turn liveness (activity-aware timeout)", () =>
       });
 
       await expect(transport.start()).rejects.toThrow("Antigravity Session startup timed out");
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 800));
       const init = await transport.start();
       expect(init.conversationId).toBe("conv-live");
       await expect(transport.runTurn("after join", () => undefined)).resolves.toMatchObject({
@@ -261,6 +261,46 @@ describe("AntigravityCliTransport turn liveness (activity-aware timeout)", () =>
       await expect(transport.runTurn("after hibernate", () => undefined)).resolves.toMatchObject({
         response: "done",
       });
+      await transport.close().catch(() => undefined);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  it("surfaces retry diagnostics from stderr to thinking and refreshes activity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-retry-test-"));
+    const RETRY_SCRIPT = `#!/bin/bash
+echo '${INIT_LINE}'
+while read -r line; do
+  case "$line" in
+    *user*)
+      sleep 0.05
+      echo 'I0915 14:27:27.183094 4326 run.go:389] Run: attempt 1 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF), retrying in 4s' >&2
+      sleep 0.05
+      echo '${STEP_LINE}'
+      echo '${RESULT_LINE}'
+      ;;
+  esac
+done
+`;
+    try {
+      const command = await writeAgy(root, "retry.sh", RETRY_SCRIPT);
+      const transport = new AntigravityCliTransport({
+        cwd: root,
+        command,
+        environment: process.env,
+        idleTimeoutMs: 2_000,
+      });
+      await transport.start();
+      const steps: Array<{ thinkingDelta?: string }> = [];
+      const res = await transport.runTurn("do retry", (s) => steps.push(s));
+      expect(res.response).toBe("done");
+      const retryStep = steps.find(
+        (s) => s.thinkingDelta && s.thinkingDelta.includes("网络连接出现波动"),
+      );
+      expect(retryStep).toBeDefined();
+      expect(retryStep?.thinkingDelta).toContain("第 1 次");
+      expect(retryStep?.thinkingDelta).toContain("4.0 秒");
       await transport.close().catch(() => undefined);
     } finally {
       await rm(root, { recursive: true, force: true });

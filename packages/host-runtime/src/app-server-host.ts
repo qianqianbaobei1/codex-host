@@ -262,6 +262,8 @@ export interface AppServerHostOptions {
   externalAdapters?: ReadonlyMap<ExternalHarnessId, HarnessAdapter>;
   pluginRoots?: readonly string[];
   pluginContext?: HarnessPluginContext;
+  /** Release bundles skip external CLI warmups so shutdown cannot wait on them. */
+  pluginWarmup?: boolean;
   mappingStore?: ExternalThreadStore;
   /** Defaults to true. A listener that shares one store across sessions owns closing it. */
   closeMappingStoreOnExit?: boolean;
@@ -832,6 +834,7 @@ export class AppServerHost {
             managedRemoteHost: false,
           },
           reservedIds: new Set(this.#externalAdapters.keys()),
+          warmup: this.#options.pluginWarmup ?? true,
           diagnose: (diagnostic) => this.#diagnose(`Harness plugin: ${JSON.stringify(diagnostic)}`),
         });
         this.#pluginDescriptors = plugins.list();

@@ -187,10 +187,10 @@ function renderCompactAccountCredits(
       const tone = rendererCreditsTone(window.usedPercent);
       const item = document.createElement("span");
       item.className = `settings-account-usage__group-value settings-account-usage__group-value--${tone}`;
+      const valuePrefix =
+        display === "remaining" ? messages.accountCreditsRemaining : messages.accountCreditsUsed;
       item.textContent = `${key} ${formatRendererCreditsPercent(value)}`;
-      item.title = `${window.label} · ${
-        display === "remaining" ? messages.accountCreditsRemaining : messages.accountCreditsUsed
-      } ${formatRendererCreditsPercent(value)}`;
+      item.title = `${window.label} · ${valuePrefix} ${formatRendererCreditsPercent(value)}`;
       values.append(item);
     }
     meter.append(label, values);

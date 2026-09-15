@@ -87,6 +87,19 @@ describe("normalizeCodexMarkdown", () => {
     expect(output).toBe(input);
   });
 
+  it("does not livelock on backtick-wrapped bracket text", () => {
+    // `[y/N]` used to stall the scan index forever and exhaust the heap.
+    const input = "交互式 `[y/N]` 确认、分页器";
+    const output = normalizeCodexMarkdown(input);
+    expect(output).toBe(input);
+  });
+
+  it("still normalizes a real link wrapped in backticks", () => {
+    const input = "see `[app.py](src/app.py)`";
+    const output = normalizeCodexMarkdown(input, { cwd: "/repo" });
+    expect(output).toBe("see [app.py](/repo/src/app.py)");
+  });
+
   it("enforces CommonMark blank line after headers", () => {
     const input = "# Header\nSome paragraph text.";
     const output = normalizeCodexMarkdown(input);

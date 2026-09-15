@@ -131,3 +131,15 @@ export function antigravityToolErrorMessage(value: unknown): string | null {
 export function isAntigravityPermissionDenial(message: string): boolean {
   return /permission check failed|denied permission|permission denied/iu.test(message);
 }
+
+/**
+ * Common transient network errors encountered during SSE streaming via local proxy or
+ * direct connection (e.g. connection resets, premature EOFs, timeout/deadline exceeded).
+ */
+export const TRANSIENT_NETWORK_PATTERN =
+  /API error \(attempt \d+\)|connection reset by peer|broken pipe|connection refused|unexpected EOF|streamGenerateContent.*?(?:EOF|reset|refused|timeout|deadline)|(?:Post|Get|Put)\s+"https?:\/\/[^"]+":.*?(?:EOF|reset|broken|refused|timeout|deadline)|context deadline exceeded|Client\.Timeout exceeded|handshake timeout|tls: (?:handshake|first record)|no route to host|network is unreachable|i\/o timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Timeout)|Service Unavailable|Bad Gateway/iu;
+
+export function isTransientNetworkErrorMessage(message: string): boolean {
+  return TRANSIENT_NETWORK_PATTERN.test(message);
+}
+

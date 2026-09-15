@@ -269,6 +269,8 @@ describe("development Desktop start", () => {
       resolveDevelopmentNodePath({
         nodePath: process.execPath,
         nodeVersion: "25.9.0",
+        currentNodePath: process.execPath,
+        currentNodeVersion: "25.9.0",
         environment: { HOME: root, NVM_DIR: path.join(root, "nvm") },
         platform: "darwin",
       }),

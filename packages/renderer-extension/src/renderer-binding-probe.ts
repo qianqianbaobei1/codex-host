@@ -64,6 +64,7 @@ import type { RendererModelClient } from "./renderer-model-client.js";
 import { RendererMethodUnavailableError } from "./renderer-request-sender.js";
 import { thinkingOptionsForModel } from "./renderer-model-picker.js";
 import { RENDERER_AGENT_INSTALL_URLS } from "./renderer-agent-picker.js";
+import { formatRendererCreditsPercent } from "./renderer-usage-control.js";
 import {
   readClaudePermissionModePreference,
   writeClaudePermissionModePreference,
@@ -113,6 +114,52 @@ const externalAgents: readonly ExternalRendererAgent[] = [
 type HarnessAvailability = Partial<Record<ExternalRendererAgent, RendererAgentAvailability>>;
 type HarnessAvailabilityErrors = Record<ExternalRendererAgent, CodexhostError | undefined>;
 type HarnessWebUiAvailability = Record<ExternalRendererAgent, boolean>;
+
+/**
+ * Return the effective remaining quota for Antigravity's Gemini model group.
+ * The top-level `usedPercent` is a backwards-compatible summary across every
+ * product group, so it must not be used for the Gemini account row.
+ */
+export function rendererAntigravityGeminiRemainingPercent(
+  credits: Pick<AccountCreditsSnapshot, "label" | "usedPercent" | "productUsage">,
+): number | null {
+  const products = credits.productUsage ?? [];
+  const labelIdentifiesGemini = /\bgemini\b/i.test(credits.label ?? "");
+  const geminiUsage = products
+    .filter((product) => {
+      const normalized = product.product.trim();
+      if (/\bgemini\b/i.test(normalized)) return true;
+      if (!labelIdentifiesGemini) return false;
+      return !/\b3p\b|claude|gpt|third[- ]party|other|其他/i.test(normalized);
+    })
+    .map((product) => product.usagePercent)
+    .filter((usage): usage is number => Number.isFinite(usage));
+
+  if (geminiUsage.length === 0) {
+    if (!labelIdentifiesGemini || !Number.isFinite(credits.usedPercent)) return null;
+    geminiUsage.push(credits.usedPercent);
+  }
+
+  const usedPercent = Math.max(...geminiUsage);
+  return Math.min(100, Math.max(0, 100 - usedPercent));
+}
+
+export function rendererAntigravityQuotaAvailableForModel(
+  credits: Pick<AccountCreditsSnapshot, "usedPercent" | "productUsage"> | null | undefined,
+  modelLabel?: string,
+): boolean {
+  if (!credits) return true;
+  const products = credits.productUsage ?? [];
+  const thirdParty = /\b3p\b|claude|gpt|third[- ]party|other|其他/i.test(modelLabel ?? "");
+  const scoped = products.filter((product) => {
+    const normalized = product.product.trim().toLowerCase();
+    return thirdParty
+      ? /\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(normalized)
+      : /gemini|native|first[- ]party|自有/u.test(normalized);
+  });
+  if (scoped.length > 0) return scoped.some((product) => product.usagePercent < 100);
+  return credits.usedPercent < 100;
+}
 
 function isRetryableHarnessAvailability(
   availability: RendererAgentAvailability | undefined,
@@ -843,16 +890,30 @@ export function installRendererBindingProbe(
   // Show the remaining quota, matching the account settings page and the
   // Credits pill. Showing "used" here made the same account look contradictory
   // (e.g. "used 99%" beside "0.6% left").
-  const harnessAccountUsageLabel = (credits: AccountCreditsSnapshot): string => {
-    const remaining = Math.max(0, 100 - Math.round(credits.usedPercent));
-    return settingsLifecycle.locale === "zh-CN" ? `剩余 ${remaining}%` : `${remaining}% left`;
+  const harnessAccountUsageLabel = (credits: AccountCreditsSnapshot): string | undefined => {
+    const remaining = rendererAntigravityGeminiRemainingPercent(credits);
+    if (remaining === null) return undefined;
+    const formatted = formatRendererCreditsPercent(remaining);
+    return settingsLifecycle.locale === "zh-CN"
+      ? `Gemini 剩余 ${formatted}`
+      : `Gemini ${formatted} left`;
   };
 
   const renderMounted = (mounted: MountedComposer): void => {
     const state = controller.get(mounted.composer);
+    const currentAgent = state.agent;
     const accounts = composerCodexAccounts(mounted.composer);
     const harnessAccounts = harnessAccountsForHost(mounted.hostId);
     const harnessRows = harnessAccounts?.accounts ?? [];
+    const selectedAntigravityModel =
+      currentAgent === "antigravity"
+        ? controller.modelForAgent(mounted.composer, "antigravity")
+        : undefined;
+    const selectedAntigravityModelLabel = selectedAntigravityModel
+      ? mounted.modelView.catalog?.models.find(
+          (model) => model.ref.id === selectedAntigravityModel.id,
+        )?.label
+      : undefined;
     const harnessEntries = harnessRows
       .filter((account) => account.harnessId === "antigravity" && account.accountId)
       .map((account) => {
@@ -868,7 +929,12 @@ export function installRendererBindingProbe(
         return {
           id,
           label: account.label ?? account.email ?? id,
-          selectable: account.selectable !== false,
+          selectable:
+            account.selectable !== false &&
+            rendererAntigravityQuotaAvailableForModel(
+              account.credits,
+              selectedAntigravityModelLabel,
+            ),
           ...(secondary ? { secondary } : {}),
         };
       });
@@ -881,7 +947,6 @@ export function installRendererBindingProbe(
         ? state.codexAccountId
         : accounts?.selection.selectedAccountId;
 
-    const currentAgent = state.agent;
     let agentCredits: AccountCreditsSnapshot | null = null;
     if (currentAgent === "codex") {
       if (

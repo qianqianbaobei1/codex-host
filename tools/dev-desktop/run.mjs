@@ -421,12 +421,19 @@ function supportedNodeCandidates(environment, platform) {
   return candidates;
 }
 
-export function resolveDevelopmentNodePath({ nodePath, nodeVersion, environment, platform }) {
+export function resolveDevelopmentNodePath({
+  nodePath,
+  nodeVersion,
+  environment,
+  platform,
+  currentNodePath = process.execPath,
+  currentNodeVersion = process.versions.node,
+}) {
   if (nodeVersionSupported(nodeVersion)) return nodePath;
   // An explicitly supplied version is a test/configuration seam and must be
   // validated as supplied. Automatic recovery is only for the real npm start
   // invocation running under an unsupported current Node binary.
-  if (nodePath !== process.execPath || nodeVersion !== process.versions.node) return null;
+  if (nodePath !== currentNodePath || nodeVersion !== currentNodeVersion) return null;
   for (const candidate of supportedNodeCandidates(environment, platform)) {
     const version = nodeVersionAt(candidate);
     if (version && nodeVersionSupported(version)) return candidate;
