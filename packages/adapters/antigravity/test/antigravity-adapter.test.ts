@@ -1155,7 +1155,11 @@ describe("AntigravityAdapter", () => {
         (e) => e.kind === "event" && e.event.type === "turn.completed",
       );
       expect(completedEvent).toBeDefined();
-      if (completedEvent && completedEvent.kind === "event" && completedEvent.event.type === "turn.completed") {
+      if (
+        completedEvent &&
+        completedEvent.kind === "event" &&
+        completedEvent.event.type === "turn.completed"
+      ) {
         expect(completedEvent.event.outcome.status).toBe("succeeded");
         expect((completedEvent.event.outcome as { error?: unknown }).error).toBeUndefined();
       }
@@ -1189,7 +1193,7 @@ describe("AntigravityAdapter", () => {
         // Simulating a transient error step that agy might send
         onStep({
           stepType: "error",
-          message: 'API error (attempt 1): request failed: unexpected EOF',
+          message: "API error (attempt 1): request failed: unexpected EOF",
         });
         onStep({ stepType: "agent_response", textDelta: "Here is the valid answer." });
         return {
@@ -1250,4 +1254,3 @@ describe("AntigravityAdapter", () => {
     }
   });
 });
-

@@ -142,4 +142,3 @@ export const TRANSIENT_NETWORK_PATTERN =
 export function isTransientNetworkErrorMessage(message: string): boolean {
   return TRANSIENT_NETWORK_PATTERN.test(message);
 }
-
