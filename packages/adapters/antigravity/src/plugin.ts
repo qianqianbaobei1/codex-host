@@ -1,4 +1,3 @@
-import type { HarnessAdapter } from "@codexhost/harness-adapter";
 import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
 
 import { AntigravityAdapter } from "./antigravity-adapter.js";
@@ -14,13 +13,9 @@ export function createHarnessAdapter(context: HarnessPluginContext): Antigravity
     ...(command ? { command } : {}),
     environment,
     accounts,
+    // OAuth is stored in the OS keyring, not just under HOME. On Darwin the
+    // adapter serializes a dedicated account-keychain lease and restores the
+    // user's keychain settings after each Session or probe.
+    manageDarwinKeychain: context.platform === "darwin",
   });
-}
-
-export async function warmup(adapter: Pick<HarnessAdapter, "inspect">): Promise<void> {
-  try {
-    await adapter.inspect();
-  } catch {
-    /* Optional prefetch cannot fail Host startup. */
-  }
 }

@@ -72,6 +72,11 @@ export function installDraftPrewarmPolicyBridge(
   const originalOnNotification = manager.onNotification;
   const originalDispatchAppServerResponse = manager.dispatchAppServerResponse;
   let selectedModel: string | null = null;
+  // A Thread keeps the Model carrier chosen for it, so a mid-conversation
+  // Agent switch can be injected into that Thread's next Turn instead of
+  // leaking into another Thread's draft.
+  let pendingDraftThreadModel: string | null = null;
+  const threadSelectedModels = new Map<string, string | null>();
   let selectedCodexAccountId: string | null = null;
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === "object" && value !== null && !Array.isArray(value);
@@ -168,6 +173,9 @@ export function installDraftPrewarmPolicyBridge(
     if (value.modelProvider === "codexhost" || value.cliVersion === "codexhost") {
       knownExternalThreadIds.add(value.id);
       knownOfficialThreadIds.delete(value.id);
+      if (typeof value.model === "string" && value.model.startsWith("codexhost/")) {
+        threadSelectedModels.set(value.id, value.model);
+      }
     }
   };
   const observeBridgeResult = (
@@ -195,10 +203,15 @@ export function installDraftPrewarmPolicyBridge(
       if (result.owner === "external") {
         knownExternalThreadIds.add(request.parameters.threadId);
         knownOfficialThreadIds.delete(request.parameters.threadId);
+        if (typeof result.transportModelId === "string") {
+          threadSelectedModels.set(request.parameters.threadId, result.transportModelId);
+        }
       } else if (result.owner === "codex") {
         knownOfficialThreadIds.add(request.parameters.threadId);
         knownExternalThreadIds.delete(request.parameters.threadId);
+        threadSelectedModels.delete(request.parameters.threadId);
       }
+      pendingDraftThreadModel = null;
       return;
     }
     if (
@@ -493,6 +506,10 @@ export function installDraftPrewarmPolicyBridge(
       );
     }
     const threadId = threadIdFromParameters(parameters);
+    if (threadId && threadSelectedModels.has(threadId)) {
+      const configured = threadSelectedModels.get(threadId);
+      return configured !== null && configured !== undefined;
+    }
     if (threadId && knownExternalThreadIds.has(threadId)) return true;
     if (threadId && knownOfficialThreadIds.has(threadId)) return false;
     return (
@@ -504,6 +521,7 @@ export function installDraftPrewarmPolicyBridge(
     if (!isRecord(parameters) || parameters.ephemeral === true) {
       return parameters;
     }
+    pendingDraftThreadModel = selectedModel;
     const routed = {
       ...parameters,
       ...(selectedModel === null ? {} : { model: selectedModel }),
@@ -512,16 +530,85 @@ export function installDraftPrewarmPolicyBridge(
     selectedCodexAccountId = null;
     return routed;
   };
-  const routedSend = (method: string, parameters: unknown, options?: unknown): unknown => {
-    const routedParameters = method === "thread/start" ? routeThreadStart(parameters) : parameters;
+  const routeTurnStart = (parameters: unknown): unknown => {
+    if (!isRecord(parameters)) return parameters;
+    const threadId = threadIdFromParameters(parameters);
+    if (threadId && threadSelectedModels.has(threadId)) {
+      const configured = threadSelectedModels.get(threadId);
+      return configured !== null && configured !== undefined
+        ? { ...parameters, model: configured }
+        : parameters;
+    }
+    if (
+      threadId &&
+      (knownExternalThreadIds.has(threadId) || knownOfficialThreadIds.has(threadId))
+    ) {
+      return parameters;
+    }
+    if (pendingDraftThreadModel !== null) {
+      const model = pendingDraftThreadModel;
+      if (threadId) {
+        threadSelectedModels.set(threadId, model);
+        knownExternalThreadIds.add(threadId);
+        knownOfficialThreadIds.delete(threadId);
+      }
+      pendingDraftThreadModel = null;
+      return { ...parameters, model };
+    }
+    return parameters;
+  };
+  // ChatGPT 26.908 ships an external-agent import surface that can poll
+  // externalAgentConfig/import/readHistories hundreds of times per second,
+  // flooding the request channel and stalling the renderer's task queue
+  // (measured: setTimeout(100ms) took ~700ms while it ran). The data is a
+  // slowly-changing import history, so serve repeat polls from a short-lived
+  // cache instead of an IPC round trip.
+  const POLL_CACHE_TTL_MS = new Map<string, number>([
+    ["externalAgentConfig/import/readHistories", 2_000],
+  ]);
+  const pollCache = new Map<string, { at: number; value: unknown }>();
+  const dispatchSend = (method: string, parameters: unknown, options?: unknown): unknown => {
+    const routedParameters =
+      method === "thread/start"
+        ? routeThreadStart(parameters)
+        : method === "turn/start"
+          ? routeTurnStart(parameters)
+          : parameters;
     const sendBridged = (): Promise<unknown> =>
       initializeBridge().then(
         () => enqueueBridgeRequest(method, routedParameters, options) as Promise<unknown>,
       );
-    const sendDirect = (): unknown =>
-      options === undefined
-        ? originalSend.call(bridge, method, routedParameters)
-        : originalSend.call(bridge, method, routedParameters, options);
+    const observeDirectResult = (result: unknown): unknown => {
+      if (isRecord(result)) {
+        if (method === "thread/start" || method === "thread/read" || method === "thread/resume") {
+          rememberExternalThread(result.thread);
+          if (
+            method === "thread/start" &&
+            pendingDraftThreadModel !== null &&
+            isRecord(result.thread) &&
+            typeof result.thread.id === "string"
+          ) {
+            threadSelectedModels.set(result.thread.id, pendingDraftThreadModel);
+            knownExternalThreadIds.add(result.thread.id);
+            knownOfficialThreadIds.delete(result.thread.id);
+            pendingDraftThreadModel = null;
+          } else if (method !== "thread/start") {
+            pendingDraftThreadModel = null;
+          }
+        }
+      }
+      return result;
+    };
+    const sendDirect = (): unknown => {
+      const response =
+        options === undefined
+          ? originalSend.call(bridge, method, routedParameters)
+          : originalSend.call(bridge, method, routedParameters, options);
+      if (response && typeof (response as Promise<unknown>).then === "function") {
+        return (response as Promise<unknown>).then(observeDirectResult);
+      }
+      return observeDirectResult(response);
+    };
     const unresolvedThreadId = shouldResolveThreadOwnership(method, routedParameters);
     if (unresolvedThreadId) {
       return resolveThreadOwnership(unresolvedThreadId).then((owner) =>
@@ -529,6 +616,20 @@ export function installDraftPrewarmPolicyBridge(
       );
     }
     return shouldUseBridge(method, routedParameters) ? sendBridged() : sendDirect();
+  };
+  const routedSend = (method: string, parameters: unknown, options?: unknown): unknown => {
+    const cacheTtl = POLL_CACHE_TTL_MS.get(method);
+    if (cacheTtl === undefined) return dispatchSend(method, parameters, options);
+    const hit = pollCache.get(method);
+    if (hit !== undefined && Date.now() - hit.at < cacheTtl) return Promise.resolve(hit.value);
+    const result = dispatchSend(method, parameters, options);
+    if (result !== null && typeof (result as Promise<unknown>)?.then === "function") {
+      return (result as Promise<unknown>).then((value) => {
+        pollCache.set(method, { at: Date.now(), value });
+        return value;
+      });
+    }
+    return result;
   };
   const routedPrewarm = (parameters: unknown, options?: unknown): unknown => {
     const routedParameters = routeThreadStart(parameters);
@@ -602,9 +703,22 @@ export function installDraftPrewarmPolicyBridge(
     requestTarget(): RendererHostRequestManager {
       return manager;
     },
-    select(model: string | null): boolean {
+    select(model: string | null, threadId?: string): boolean {
       if (model !== null && (typeof model !== "string" || !model.startsWith("codexhost/"))) {
         throw new Error("Draft route Model must be a codexhost transport carrier");
+      }
+      if (threadId) {
+        const previous = threadSelectedModels.get(threadId);
+        if (previous === model) return false;
+        threadSelectedModels.set(threadId, model);
+        if (model !== null) {
+          knownExternalThreadIds.add(threadId);
+          knownOfficialThreadIds.delete(threadId);
+        } else {
+          knownOfficialThreadIds.add(threadId);
+          knownExternalThreadIds.delete(threadId);
+        }
+        return true;
       }
       if (selectedModel === model) return false;
       selectedModel = model;

@@ -205,10 +205,13 @@ describe("Antigravity shadow HOME", () => {
     await writeFile(path.join(realHome, ".gitconfig"), "[user]\n", "utf8");
     const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
     const shadowHome = path.join(shadowRoot, "work", "home");
-    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot });
+    const createKeychain = async (file: string): Promise<void> => {
+      await writeFile(file, "fake keychain", "utf8");
+    };
+    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot, createKeychain });
     await rm(path.join(shadowHome, ".gitconfig"));
     await writeFile(path.join(shadowHome, ".gitconfig"), "local override", "utf8");
-    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot });
+    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot, createKeychain });
     expect(await readFile(path.join(shadowHome, ".gitconfig"), "utf8")).toBe("local override");
   });
 });
@@ -296,6 +299,49 @@ describe("AntigravityAccountStore", () => {
     expect(store.accountForNativeSession("conv-1")?.id).toBe("work");
     expect(store.resolveAccountForThread("thread-unknown").id).toBe("default");
     expect(store.resolveAccountForThread(undefined).id).toBe("default");
+  });
+
+  it("persists quota cooldowns and skips exhausted accounts for new Threads", async () => {
+    const { store } = await makeStore();
+    await store.createAccount({ id: "work" });
+    await store.markCooldown("default", new Date(Date.now() + 60_000).toISOString());
+
+    const defaultAccount = store.get("default");
+    if (!defaultAccount) throw new Error("Default account was not created");
+    expect(store.isUsable(defaultAccount)).toBe(false);
+    expect(store.firstAvailableAccount()?.id).toBe("work");
+
+    const reloaded = loadAntigravityAccountsSync({ environment: { HOME: store.realHome } });
+    expect(reloaded.mode).toBe("multi");
+    if (reloaded.mode !== "multi") return;
+    expect(reloaded.store.get("default")?.state).toBe("cooldown");
+  });
+
+  it("does not route an unbound Thread to an unavailable configured default", async () => {
+    const { store } = await makeStore();
+    await store.createAccount({ id: "work" });
+    await store.setDefaultAccount("work");
+    await store.markCooldown("work", new Date(Date.now() + 60_000).toISOString());
+
+    expect(store.resolveAccountForThread("new-thread").id).toBe("default");
+    await store.bindThread({
+      threadId: "existing-thread",
+      accountId: "work",
+      nativeSessionId: "conv-work",
+      state: "committed",
+    });
+    expect(store.resolveAccountForThread("existing-thread").id).toBe("work");
+  });
+
+  it("clears the login fuse after an explicit successful login", async () => {
+    const { store } = await makeStore();
+    await store.createAccount({ id: "work" });
+    await store.markCooldown("work", new Date(Date.now() + 60_000).toISOString());
+    await store.markReady("work");
+
+    expect(store.get("work")).toMatchObject({ id: "work", enabled: true });
+    expect(store.get("work")).not.toHaveProperty("state");
+    expect(store.get("work")).not.toHaveProperty("cooldownUntil");
   });
 
   it("drops bindings when an account is removed and keeps the legacy account", async () => {

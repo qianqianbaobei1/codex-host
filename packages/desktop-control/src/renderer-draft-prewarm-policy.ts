@@ -61,15 +61,22 @@ const FIND_REQUEST_MANAGER_EXPRESSION = `(() => {
   }
   const managers = new Set();
   const activeHostIds = new Set();
-  for (let depth = 0; fiber != null && depth < 200; depth += 1, fiber = fiber.return) {
-    const props = fiber.memoizedProps;
+  // ChatGPT 26.908 moved the request manager out of the Composer ancestor
+  // chain, so walk the full fiber neighborhood instead of only fiber.return.
+  const seen = new Set();
+  const queue = [fiber];
+  for (let scanned = 0; queue.length > 0 && scanned < 20000; scanned += 1) {
+    const current = queue.pop();
+    if (current == null || seen.has(current)) continue;
+    seen.add(current);
+    const props = current.memoizedProps;
     if (props != null && typeof props === 'object') {
       for (const name of ['executionTargetHostId', 'permissionsHostId']) {
         const value = props[name];
         if (typeof value === 'string' && value.length > 0) activeHostIds.add(value);
       }
     }
-    let hook = fiber.memoizedState;
+    let hook = current.memoizedState;
     for (let index = 0; hook != null && index < 120; index += 1, hook = hook.next) {
       const value = hook.memoizedState;
       if (
@@ -85,6 +92,9 @@ const FIND_REQUEST_MANAGER_EXPRESSION = `(() => {
         managers.add(value);
       }
     }
+    if (current.sibling != null) queue.push(current.sibling);
+    if (current.child != null) queue.push(current.child);
+    if (current.return != null) queue.push(current.return);
   }
   const candidates = [...managers].map((manager) => {
     const requestClient =

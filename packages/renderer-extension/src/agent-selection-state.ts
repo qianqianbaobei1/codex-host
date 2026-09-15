@@ -14,6 +14,7 @@ export const KNOWN_RENDERER_AGENTS = [
   "omp",
   "antigravity",
   "kiro-cli",
+  "cursor-cli",
 ] as const;
 export const DEFAULT_RENDERER_AGENTS = KNOWN_RENDERER_AGENTS;
 export type RendererAgent = (typeof KNOWN_RENDERER_AGENTS)[number];
@@ -42,6 +43,7 @@ export interface DraftComposerState {
   antigravityThinkingOptionId?: HarnessThinkingOptionId;
   kiroCliModel?: HarnessModelRef;
   kiroCliThinkingOptionId?: HarnessThinkingOptionId;
+  cursorCliModel?: HarnessModelRef;
   permissionModeByAgent?: Partial<Record<ExternalRendererAgent, HarnessPermissionModeId>>;
 }
 
@@ -89,6 +91,9 @@ export class DraftAgentController<Composer extends object> {
   readonly #states = new WeakMap<Composer, MutableComposerState>();
   readonly #switching = new Set<MutableComposerState>();
   readonly #pendingSubmissions = new Set<MutableComposerState>();
+  // A Thread's Agent is owned by the Host, but a user who switches it must not
+  // have that choice overwritten by the next ownership restore.
+  readonly #userSwitchedAgents = new Set<MutableComposerState>();
   #composerSequence = 0;
   #modelRequestSequence = 0;
   #ownershipRequestSequence = 0;
@@ -134,6 +139,10 @@ export class DraftAgentController<Composer extends object> {
 
   isSwitching(composer: Composer): boolean {
     return this.#switching.has(this.#state(composer));
+  }
+
+  isUserSwitched(composer: Composer): boolean {
+    return this.#userSwitchedAgents.has(this.#state(composer));
   }
 
   beginModelRequest(composer: Composer): number {
@@ -198,7 +207,7 @@ export class DraftAgentController<Composer extends object> {
     if (!this.#enabledAgents.has(agent)) return null;
     const state = this.#state(composer);
     this.#pendingSubmissions.delete(state);
-    state.agent = agent;
+    if (!this.#userSwitchedAgents.has(state)) state.agent = agent;
     state.phase = "locked";
     if (agent === "codex" && codexAccountId) state.codexAccountId = codexAccountId;
     else delete state.codexAccountId;
@@ -210,6 +219,7 @@ export class DraftAgentController<Composer extends object> {
     if (agent === "omp" && model) state.ompModel = model;
     if (agent === "antigravity" && model) state.antigravityModel = model;
     if (agent === "kiro-cli" && model) state.kiroCliModel = model;
+    if (agent === "cursor-cli" && model) state.cursorCliModel = model;
     if (agent === "pi" && thinkingOptionId) state.piThinkingOptionId = thinkingOptionId;
     else if (agent === "pi") delete state.piThinkingOptionId;
     if (agent === "claude-code" && thinkingOptionId) {
@@ -239,6 +249,7 @@ export class DraftAgentController<Composer extends object> {
         "omp",
         "antigravity",
         "kiro-cli",
+        "cursor-cli",
       ] as const) {
         const current = state.permissionModeByAgent?.[candidate];
         if (candidate !== agent && current) permissionModeByAgent[candidate] = current;
@@ -263,6 +274,7 @@ export class DraftAgentController<Composer extends object> {
     if (agent === "omp") return state.ompModel;
     if (agent === "antigravity") return state.antigravityModel;
     if (agent === "kiro-cli") return state.kiroCliModel;
+    if (agent === "cursor-cli") return state.cursorCliModel;
     return undefined;
   }
 
@@ -315,7 +327,52 @@ export class DraftAgentController<Composer extends object> {
     else if (agent === "omp") state.ompModel = model;
     else if (agent === "antigravity") state.antigravityModel = model;
     else if (agent === "kiro-cli") state.kiroCliModel = model;
+    else if (agent === "cursor-cli") state.cursorCliModel = model;
     return state;
+  }
+
+  clearExternalConfiguration(composer: Composer, agent: ExternalRendererAgent): void {
+    const state = this.#state(composer);
+    switch (agent) {
+      case "pi":
+        delete state.piModel;
+        break;
+      case "claude-code":
+        delete state.claudeModel;
+        break;
+      case "deepseek-harness":
+        delete state.deepSeekHarnessModel;
+        break;
+      case "opencode":
+        delete state.openCodeModel;
+        break;
+      case "grok":
+        delete state.grokModel;
+        break;
+      case "omp":
+        delete state.ompModel;
+        break;
+      case "antigravity":
+        delete state.antigravityModel;
+        break;
+      case "kiro-cli":
+        delete state.kiroCliModel;
+        break;
+      case "cursor-cli":
+        delete state.cursorCliModel;
+        break;
+    }
+    this.setExternalThinkingOption(composer, agent);
+    if (state.permissionModeByAgent) {
+      const permissionModeByAgent = Object.fromEntries(
+        Object.entries(state.permissionModeByAgent).filter(([key]) => key !== agent),
+      ) as NonNullable<DraftComposerState["permissionModeByAgent"]>;
+      if (Object.keys(permissionModeByAgent).length > 0) {
+        state.permissionModeByAgent = permissionModeByAgent;
+      } else {
+        delete state.permissionModeByAgent;
+      }
+    }
   }
 
   setPiConfiguration(
@@ -411,6 +468,7 @@ export class DraftAgentController<Composer extends object> {
       state.codexAccountId = codexAccountId;
     }
     this.#lastSubmittedAgent = state.agent;
+    this.#userSwitchedAgents.delete(state);
     return state;
   }
 
@@ -443,7 +501,7 @@ export class DraftAgentController<Composer extends object> {
   ): Promise<boolean> {
     const state = this.#state(composer);
     if (!this.#enabledAgents.has(nextAgent)) return false;
-    if (state.phase !== "draft" || this.#switching.has(state)) return false;
+    if (this.#switching.has(state)) return false;
     if (state.agent === nextAgent) return true;
 
     this.#pendingSubmissions.delete(state);
@@ -462,6 +520,7 @@ export class DraftAgentController<Composer extends object> {
         return false;
       }
       state.agent = nextAgent;
+      this.#userSwitchedAgents.add(state);
       return true;
     } finally {
       this.#switching.delete(state);

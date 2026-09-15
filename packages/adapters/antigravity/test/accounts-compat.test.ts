@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ANTIGRAVITY_ACCOUNT_ID_ENV,
@@ -13,6 +13,7 @@ import {
   AntigravityAdapter,
   type AntigravityCliTransportLike,
 } from "../src/antigravity-adapter.js";
+import { AntigravityTransportError } from "../src/transport.js";
 
 const roots: string[] = [];
 
@@ -163,6 +164,7 @@ describe("Antigravity multi-account compatibility gate (spawn level)", () => {
     const adapter = new AntigravityAdapter({
       command,
       accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
       environment: {
         ...process.env,
         HOME: realHome,
@@ -210,6 +212,7 @@ describe("Antigravity multi-account compatibility gate (spawn level)", () => {
     const adapter = new AntigravityAdapter({
       command,
       accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
       environment: {
         ...process.env,
         HOME: realHome,
@@ -286,6 +289,7 @@ describe("Antigravity account binding persistence", () => {
     const adapter = new AntigravityAdapter(
       {
         accounts: { mode: "multi", store },
+        manageDarwinKeychain: false,
         environment: {
           ...process.env,
           HOME: realHome,
@@ -333,6 +337,7 @@ describe("Antigravity account binding persistence", () => {
     const adapter = new AntigravityAdapter(
       {
         accounts: { mode: "multi", store },
+        manageDarwinKeychain: false,
         environment: {
           ...process.env,
           HOME: realHome,
@@ -411,6 +416,7 @@ describe("Antigravity account settings surface", () => {
     const adapter = new AntigravityAdapter({
       command,
       accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
       environment: {
         ...process.env,
         HOME: realHome,
@@ -424,15 +430,28 @@ describe("Antigravity account settings surface", () => {
       expect(rows.map((row) => row.accountId).sort()).toEqual(["default", "work"]);
       expect(rows.every((row) => row.selectable === true)).toBe(true);
       expect(rows.find((row) => row.accountId === "default")?.isDefault).toBe(true);
-      // remaining 0.75 -> 25% used; the shadow account reports 90% used.
-      expect(rows.find((row) => row.accountId === "default")?.credits.usedPercent).toBe(25);
-      expect(rows.find((row) => row.accountId === "work")?.credits.usedPercent).toBe(90);
+      // Account listing is metadata-only and must not trigger a quota/auth
+      // probe. A previously written host-level snapshot may still be exposed
+      // for the explicitly legacy account.
 
       await adapter.selectAccount("work");
       expect(store.defaultAccount()?.id).toBe("work");
       const after = await adapter.inspectAccounts();
       expect(after?.find((row) => row.accountId === "work")?.isDefault).toBe(true);
       expect(after?.find((row) => row.accountId === "default")?.isDefault).toBe(false);
+
+      // Quota probing is explicit: the lightweight account listing above must
+      // stay metadata-only, while Settings can ask for fresh per-account data.
+      await adapter.refreshAccountCredits();
+      const refreshed = await adapter.inspectAccounts();
+      expect(refreshed?.find((row) => row.accountId === "default")?.credits).toMatchObject({
+        usedPercent: 25,
+        periodType: "weekly",
+      });
+      expect(refreshed?.find((row) => row.accountId === "work")?.credits).toMatchObject({
+        usedPercent: 90,
+        periodType: "weekly",
+      });
     } finally {
       await adapter.close();
     }
@@ -443,6 +462,49 @@ describe("Antigravity account settings surface", () => {
     expect(await adapter.inspectAccounts()).toBeNull();
     await expect(adapter.selectAccount("work")).rejects.toThrow(/multi-account/u);
     await adapter.close();
+  });
+
+  it("opens an explicit account login terminal without running AGY in the Host", async () => {
+    const root = await makeRoot("login-terminal");
+    const realHome = path.join(root, "home");
+    await mkdir(realHome, { recursive: true });
+    const command = await writeFakeAgy(root);
+    const store = new AntigravityAccountStore({
+      file: path.join(realHome, ".agy-accounts", "accounts.json"),
+      realHome,
+      value: accountsValue({
+        accounts: [
+          { id: "default", name: "本机", legacy: true, enabled: true },
+          { id: "work", name: "工作", enabled: true, state: "needs_login" },
+        ],
+      }),
+    });
+    let scriptPath = "";
+    const adapter = new AntigravityAdapter(
+      {
+        command,
+        accounts: { mode: "multi", store },
+        environment: { ...process.env, HOME: realHome },
+        manageDarwinKeychain: false,
+      },
+      {
+        openLoginTerminal: async (input) => {
+          scriptPath = input.scriptPath;
+        },
+      },
+    );
+    try {
+      await adapter.loginAccount("work");
+      expect(scriptPath).toMatch(/work-[0-9a-f-]+\.command$/u);
+      const script = await readFile(scriptPath, "utf8");
+      expect(script).toContain('--prompt-interactive ""');
+      expect(script).toContain(
+        `export HOME='${path.join(realHome, ".agy-accounts", "work", "home")}'`,
+      );
+      expect(store.get("work")?.state).toBe("needs_login");
+    } finally {
+      await adapter.close();
+    }
   });
 });
 
@@ -485,7 +547,7 @@ describe("Antigravity per-Thread account routing", () => {
     await store.bindThread({ threadId: "thread-9", accountId: "work", state: "committed" });
     let captured: NodeJS.ProcessEnv | undefined;
     const adapter = new AntigravityAdapter(
-      { accounts: { mode: "multi", store }, environment },
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
       {
         listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
         createTransport: (options) => {
@@ -514,11 +576,36 @@ describe("Antigravity per-Thread account routing", () => {
     }
   });
 
+  it("routes an unbound create to the selected default account", async () => {
+    const { realHome, cwd, store, environment } = await setup();
+    await store.setDefaultAccount("work");
+    let captured: NodeJS.ProcessEnv | undefined;
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      {
+        listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
+        createTransport: (options) => {
+          captured = options.environment;
+          return fakeTransport("conv-default");
+        },
+      },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect(captured?.HOME).toBe(path.join(realHome, ".agy-accounts", "work", "home"));
+      await opened.value.close();
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it("resume follows the native Session owner, not a stale Thread binding", async () => {
     const { realHome, cwd, store, environment } = await setup();
     await store.bindThread({ threadId: "thread-owner", accountId: "work", state: "committed" });
     const creator = new AntigravityAdapter(
-      { accounts: { mode: "multi", store }, environment },
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
       {
         listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
         createTransport: () => fakeTransport("conv-own"),
@@ -540,7 +627,7 @@ describe("Antigravity per-Thread account routing", () => {
     await store.bindThread({ threadId: "thread-9", accountId: "default", state: "committed" });
     let captured: NodeJS.ProcessEnv | undefined;
     const adapter = new AntigravityAdapter(
-      { accounts: { mode: "multi", store }, environment },
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
       {
         listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
         createTransport: (options) => {
@@ -559,6 +646,42 @@ describe("Antigravity per-Thread account routing", () => {
       expect(opened.ok).toBe(true);
       if (!opened.ok) return;
       expect(captured?.HOME).toBe(path.join(realHome, ".agy-accounts", "work", "home"));
+      await opened.value.close();
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("persists an exhausted account cooldown from the transport fault callback", async () => {
+    const { cwd, store, environment } = await setup();
+    let onFault: ((error: AntigravityTransportError) => void) | undefined;
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      {
+        listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
+        createTransport: (options) => {
+          onFault = options.onFault;
+          return fakeTransport("conv-quota");
+        },
+      },
+    );
+    try {
+      const opened = await adapter.open({
+        kind: "create",
+        cwd,
+        environment: { [ANTIGRAVITY_ACCOUNT_ID_ENV]: "work" },
+      });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      onFault?.(
+        new AntigravityTransportError("quotaExhausted", "quota exhausted", {
+          diagnostic: "Resets in 2h48m22s",
+        }),
+      );
+      await vi.waitFor(() => expect(store.get("work")?.state).toBe("cooldown"));
+      const cooledAccount = store.get("work");
+      if (!cooledAccount) throw new Error("Cooled account was not persisted");
+      expect(store.isUsable(cooledAccount)).toBe(false);
       await opened.value.close();
     } finally {
       await adapter.close();

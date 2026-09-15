@@ -233,21 +233,52 @@ export function composePluginBridgePrompt(
   return [...sections, "【原始用户请求】", userText].join("\n\n");
 }
 
+export function isRuleBridgeDisabled(
+  environment: NodeJS.ProcessEnv,
+  configContent?: string | null,
+): boolean {
+  if (
+    environment.CODEXHOST_DISABLE_RULE_BRIDGE === "1" ||
+    environment.CODEXHOST_DISABLE_RULE_BRIDGE === "true" ||
+    environment.CODEXHOST_ANTIGRAVITY_SKIP_RULES === "1" ||
+    environment.CODEXHOST_ANTIGRAVITY_SKIP_RULES === "true"
+  ) {
+    return true;
+  }
+  if (configContent) {
+    const match = configContent.match(/\[(?:codexhost|codex-host)\][\s\S]*?bridge_rules\s*=\s*(false|true)/i);
+    if (match && match[1]?.toLowerCase() === "false") {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function readSelectedPluginSkillPrompt(
   userText: string,
   environment: NodeJS.ProcessEnv,
   cwd?: string,
 ): Promise<string> {
   try {
-    const rules = await readCodexRules(environment, cwd);
+    if (
+      environment.CODEXHOST_DISABLE_PLUGIN_BRIDGE === "1" ||
+      environment.CODEXHOST_DISABLE_PLUGIN_BRIDGE === "true"
+    ) {
+      return userText;
+    }
+
     const configPath = path.join(codexHome(environment), "config.toml");
+    let configContent: string | null = null;
     let enabled = new Set<string>();
     try {
-      const config = await readFile(configPath, "utf8");
-      enabled = enabledPluginIdsFromConfig(config);
+      configContent = await readFile(configPath, "utf8");
+      enabled = enabledPluginIdsFromConfig(configContent);
     } catch {
       // config.toml missing is ok
     }
+
+    const rulesDisabled = isRuleBridgeDisabled(environment, configContent);
+    const rules = rulesDisabled ? null : await readCodexRules(environment, cwd);
 
     let skills: PluginBridgeSkill[] = [];
     if (enabled.size > 0) {

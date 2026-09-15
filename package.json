@@ -25,6 +25,7 @@
   "scripts": {
     "start": "node tools/dev-desktop/run.mjs",
     "install:local": "bash scripts/install-local.sh",
+    "antigravity:account": "node packages/adapters/antigravity/scripts/antigravity-account.mjs",
     "build": "npm run build:typescript && npm run build:renderer && npm run build:release && npm run build:rust",
     "build:typescript": "tsc -b && npm run build:plugins",
     "build:release": "npm run build:release:host && npm run build:release:desktop-control",

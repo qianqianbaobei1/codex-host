@@ -340,9 +340,97 @@ describe("AntigravityAdapter", () => {
     }
   });
 
+  it("projects Antigravity tool output as structured replacements", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-tool-output-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transport: AntigravityCliTransportLike = {
+      conversationId: "conv-tool-output-1",
+      logPath: null,
+      async start() {
+        return { conversationId: "conv-tool-output-1", cwd: root, model: MODEL };
+      },
+      async setModel(model: string) {
+        return { conversationId: "conv-tool-output-1", cwd: root, model };
+      },
+      async setEffort() {
+        return { conversationId: "conv-tool-output-1", cwd: root, model: MODEL };
+      },
+      async setPermissionMode() {
+        return { conversationId: "conv-tool-output-1", cwd: root, model: MODEL };
+      },
+      async runTurn(_text, onStep) {
+        onStep({
+          stepType: "tool",
+          state: "ACTIVE",
+          stepIndex: 1,
+          toolName: "ViewFile",
+          toolInfo: { parameters: { path: "README.md" }, output: "first" },
+        });
+        onStep({
+          stepType: "tool",
+          state: "DONE",
+          stepIndex: 1,
+          toolName: "ViewFile",
+          toolInfo: { parameters: { path: "README.md" }, output: "first second" },
+        });
+        return {
+          conversationId: "conv-tool-output-1",
+          status: "SUCCESS",
+          response: "finished",
+          numTurns: 1,
+        };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      {
+        createTransport: () => transport,
+        listModels: async () => ({ stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" }),
+      },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const outputs = waitForTurn(opened.value);
+      await opened.value.execute({
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("tool-output-turn"),
+        input: [{ type: "text", text: "read the file" }],
+      });
+      const events = await outputs;
+      const updates = events.flatMap((output) =>
+        output.kind === "event" && output.event.type === "item.updated" ? [output.event] : [],
+      );
+      expect(updates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            update: {
+              type: "output.replace",
+              output: { content: [{ type: "text", text: "first" }] },
+            },
+          }),
+          expect.objectContaining({
+            update: {
+              type: "output.replace",
+              output: { content: [{ type: "text", text: "first second" }] },
+            },
+          }),
+        ]),
+      );
+      expect(updates.some((event) => event.update.type === "output.append")).toBe(false);
+      await opened.value.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("supports thinking.select and updates effectiveThinkingOptionId", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-thinking-test-"));
-    const environment = { ANTIGRAVITY_APP_DATA_DIR: root };
+    const environment = { ANTIGRAVITY_APP_DATA_DIR: root, CODEXHOST_DATA_DIR: root };
     const transportFactory = fakeTransportFactory("conv-thinking-select-1");
     // The CLI lists effort variants as separate rows; the Model catalog then
     // exposes them as Thinking options (upstream-aligned parsing).
@@ -452,6 +540,74 @@ describe("AntigravityAdapter", () => {
     }
   });
 
+  it("does not start a Turn when Session startup fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-start-fail-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let startCalls = 0;
+    const transport: AntigravityCliTransportLike = {
+      conversationId: undefined,
+      logPath: null,
+      async start() {
+        startCalls += 1;
+        if (startCalls === 1) {
+          return { conversationId: "conv-start-fail", cwd: root, model: MODEL };
+        }
+        throw new Error("Antigravity Session startup timed out");
+      },
+      async setModel(model: string) {
+        return { conversationId: "conv-start-fail", cwd: root, model };
+      },
+      async setEffort() {
+        return { conversationId: "conv-start-fail", cwd: root, model: MODEL };
+      },
+      async setPermissionMode() {
+        return { conversationId: "conv-start-fail", cwd: root, model: MODEL };
+      },
+      async runTurn() {
+        throw new Error("runTurn must not run when start failed");
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const adapter = new AntigravityAdapter(
+      {
+        command: path.join(os.homedir(), ".local/bin/agy"),
+        environment,
+      },
+      {
+        createTransport: () => transport,
+        listModels: async () => ({ stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" }),
+      },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const events: HarnessOutput[] = [];
+      const consuming = (async () => {
+        for await (const output of session.outputs) events.push(output);
+      })();
+      const started = await session.execute({
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("start-fail-turn"),
+        input: [{ type: "text", text: "hello" }],
+      });
+      expect(started).toMatchObject({
+        ok: false,
+        error: { message: "Antigravity Session startup timed out" },
+      });
+      await session.close();
+      await consuming;
+      expect(
+        events.filter((output) => output.kind === "event" && output.event.type === "turn.started"),
+      ).toHaveLength(0);
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("caches inspect results and only refreshes when refresh is requested", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-cache-test-"));
     const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
@@ -486,6 +642,73 @@ describe("AntigravityAdapter", () => {
       expect(listCalls).toBe(2);
     } finally {
       await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the persisted account catalog across cwd changes and adapter restarts", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-persisted-cache-"));
+    const firstCwd = path.join(root, "first-cwd");
+    const secondCwd = path.join(root, "second-cwd");
+    await mkdir(firstCwd, { recursive: true });
+    await mkdir(secondCwd, { recursive: true });
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let listCalls = 0;
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      listCalls += 1;
+      return { stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" };
+    };
+    const createAdapter = (): AntigravityAdapter =>
+      new AntigravityAdapter(
+        { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+        { createTransport: () => fakeTransportFactory("persisted-cache").create(), listModels },
+      );
+    const first = createAdapter();
+    try {
+      await first.inspect({ cwd: firstCwd });
+    } finally {
+      await first.close();
+    }
+
+    const second = createAdapter();
+    try {
+      await expect(second.inspect({ cwd: secondCwd })).resolves.toMatchObject({ status: "ready" });
+      expect(listCalls).toBe(1);
+    } finally {
+      await second.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat persisted readiness as valid after the configured CLI disappears", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-cache-command-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const first = new AntigravityAdapter(
+      { command: "/bin/sh", environment },
+      { createTransport: () => fakeTransportFactory("persisted-command").create(), listModels },
+    );
+    await expect(first.inspect({ cwd: root })).resolves.toMatchObject({ status: "ready" });
+    await first.close();
+
+    const second = new AntigravityAdapter(
+      {
+        environment: {
+          ...environment,
+          CODEXHOST_ANTIGRAVITY_COMMAND: path.join(root, "missing-agy"),
+        },
+      },
+      { createTransport: () => fakeTransportFactory("persisted-command").create(), listModels },
+    );
+    try {
+      await expect(second.inspect({ cwd: root })).resolves.toMatchObject({
+        status: "notInstalled",
+      });
+    } finally {
+      await second.close();
       await rm(root, { recursive: true, force: true });
     }
   });

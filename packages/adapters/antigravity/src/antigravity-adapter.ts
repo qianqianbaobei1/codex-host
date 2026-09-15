@@ -1,8 +1,14 @@
-import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  execFile,
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import {
   HarnessOutputChannel,
@@ -69,10 +75,7 @@ import {
 import { readAntigravityCreditsSync } from "./credits.js";
 import { pollAntigravityContextUsage } from "./context-usage.js";
 import { projectAntigravityFileChange } from "./file-change.js";
-import {
-  loadAntigravitySnapshot,
-  mergeAntigravityHistoryTurns,
-} from "./history.js";
+import { loadAntigravitySnapshot, mergeAntigravityHistoryTurns } from "./history.js";
 import { AntigravityHistory } from "./history-sidecar.js";
 import { AntigravitySessionLedger, type AntigravityLedgerTurn } from "./ledger.js";
 import { readSelectedPluginSkillPrompt } from "./plugin-bridge.js";
@@ -99,6 +102,7 @@ import {
   antigravityRealHome,
   type AntigravityAccount,
   type AntigravityAccountsLoad,
+  type AntigravityKeychainRelease,
 } from "./accounts.js";
 import { antigravityToolErrorMessage, isAntigravityPermissionDenial } from "./stream-events.js";
 import { parseToolArgs } from "./transcript.js";
@@ -126,6 +130,8 @@ export interface AntigravityAdapterOptions {
   closeTimeoutMs?: number;
   printTimeout?: string;
   toolOutputLimit?: number;
+  /** Test/embedded-host seam; production multi-account mode keeps strict macOS isolation. */
+  manageDarwinKeychain?: boolean;
 }
 
 export interface AntigravityModelsResult {
@@ -140,6 +146,7 @@ export interface AntigravityAdapterDependencies {
     command?: string;
     environment: NodeJS.ProcessEnv;
   }): Promise<AntigravityModelsResult>;
+  openLoginTerminal?(input: { scriptPath: string }): Promise<void>;
 }
 
 export interface AntigravityCliTransportLike {
@@ -163,6 +170,7 @@ export interface AntigravityCliTransportLike {
 }
 
 const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
+const execFileAsync = promisify(execFile);
 const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
 const DEFAULT_MODELS_TIMEOUT_MS = 30_000;
 const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60_000;
@@ -176,6 +184,7 @@ const INSPECTION_FAILURE_COOLDOWN_MS = 15_000;
 const CONTEXT_PROBE_BACKOFF_MS = 60_000;
 const PERSISTED_INSPECTION_VERSION = 1;
 const PERSISTED_INSPECTION_MAX_AGE_MS = 6 * 60 * 60_000;
+const DEFAULT_ACCOUNT_COOLDOWN_MS = 15 * 60_000;
 
 function processHasExited(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
@@ -228,6 +237,17 @@ function nonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function quotaCooldownUntil(error: AntigravityTransportError): string {
+  const text = error.diagnostic ?? error.message;
+  const match = /resets?\s+in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?/iu.exec(text);
+  const hours = Number.parseInt(match?.[1] ?? "0", 10) || 0;
+  const minutes = Number.parseInt(match?.[2] ?? "0", 10) || 0;
+  const seconds = Number.parseInt(match?.[3] ?? "0", 10) || 0;
+  const parsed = (hours * 60 * 60 + minutes * 60 + seconds) * 1000;
+  const duration = Math.min(24 * 60 * 60_000, parsed > 0 ? parsed : DEFAULT_ACCOUNT_COOLDOWN_MS);
+  return new Date(Date.now() + duration).toISOString();
+}
+
 const LEGACY_ACCOUNT_KEY = "legacy";
 
 /** Tag the routed Session so every downstream `#environment()` call resolves the same account. */
@@ -242,6 +262,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+async function fileFingerprint(file: string): Promise<string | null> {
+  const metadata = await stat(file).catch(() => null);
+  return metadata ? `${metadata.mtimeMs}:${metadata.size}` : null;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    timer.unref?.();
+  });
+}
+
 function invalidState(message: string): HarnessError {
   return { code: "invalidState", message, retryable: false };
 }
@@ -252,8 +288,12 @@ function normalizeError(
   stderrTail?: string,
 ): HarnessError {
   if (error instanceof AntigravityTransportError) {
+    // Quota exhaustion is reported to the Host as a plain Harness failure: it is
+    // not retryable until the account changes or the quota window resets.
+    const code: HarnessError["code"] =
+      error.kind === "quotaExhausted" ? "nativeFailure" : error.kind;
     return {
-      code: error.kind,
+      code,
       message: error.message,
       retryable: error.kind === "unavailable" || error.kind === "processExited",
       ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
@@ -472,6 +512,7 @@ class AntigravityHarnessSession implements HarnessSession {
   readonly #ledger: AntigravitySessionLedger;
   readonly #toolOutputLimit: number;
   readonly #sessionIdleTimeoutMs: number;
+  readonly #keychainRelease: AntigravityKeychainRelease | undefined;
   readonly #history: AntigravityHistory | null;
   #transport: AntigravityCliTransportLike;
   #state: HarnessSessionState;
@@ -500,6 +541,7 @@ class AntigravityHarnessSession implements HarnessSession {
     historyRequired?: number;
     toolOutputLimit: number;
     sessionIdleTimeoutMs?: number;
+    keychainRelease?: AntigravityKeychainRelease;
   }) {
     this.#cwd = input.cwd;
     this.#environment = input.environment ?? process.env;
@@ -514,6 +556,7 @@ class AntigravityHarnessSession implements HarnessSession {
     this.#historyRequired = input.historyRequired ?? 0;
     this.#toolOutputLimit = input.toolOutputLimit;
     this.#sessionIdleTimeoutMs = input.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
+    this.#keychainRelease = input.keychainRelease;
     this.outputs = this.#channel.outputs;
     this.#armSessionIdleTimer();
   }
@@ -528,8 +571,7 @@ class AntigravityHarnessSession implements HarnessSession {
         // The sidecar already covers everything the Host recorded; reading
         // Native history here could not add Turns the Host never saw.
         turns = sidecarTurns;
-      }
-      else {
+      } else {
         // Native transcript/ledger is authoritative and may contain Turns that
         // predate or postdate the sidecar; merge instead of shadowing it.
         const snapshot = await loadAntigravitySnapshot(this.#conversationId(), this.#state, {
@@ -590,7 +632,7 @@ class AntigravityHarnessSession implements HarnessSession {
     if (this.#closed) return { ok: false, error: invalidState("Antigravity Session is closed") };
     switch (command.type) {
       case "turn.start":
-        return this.#startTurn(command);
+        return await this.#startTurn(command);
       case "turn.cancel":
         return this.#cancelTurn(command);
       case "model.select":
@@ -620,11 +662,12 @@ class AntigravityHarnessSession implements HarnessSession {
       this.#active = null;
     }
     await this.#transport.close().catch(() => undefined);
+    if (this.#keychainRelease) await this.#keychainRelease().catch(() => undefined);
     await this.#history?.flush().catch(() => undefined);
     this.#channel.end();
   }
 
-  #startTurn(command: TurnStartCommand): HarnessResult<TurnStartAccepted> {
+  async #startTurn(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>> {
     if (this.#active || this.#configuring) {
       return {
         ok: false,
@@ -643,6 +686,25 @@ class AntigravityHarnessSession implements HarnessSession {
           code: "invalidRequest",
           message: "Antigravity Turn must not be empty",
           retryable: false,
+        },
+      };
+    }
+    try {
+      await this.#transport.start();
+    } catch (error) {
+      return {
+        ok: false,
+        error: normalizeError(error, "unavailable", this.#transport.stderrTail),
+      };
+    }
+    if (this.#closed) return { ok: false, error: invalidState("Antigravity Session is closed") };
+    if (this.#active || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Antigravity Session already has an active operation",
+          retryable: true,
         },
       };
     }
@@ -667,11 +729,7 @@ class AntigravityHarnessSession implements HarnessSession {
   async #runTurn(active: ActiveTurn): Promise<void> {
     let result: AntigravityResultEvent | null = null;
     try {
-      const prompt = await readSelectedPluginSkillPrompt(
-        active.text,
-        this.#environment,
-        this.#cwd,
-      );
+      const prompt = await readSelectedPluginSkillPrompt(active.text, this.#environment, this.#cwd);
       result = await this.#transport.runTurn(prompt, (step) => this.#handleStep(active, step));
       if (result.conversationId !== this.#conversationId()) {
         throw new AntigravityTransportError(
@@ -859,15 +917,19 @@ class AntigravityHarnessSession implements HarnessSession {
         )
         .map(({ text: content }) => content)
         .join("");
-      const delta = text.startsWith(tool.output) ? text.slice(tool.output.length) : text;
+      const changed = text !== tool.output;
       tool.output = text;
       tool.item = { ...tool.item, output };
-      if (delta)
+      if (changed)
         this.#event({
           type: "item.updated",
           turnId: active.command.turnId,
           itemId: tool.item.itemId,
-          update: { type: "output.append", text: delta },
+          // ToolExecution output is a structured HostToolOutput. The shared
+          // projector accepts append deltas only for CommandExecution; send
+          // the current structured snapshot so generic AGY tools remain
+          // renderable while their output streams.
+          update: { type: "output.replace", output },
         });
     }
     if (step.state === "DONE") {
@@ -1393,6 +1455,7 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly cachedThreadCapabilities = ANTIGRAVITY_CAPABILITIES;
   readonly #options: AntigravityAdapterOptions;
   readonly #createTransport: (options: AntigravityTransportOptions) => AntigravityCliTransportLike;
+  readonly #openLoginTerminal: (input: { scriptPath: string }) => Promise<void>;
   readonly #listModels: (input: {
     cwd: string;
     command?: string;
@@ -1414,6 +1477,8 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly #creditsByAccount = new Map<string, AccountCreditsSnapshot>();
   readonly #creditsRefreshByAccount = new Map<string, Promise<AccountCreditsSnapshot | null>>();
   readonly #creditsRefreshStartedAt = new Map<string, number>();
+  readonly #accountCooldownUntil = new Map<string, number>();
+  readonly #loginMonitors = new Map<string, Promise<void>>();
 
   constructor(
     options: AntigravityAdapterOptions = {},
@@ -1422,6 +1487,11 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#options = options;
     this.#createTransport =
       dependencies.createTransport ?? ((opts) => new AntigravityCliTransport(opts));
+    this.#openLoginTerminal =
+      dependencies.openLoginTerminal ??
+      (async ({ scriptPath }) => {
+        await execFileAsync("/usr/bin/open", [scriptPath]);
+      });
     this.#listModels = dependencies.listModels ?? defaultListModels;
     this.#accounts = options.accounts ?? { mode: "legacy" };
     this.#accountsRealHome = antigravityRealHome({ ...process.env, ...options.environment });
@@ -1443,14 +1513,51 @@ export class AntigravityAdapter implements HarnessAdapter {
         error: invalidState("Antigravity Adapter is closed"),
       };
     }
+    const accountsFailure = this.#accountsFailure();
+    if (accountsFailure) {
+      return {
+        status: "error",
+        error: { ...accountsFailure, stage: "unavailable", durationMs: 0 },
+      };
+    }
+    const homeFailure = await this.#ensureAccountHome(environment);
+    if (homeFailure) {
+      return {
+        status: "error",
+        error: { ...homeFailure, stage: "unavailable", durationMs: 0 },
+      };
+    }
     const cwd = path.resolve(input.cwd ?? process.cwd());
-    const key = this.#inspectionKey(environment, cwd);
+    const key = this.#inspectionKey(environment);
     await this.#loadPersistedInspectionCache();
     const inFlight = this.#inspectionInFlight.get(key);
     if (inFlight) return inFlight;
     if (!input.refresh) {
       const cached = this.#inspectionCache.get(key);
-      if (cached) return cached;
+      if (cached) {
+        try {
+          // Persisted readiness is only metadata. Revalidate the configured
+          // executable before using it, otherwise uninstalling or changing
+          // CODEXHOST_ANTIGRAVITY_COMMAND leaves a false-ready adapter.
+          resolveAntigravityExecutable({
+            ...(this.#options.command ? { command: this.#options.command } : {}),
+            environment,
+          });
+          return cached;
+        } catch (error) {
+          this.#inspectionCache.delete(key);
+          const normalized = normalizeError(error, "notInstalled");
+          const failed: HarnessInspection = {
+            status: normalized.code === "notInstalled" ? "notInstalled" : "error",
+            error: { ...normalized, stage: "notInstalled", durationMs: 0 },
+          };
+          this.#inspectionFailures.set(key, {
+            inspection: failed,
+            retryAt: Date.now() + INSPECTION_FAILURE_COOLDOWN_MS,
+          });
+          return failed;
+        }
+      }
       const failure = this.#inspectionFailures.get(key);
       if (failure && failure.retryAt > Date.now()) return failure.inspection;
       if (failure) this.#inspectionFailures.delete(key);
@@ -1477,9 +1584,14 @@ export class AntigravityAdapter implements HarnessAdapter {
     });
   }
 
-  #inspectionKey(environment: NodeJS.ProcessEnv, cwd: string): string {
-    const accountId = this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
-    return `${accountId}\u0000${path.resolve(cwd)}`;
+  /**
+   * The catalog this adapter probes is per Account, not per working directory:
+   * AGY's available models do not depend on the Thread's cwd. Keying the cache
+   * by cwd made every new conversation re-probe AGY (spawning a CLI process),
+   * which is what made switching Threads feel slow.
+   */
+  #inspectionKey(environment: NodeJS.ProcessEnv): string {
+    return this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
   }
 
   /**
@@ -1531,11 +1643,17 @@ export class AntigravityAdapter implements HarnessAdapter {
         ...(this.#options.command ? { command: this.#options.command } : {}),
         environment,
       });
-      const result = await this.#listModels({
-        cwd,
-        ...(this.#options.command ? { command: this.#options.command } : {}),
-        environment,
-      });
+      const releaseKeychain = await this.#acquireAccountKeychain(environment);
+      let result: AntigravityModelsResult;
+      try {
+        result = await this.#listModels({
+          cwd,
+          ...(this.#options.command ? { command: this.#options.command } : {}),
+          environment,
+        });
+      } finally {
+        await releaseKeychain();
+      }
       const models = parseAntigravityModelsOutput(result.stdout);
       const catalog = normalizeAntigravityModelCatalog(models);
       return {
@@ -1560,9 +1678,8 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   /**
-   * One row per configured account so the account settings page can show quota
-   * and switch the default. Accounts whose quota probe fails are omitted rather
-   * than shown with fabricated numbers.
+   * One row per configured account. Listing accounts is metadata-only: it must
+   * never run AGY or trigger OAuth just to paint the picker.
    */
   async inspectAccounts(): Promise<readonly HarnessAccountSnapshot[] | null> {
     if (this.#accounts.mode !== "multi") return null;
@@ -1572,32 +1689,188 @@ export class AntigravityAdapter implements HarnessAdapter {
       store
         .list()
         .filter((account) => account.enabled)
-        .map(async (account): Promise<HarnessAccountSnapshot | null> => {
-          const environment = this.#environment({ [ANTIGRAVITY_ACCOUNT_ID_ENV]: account.id });
-          const credits = await this.#refreshCreditsFor(account.id, environment).catch(() => null);
-          if (!credits) return null;
+        .map(async (account): Promise<HarnessAccountSnapshot> => {
+          const credits = this.#creditsFor(account.id);
           return {
             accountId: account.id,
             label: account.name,
             isDefault: account.id === defaultAccountId,
-            selectable: true,
-            credits,
+            selectable: this.#isAccountUsable(account),
+            authState: account.state ?? "ready",
+            ...(credits ? { credits } : {}),
           };
         }),
     );
-    return rows.filter((row): row is HarnessAccountSnapshot => row !== null);
+    return rows;
+  }
+
+  /** Refresh quota telemetry for each configured account without changing the default. */
+  async refreshAccountCredits(): Promise<void> {
+    if (this.#accounts.mode !== "multi") return;
+    const accounts = this.#accounts.store
+      .list()
+      .filter((account) => account.enabled && this.#isAccountUsable(account));
+    for (const account of accounts) {
+      try {
+        await this.#accounts.store.ensureHome(account, {
+          ...(this.#options.manageDarwinKeychain !== undefined
+            ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
+            : {}),
+        });
+        const environment = this.#environment({
+          [ANTIGRAVITY_ACCOUNT_ID_ENV]: account.id,
+        });
+        await this.#refreshCreditsFor(account.id, environment, true);
+      } catch {
+        // Keep the account row visible; the settings surface will show the
+        // existing snapshot or "no quota data" for this account.
+      }
+    }
+  }
+
+  /** Create a new isolated account entry and prepare its shadow HOME and keychain. */
+  async createAccount(accountId: string, name?: string): Promise<void> {
+    if (this.#accounts.mode !== "multi") {
+      throw new Error("Antigravity multi-account mode is not configured");
+    }
+    const account = await this.#accounts.store.createAccount({
+      id: accountId,
+      ...(name !== undefined ? { name } : {}),
+    });
+    await this.#accounts.store.ensureHome(account, {
+      ...(this.#options.manageDarwinKeychain !== undefined
+        ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
+        : {}),
+    });
+  }
+
+  /** Delete a custom isolated account and remove its shadow HOME. */
+  async deleteAccount(accountId: string): Promise<void> {
+    if (this.#accounts.mode !== "multi") {
+      throw new Error("Antigravity multi-account mode is not configured");
+    }
+    await this.#accounts.store.removeAccount(accountId);
+  }
+
+  /**
+   * Open an explicit login terminal for one account. The terminal owns the
+   * OAuth interaction; Host only watches a completion marker/token fingerprint
+   * and never performs a background login or token refresh.
+   */
+  async loginAccount(accountId: string): Promise<void> {
+    if (this.#accounts.mode !== "multi") {
+      throw new Error("Antigravity multi-account mode is not configured");
+    }
+    if (process.platform !== "darwin") {
+      throw new Error("Antigravity account login terminal is supported on macOS only");
+    }
+    const account = this.#accounts.store.get(accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
+    if (this.#loginMonitors.has(accountId)) return;
+
+    const environment = this.#environment({ [ANTIGRAVITY_ACCOUNT_ID_ENV]: accountId });
+    const home = await this.#accounts.store.ensureHome(account, {
+      ...(this.#options.manageDarwinKeychain !== undefined
+        ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
+        : {}),
+    });
+    const executable = resolveAntigravityExecutable({
+      ...(this.#options.command ? { command: this.#options.command } : {}),
+      environment,
+    });
+    const tokenFile = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    const before = await fileFingerprint(tokenFile);
+    const loginDirectory = path.join(
+      this.#accountsRealHome,
+      "Library",
+      "Application Support",
+      "codexhost",
+      "antigravity-login",
+    );
+    await mkdir(loginDirectory, { recursive: true, mode: 0o700 });
+    const scriptPath = path.join(loginDirectory, `${accountId}-${randomUUID()}.command`);
+    const markerPath = `${scriptPath}.completed`;
+    const releaseKeychain = await this.#acquireAccountKeychain(environment);
+    const script = [
+      "#!/bin/zsh",
+      "set -u",
+      `export HOME=${shellQuote(home)}`,
+      `export PATH=${shellQuote(environment.PATH ?? "/usr/bin:/bin")}`,
+      `MARKER=${shellQuote(markerPath)}`,
+      `AGY=${shellQuote(executable)}`,
+      'echo "CodexHost: 正在为该账号启动独立 Antigravity 登录"',
+      'echo "登录完成后请退出 AGY，再按回车关闭此窗口。"',
+      // This AGY release treats --prompt-interactive as a string option. An
+      // empty initial prompt enters the interactive session without sending a
+      // user message, which is the login flow this terminal needs.
+      '"$AGY" --prompt-interactive ""',
+      "code=$?",
+      'echo "AGY 已退出（code=$code）。CodexHost 会自动检查登录状态。"',
+      'if [ "$code" -eq 0 ]; then /usr/bin/touch -- "$MARKER"; fi',
+      'read -r "?按回车关闭此窗口..."',
+      '/bin/rm -f -- "$0"',
+      "exit $code",
+      "",
+    ].join("\n");
+    await writeFile(scriptPath, script, { encoding: "utf8", mode: 0o700 });
+    await chmod(scriptPath, 0o700);
+    try {
+      await this.#openLoginTerminal({ scriptPath });
+    } catch (error) {
+      await unlink(scriptPath).catch(() => undefined);
+      await unlink(markerPath).catch(() => undefined);
+      await releaseKeychain();
+      throw error;
+    }
+
+    const monitor = this.#monitorLogin(accountId, tokenFile, before, markerPath, releaseKeychain);
+    this.#loginMonitors.set(accountId, monitor);
+    void monitor.finally(() => {
+      if (this.#loginMonitors.get(accountId) === monitor) this.#loginMonitors.delete(accountId);
+    });
+  }
+
+  async #monitorLogin(
+    accountId: string,
+    tokenFile: string,
+    before: string | null,
+    markerPath: string,
+    releaseKeychain: AntigravityKeychainRelease,
+  ): Promise<void> {
+    try {
+      const deadline = Date.now() + 15 * 60_000;
+      while (Date.now() < deadline && !this.#closePromise) {
+        await delay(2_000);
+        const current = await fileFingerprint(tokenFile);
+        const completed = await fileFingerprint(markerPath);
+        if ((current && current !== before) || completed) {
+          if (this.#accounts.mode === "multi") {
+            await this.#accounts.store.markReady(accountId).catch(() => undefined);
+          }
+          return;
+        }
+      }
+    } finally {
+      await unlink(markerPath).catch(() => undefined);
+      await releaseKeychain().catch(() => undefined);
+    }
   }
 
   async selectAccount(accountId: string): Promise<void> {
     if (this.#accounts.mode !== "multi") {
       throw new Error("Antigravity multi-account mode is not configured");
     }
+    const account = this.#accounts.store.get(accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
+    if (!this.#isAccountUsable(account)) {
+      throw new Error(`Antigravity account '${account.name}' is unavailable or in cooldown`);
+    }
     await this.#accounts.store.setDefaultAccount(accountId);
   }
 
   refreshCredits(): Promise<AccountCreditsSnapshot | null> {
     const key = this.#creditsKey();
-    return this.#refreshCreditsFor(key, undefined);
+    return this.#refreshCreditsFor(key, undefined, true);
   }
 
   #creditsKey(environment?: NodeJS.ProcessEnv): string {
@@ -1607,8 +1880,10 @@ export class AntigravityAdapter implements HarnessAdapter {
   #creditsFor(key: string): AccountCreditsSnapshot | null {
     let credits = this.#creditsByAccount.get(key) ?? null;
     // The statusline fallback is produced by the host-level agy process, so it
-    // only ever describes the legacy account.
-    if (!credits && key === LEGACY_ACCOUNT_KEY) {
+    // only ever describes the legacy account (including a configured
+    // multi-account entry explicitly marked as legacy).
+    const account = this.#accounts.mode === "multi" ? this.#accounts.store.get(key) : null;
+    if (!credits && (key === LEGACY_ACCOUNT_KEY || account?.legacy === true)) {
       credits = readAntigravityCreditsSync();
       if (credits) this.#creditsByAccount.set(key, credits);
     }
@@ -1618,12 +1893,22 @@ export class AntigravityAdapter implements HarnessAdapter {
   #refreshCreditsFor(
     key: string,
     environment?: NodeJS.ProcessEnv,
+    force = false,
   ): Promise<AccountCreditsSnapshot | null> {
     if (this.#closePromise) return Promise.resolve(this.#creditsFor(key));
+    if (this.#accounts.mode === "multi") {
+      const account = this.#resolveAccount(environment);
+      if (account && !this.#isAccountUsable(account)) {
+        return Promise.resolve(this.#creditsFor(key));
+      }
+    }
     const inFlight = this.#creditsRefreshByAccount.get(key);
     if (inFlight) return inFlight;
     const now = Date.now();
-    if (now - (this.#creditsRefreshStartedAt.get(key) ?? 0) < CREDITS_REFRESH_COOLDOWN_MS) {
+    if (
+      !force &&
+      now - (this.#creditsRefreshStartedAt.get(key) ?? 0) < CREDITS_REFRESH_COOLDOWN_MS
+    ) {
       return Promise.resolve(this.#creditsFor(key));
     }
     this.#creditsRefreshStartedAt.set(key, now);
@@ -1632,11 +1917,6 @@ export class AntigravityAdapter implements HarnessAdapter {
     });
     this.#creditsRefreshByAccount.set(key, refresh);
     return refresh;
-  }
-
-  #scheduleCreditsRefresh(environment?: NodeJS.ProcessEnv): void {
-    const key = this.#creditsKey(environment);
-    void this.#refreshCreditsFor(key, environment);
   }
 
   async #loadCredits(
@@ -1671,61 +1951,66 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   /** Runs the Antigravity CLI once and resolves stdout (quota probes). */
-  #runAntigravityCommand(
+  async #runAntigravityCommand(
     arguments_: readonly string[],
     environment?: NodeJS.ProcessEnv,
   ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const resolvedEnvironment = environment ?? this.#environment();
-      let executable: string;
-      try {
-        executable = resolveAntigravityExecutable({
-          ...(this.#options.command ? { command: this.#options.command } : {}),
-          environment: resolvedEnvironment,
+    const resolvedEnvironment = environment ?? this.#environment();
+    const releaseKeychain = await this.#acquireAccountKeychain(resolvedEnvironment);
+    try {
+      return await new Promise((resolve, reject) => {
+        let executable: string;
+        try {
+          executable = resolveAntigravityExecutable({
+            ...(this.#options.command ? { command: this.#options.command } : {}),
+            environment: resolvedEnvironment,
+          });
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        const child = spawn(executable, [...arguments_], {
+          env: resolvedEnvironment,
+          detached: process.platform !== "win32",
+          windowsHide: true,
         });
-      } catch (error) {
-        reject(error);
-        return;
-      }
-      const child = spawn(executable, [...arguments_], {
-        env: resolvedEnvironment,
-        detached: process.platform !== "win32",
-        windowsHide: true,
-      });
-      this.#probeProcesses.add(child);
-      let stdout = "";
-      let stderr = "";
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
-      });
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        this.#probeProcesses.delete(child);
-        reject(new Error("Antigravity quota probe timed out"));
-        void terminateProbe(child).catch(() => undefined);
-      }, DEFAULT_PROBE_TIMEOUT_MS);
-      const finish = (callback: () => void): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.#probeProcesses.delete(child);
-        callback();
-      };
-      child.once("error", (error) => finish(() => reject(error)));
-      child.once("exit", (code) => {
-        finish(() => {
-          if (code === 0) resolve(stdout);
-          else reject(new Error(stderr.trim() || `agy exited with code ${String(code)}`));
+        this.#probeProcesses.add(child);
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          stdout += chunk;
+        });
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          this.#probeProcesses.delete(child);
+          reject(new Error("Antigravity quota probe timed out"));
+          void terminateProbe(child).catch(() => undefined);
+        }, DEFAULT_PROBE_TIMEOUT_MS);
+        const finish = (callback: () => void): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.#probeProcesses.delete(child);
+          callback();
+        };
+        child.once("error", (error) => finish(() => reject(error)));
+        child.once("exit", (code) => {
+          finish(() => {
+            if (code === 0) resolve(stdout);
+            else reject(new Error(stderr.trim() || `agy exited with code ${String(code)}`));
+          });
         });
       });
-    });
+    } finally {
+      await releaseKeychain();
+    }
   }
 
   async open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>> {
@@ -1743,17 +2028,49 @@ export class AntigravityAdapter implements HarnessAdapter {
     const accountFailure = this.#accountsFailure();
     if (accountFailure) return { ok: false, error: accountFailure };
     const account = this.#resolveAccountForOpen(input);
+    if (this.#accounts.mode === "multi" && !account) {
+      return {
+        ok: false,
+        error: {
+          code: "unavailable",
+          message: "All Antigravity accounts are unavailable or in cooldown",
+          retryable: true,
+        },
+      };
+    }
+    if (account && this.#accounts.mode === "multi" && !this.#isAccountUsable(account)) {
+      return {
+        ok: false,
+        error: {
+          code: "unavailable",
+          message: `Antigravity account '${account.name}' is unavailable or in cooldown`,
+          retryable: true,
+        },
+      };
+    }
     const routed = account ? withAntigravityAccountMarker(input, account.id) : input;
+    let keychainRelease: AntigravityKeychainRelease | undefined;
+    if (
+      account &&
+      this.#accounts.mode === "multi" &&
+      this.#options.manageDarwinKeychain !== false
+    ) {
+      try {
+        keychainRelease = await this.#accounts.store.acquireKeychainIsolation(account);
+      } catch (error) {
+        return {
+          ok: false,
+          error: {
+            code: "unavailable",
+            message: `Antigravity account isolation could not be established: ${errorMessage(error)}`,
+            retryable: true,
+          },
+        };
+      }
+    }
     const environment = this.#environment(routed.environment);
     const prepared = this.#prepareTransport(routed);
-    const cwd = path.resolve(routed.cwd);
-    const cachedInspection = this.#inspectionCache.get(this.#inspectionKey(environment, cwd));
-    let inspection: HarnessInspection;
-    if (cachedInspection) {
-      inspection = cachedInspection;
-    } else {
-      inspection = await this.#inspectWithEnvironment({ cwd: routed.cwd }, environment);
-    }
+    const inspection = await this.#inspectWithEnvironment({ cwd: routed.cwd }, environment);
     if (inspection.status !== "ready") {
       await this.#closePreparedTransport(prepared);
       return { ok: false, error: harnessErrorFromInspection(inspection.error) };
@@ -1769,14 +2086,16 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     });
     if (routed.kind === "create") {
-      const opened = await this.#openCreate(routed, models, prepared);
+      const opened = await this.#openCreate(routed, models, prepared, keychainRelease);
       if (opened.ok) {
+        keychainRelease = undefined;
         const bindingFailure = await this.#recordBinding(account, routed, opened.value);
         if (bindingFailure) {
           await opened.value.close().catch(() => undefined);
           return { ok: false, error: bindingFailure };
         }
-        this.#scheduleCreditsRefresh(environment);
+      } else {
+        await keychainRelease?.().catch(() => undefined);
       }
       return opened;
     }
@@ -1790,14 +2109,16 @@ export class AntigravityAdapter implements HarnessAdapter {
         },
       };
     }
-    const opened = await this.#openResume(routed, models, prepared);
+    const opened = await this.#openResume(routed, models, prepared, keychainRelease);
     if (opened.ok) {
+      keychainRelease = undefined;
       const bindingFailure = await this.#recordBinding(account, routed, opened.value);
       if (bindingFailure) {
         await opened.value.close().catch(() => undefined);
         return { ok: false, error: bindingFailure };
       }
-      this.#scheduleCreditsRefresh(environment);
+    } else {
+      await keychainRelease?.().catch(() => undefined);
     }
     return opened;
   }
@@ -1819,6 +2140,7 @@ export class AntigravityAdapter implements HarnessAdapter {
       this.#inspectionInFlight.clear();
       this.#inspectionPersistentLoad = null;
       this.#inspectionPersistentWrite = null;
+      this.#loginMonitors.clear();
     })();
     return this.#closePromise;
   }
@@ -1852,22 +2174,25 @@ export class AntigravityAdapter implements HarnessAdapter {
           }
           for (const entry of (parsed as { entries: unknown[] }).entries) {
             if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-            const cwd = (entry as { cwd?: unknown }).cwd;
             const accountId = (entry as { accountId?: unknown }).accountId;
             const updatedAtMs = (entry as { updatedAtMs?: unknown }).updatedAtMs;
             const inspection = harnessInspectionSchema.safeParse(
               (entry as { inspection?: unknown }).inspection,
             );
             if (
-              typeof cwd === "string" &&
               typeof updatedAtMs === "number" &&
               Number.isFinite(updatedAtMs) &&
               Date.now() - updatedAtMs <= PERSISTED_INSPECTION_MAX_AGE_MS &&
               inspection.success &&
               inspection.data.status === "ready"
             ) {
+              // The catalog is account-scoped. Older v1 files also carried a
+              // cwd field; accept those entries while normalizing them to the
+              // current account-only in-memory key.
               this.#inspectionCache.set(
-                `${typeof accountId === "string" ? accountId : LEGACY_ACCOUNT_KEY}\u0000${path.resolve(cwd)}`,
+                typeof accountId === "string" && accountId.length > 0
+                  ? accountId
+                  : LEGACY_ACCOUNT_KEY,
                 inspection.data,
               );
             }
@@ -1886,10 +2211,8 @@ export class AntigravityAdapter implements HarnessAdapter {
     if (!filePath || this.#inspectionCache.size === 0) return;
     const updatedAtMs = Date.now();
     const entries = [...this.#inspectionCache.entries()].map(([key, inspection]) => {
-      const separator = key.indexOf("\u0000");
       return {
-        accountId: separator >= 0 ? key.slice(0, separator) : LEGACY_ACCOUNT_KEY,
-        cwd: separator >= 0 ? key.slice(separator + 1) : key,
+        accountId: key,
         inspection,
         updatedAtMs,
       };
@@ -1917,6 +2240,7 @@ export class AntigravityAdapter implements HarnessAdapter {
     input: Extract<OpenSessionInput, { kind: "create" }>,
     models: readonly AntigravityNativeModel[],
     prepared?: PreparedAntigravityTransport | null,
+    keychainRelease?: AntigravityKeychainRelease,
   ): Promise<HarnessResult<HarnessSession>> {
     let modelSlug: string | undefined;
     let model: AntigravityNativeModel | undefined;
@@ -1994,6 +2318,7 @@ export class AntigravityAdapter implements HarnessAdapter {
           ...(this.#options.sessionIdleTimeoutMs !== undefined
             ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
             : {}),
+          ...(keychainRelease ? { keychainRelease } : {}),
         }),
       );
       return { ok: true, value: session };
@@ -2007,6 +2332,7 @@ export class AntigravityAdapter implements HarnessAdapter {
     input: Extract<OpenSessionInput, { kind: "resume" }>,
     models: readonly AntigravityNativeModel[],
     prepared?: PreparedAntigravityTransport | null,
+    keychainRelease?: AntigravityKeychainRelease,
   ): Promise<HarnessResult<HarnessSession>> {
     let sourceRef: NativeSessionRef;
     let locator: {
@@ -2096,6 +2422,7 @@ export class AntigravityAdapter implements HarnessAdapter {
           ...(this.#options.sessionIdleTimeoutMs !== undefined
             ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
             : {}),
+          ...(keychainRelease ? { keychainRelease } : {}),
         }),
       );
       return { ok: true, value: session };
@@ -2117,10 +2444,12 @@ export class AntigravityAdapter implements HarnessAdapter {
     skipPermissions: boolean,
     effort?: string,
   ): AntigravityTransportOptions {
+    const environment = this.#environment(input.environment);
+    const accountId = this.#resolveAccount(input.environment)?.id;
     return {
       cwd: input.cwd,
       ...(this.#options.command ? { command: this.#options.command } : {}),
-      environment: this.#environment(input.environment),
+      environment,
       ...(conversationId ? { conversationId } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
@@ -2143,7 +2472,18 @@ export class AntigravityAdapter implements HarnessAdapter {
       ...(this.#options.printTimeout !== undefined
         ? { printTimeout: this.#options.printTimeout }
         : {}),
+      onFault: (error) => {
+        if (error.kind !== "quotaExhausted" || !accountId) return;
+        void this.#markAccountCooldown(accountId, error).catch(() => undefined);
+      },
     };
+  }
+
+  async #markAccountCooldown(accountId: string, error: AntigravityTransportError): Promise<void> {
+    if (this.#accounts.mode !== "multi") return;
+    const cooldownUntil = quotaCooldownUntil(error);
+    this.#accountCooldownUntil.set(accountId, Date.parse(cooldownUntil));
+    await this.#accounts.store.markCooldown(accountId, cooldownUntil);
   }
 
   #prepareTransport(input: OpenSessionInput): PreparedAntigravityTransport | null {
@@ -2197,8 +2537,47 @@ export class AntigravityAdapter implements HarnessAdapter {
       ...explicit,
     });
     const account = this.#resolveAccount(explicit);
+    if (!explicit?.[ANTIGRAVITY_ACCOUNT_ID_ENV]) {
+      Reflect.deleteProperty(base, ANTIGRAVITY_ACCOUNT_ID_ENV);
+    }
     if (!account) return base;
     return applyAntigravityAccountEnvironment(base, account, this.#accountsRealHome);
+  }
+
+  async #ensureAccountHome(environment: NodeJS.ProcessEnv): Promise<HarnessError | null> {
+    if (this.#accounts.mode !== "multi") return null;
+    const account = this.#resolveAccount(environment);
+    if (!account) {
+      return {
+        code: "unavailable",
+        message: "Antigravity has no configured account",
+        retryable: true,
+      };
+    }
+    try {
+      await this.#accounts.store.ensureHome(account, {
+        ...(this.#options.manageDarwinKeychain !== undefined
+          ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
+          : {}),
+      });
+      return null;
+    } catch (error) {
+      return {
+        code: "unavailable",
+        message: `Antigravity account HOME could not be prepared: ${errorMessage(error)}`,
+        retryable: true,
+      };
+    }
+  }
+
+  async #acquireAccountKeychain(
+    environment: NodeJS.ProcessEnv,
+  ): Promise<AntigravityKeychainRelease> {
+    if (this.#accounts.mode !== "multi" || this.#options.manageDarwinKeychain === false)
+      return async () => undefined;
+    const account = this.#resolveAccount(environment);
+    if (!account) throw new Error("Antigravity has no configured account");
+    return this.#accounts.store.acquireKeychainIsolation(account);
   }
 
   /** Configured-but-broken accounts must fail closed instead of using the real HOME. */
@@ -2228,13 +2607,35 @@ export class AntigravityAdapter implements HarnessAdapter {
    */
   #resolveAccountForOpen(input: OpenSessionInput): AntigravityAccount | null {
     if (this.#accounts.mode !== "multi") return null;
+    const marker = input.environment?.[ANTIGRAVITY_ACCOUNT_ID_ENV]?.trim();
+    if (marker) return this.#accounts.store.get(marker);
     if (input.kind === "resume") {
       const byNativeSession = this.#accounts.store.accountForNativeSession(
         input.nativeRef.nativeSessionId,
       );
       if (byNativeSession) return byNativeSession;
     }
+    if (input.kind === "create") {
+      const threadId = input.environment?.[ANTIGRAVITY_THREAD_ID_ENV]?.trim();
+      if (threadId && this.#accounts.store.bindingForThread(threadId)) {
+        return this.#resolveAccount(input.environment);
+      }
+      const preferred = this.#accounts.store.defaultAccount();
+      const candidates = preferred
+        ? [preferred, ...this.#accounts.store.list()]
+        : this.#accounts.store.list();
+      return candidates.find((candidate) => this.#isAccountUsable(candidate)) ?? null;
+    }
     return this.#resolveAccount(input.environment);
+  }
+
+  #isAccountUsable(account: AntigravityAccount): boolean {
+    const localUntil = this.#accountCooldownUntil.get(account.id);
+    if (localUntil !== undefined) {
+      if (localUntil > Date.now()) return false;
+      this.#accountCooldownUntil.delete(account.id);
+    }
+    return this.#accounts.mode === "multi" ? this.#accounts.store.isUsable(account) : true;
   }
 
   async #recordBinding(
@@ -2279,11 +2680,13 @@ async function defaultListModels(input: {
     ...(input.command ? { command: input.command } : {}),
     environment: input.environment,
   });
-  const invocation = antigravityModelsInvocation(executable, input.environment);
+  const spawnEnv = { ...input.environment };
+  Reflect.deleteProperty(spawnEnv, ANTIGRAVITY_ACCOUNT_ID_ENV);
+  const invocation = antigravityModelsInvocation(executable, spawnEnv);
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.command, invocation.arguments, {
       cwd: input.cwd,
-      env: input.environment,
+      env: spawnEnv,
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: false,

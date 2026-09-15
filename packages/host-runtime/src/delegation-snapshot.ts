@@ -52,11 +52,33 @@ export function allVisibleMessages(turns: readonly JsonObject[]): DelegationMess
   const messages: DelegationMessage[] = [];
   for (const turn of turns) {
     const turnId = stringValue(turn.id);
-    if (!turnId || !Array.isArray(turn.items)) continue;
-    const agentItems = turn.items.filter(
+    if (!turnId) continue;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    const hasUserMessage = items.some((item) => isRecord(item) && item.type === "userMessage");
+    // Some projected Harness turns carry the user's input on `turn.input`
+    // instead of materializing a userMessage item. Keep handover and
+    // delegation snapshots lossless without duplicating native user items.
+    if (!hasUserMessage && Array.isArray(turn.input)) {
+      for (const [index, input] of turn.input.entries()) {
+        if (
+          isRecord(input) &&
+          input.type === "text" &&
+          typeof input.text === "string" &&
+          input.text.length > 0
+        ) {
+          messages.push({
+            id: `input-${turnId}-${index}`,
+            turnId,
+            role: "user",
+            text: input.text,
+          });
+        }
+      }
+    }
+    const agentItems = items.filter(
       (item): item is JsonObject => isRecord(item) && item.type === "agentMessage",
     );
-    for (const [index, item] of turn.items.entries()) {
+    for (const [index, item] of items.entries()) {
       if (!isRecord(item)) continue;
       const id = stringValue(item.id) ?? stringValue(item.itemId) ?? `item-${turnId}-${index}`;
       if (item.type === "userMessage") {

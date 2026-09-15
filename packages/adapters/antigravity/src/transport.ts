@@ -16,7 +16,12 @@ import {
 } from "./command.js";
 
 export type AntigravityTransportFaultKind =
-  "notInstalled" | "authenticationRequired" | "unavailable" | "protocolError" | "processExited";
+  | "notInstalled"
+  | "authenticationRequired"
+  | "unavailable"
+  | "protocolError"
+  | "processExited"
+  | "quotaExhausted";
 
 export class AntigravityTransportError extends Error {
   readonly diagnostic: string | undefined;
@@ -102,7 +107,7 @@ interface AntigravityActiveTurn {
   onStep(step: AntigravityStepUpdate): void;
 }
 
-const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
 /** Resettable inactivity budget for a genuinely silent Turn. */
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 /** Absolute per-Turn backstop; see `turnDeadlineMs`. */
@@ -110,6 +115,13 @@ const DEFAULT_TURN_DEADLINE_MS = 2 * 60 * 60_000;
 /** Watchdog cadence for checking idle/deadline stalls. */
 const WATCHDOG_INTERVAL_MS = 1_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
+/**
+ * AGY reports an exhausted quota on stderr and then retries with backoff for as
+ * long as `--print-timeout` allows, so the Turn would otherwise stay silent
+ * until the idle watchdog fires.
+ */
+const QUOTA_EXHAUSTED_PATTERN =
+  /RESOURCE_EXHAUSTED|Individual quota reached|quota (?:is )?(?:reached|exhausted)/iu;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -133,6 +145,13 @@ function classifyError(error: unknown, diagnostic?: string): AntigravityTranspor
     return new AntigravityTransportError("notInstalled", error.message, { cause: error });
   }
   const text = `${errorText(error)} ${diagnostic ?? ""}`;
+  if (QUOTA_EXHAUSTED_PATTERN.test(text)) {
+    return new AntigravityTransportError(
+      "quotaExhausted",
+      "Antigravity CLI quota is exhausted; switch accounts or wait for the quota to reset",
+      { cause: error, ...(diagnostic ? { diagnostic } : {}) },
+    );
+  }
   if (/sign[ -]?in|authenticat|credential|login/iu.test(text)) {
     return new AntigravityTransportError(
       "authenticationRequired",
@@ -152,6 +171,13 @@ function classifyExit(
   diagnostic?: string,
 ): AntigravityTransportError {
   const text = diagnostic ?? "";
+  if (QUOTA_EXHAUSTED_PATTERN.test(text)) {
+    return new AntigravityTransportError(
+      "quotaExhausted",
+      "Antigravity CLI quota is exhausted; switch accounts or wait for the quota to reset",
+      diagnostic ? { diagnostic } : undefined,
+    );
+  }
   if (/sign[ -]?in|authenticat|credential|login/iu.test(text)) {
     return new AntigravityTransportError(
       "authenticationRequired",
@@ -345,22 +371,26 @@ export class AntigravityCliTransport {
       throw new AntigravityTransportError("unavailable", "Antigravity Session is closed");
     }
     if (this.#init && this.#child) return this.#init;
-    if (this.#startPromise) return this.#startPromise;
-
-    this.#startPromise = new Promise<AntigravityInitEvent>((resolve, reject) => {
-      this.#resolveStart = resolve;
-      this.#rejectStart = reject;
-      this.#spawn();
-    });
+    if (!this.#startPromise) {
+      this.#startPromise = new Promise<AntigravityInitEvent>((resolve, reject) => {
+        this.#resolveStart = resolve;
+        this.#rejectStart = reject;
+        this.#spawn();
+      }).finally(() => {
+        this.#startPromise = null;
+        this.#resolveStart = null;
+        this.#rejectStart = null;
+      });
+    }
     try {
       return await this.#withTimeout(this.#startPromise, this.#startupTimeoutMs, "Session startup");
     } catch (error) {
-      await this.#terminate("SIGTERM").catch(() => undefined);
+      // A live spawn may still be initializing (proxy, auth, resume). Kill only
+      // when nothing is left to join; otherwise the next start() waits on it.
+      if (this.#closed || !this.#child) {
+        await this.#terminate("SIGTERM").catch(() => undefined);
+      }
       throw error;
-    } finally {
-      this.#startPromise = null;
-      this.#resolveStart = null;
-      this.#rejectStart = null;
     }
   }
 
@@ -667,6 +697,7 @@ export class AntigravityCliTransport {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk}`);
+      this.#failTurnOnQuotaExhaustion(chunk);
     });
     child.once("error", (error) => this.#handleProcessError(error, child));
     child.once("exit", (code, signal) => this.#handleProcessExit(child, code, signal));
@@ -719,6 +750,28 @@ export class AntigravityCliTransport {
         this.#handleProcessError(error, child);
       }
     }
+  }
+
+  /**
+   * Fail the active Turn as soon as AGY reports an exhausted quota. AGY keeps
+   * retrying on its own for up to `--print-timeout`, which otherwise leaves the
+   * user staring at a spinning Turn with no error and no result.
+   */
+  #failTurnOnQuotaExhaustion(chunk: string): void {
+    if (!this.#activeTurn || !QUOTA_EXHAUSTED_PATTERN.test(chunk)) return;
+    const normalized = new AntigravityTransportError(
+      "quotaExhausted",
+      "Antigravity CLI quota is exhausted; switch accounts or wait for the quota to reset",
+      { diagnostic: this.#stderrTail },
+    );
+    const active = this.#activeTurn;
+    // Clear the reference before rejecting. The native process may emit an
+    // exit/error synchronously while it is being terminated; a stale active
+    // turn would otherwise be rejected a second time and retain the Session.
+    this.#activeTurn = null;
+    active.reject(normalized);
+    this.#reportFault(normalized);
+    void this.#terminate("SIGTERM").catch(() => undefined);
   }
 
   #handleProcessError(error: unknown, child: ChildProcessWithoutNullStreams): void {

@@ -1480,4 +1480,97 @@ describe("Codex UI projector", () => {
       value.project({ type: "turn.completed", turnId, outcome: { status: "succeeded" } }),
     ).toThrow("follows the Turn terminal");
   });
+
+  it("normalizes agentMessage markdown links and formatting during streaming and completion", () => {
+    const value = projector();
+    value.project({ type: "turn.started", turnId });
+
+    const agentId = itemId("markdown-agent");
+    value.project({
+      type: "item.started",
+      turnId,
+      item: { type: "agentMessage", itemId: agentId, text: "" },
+    });
+
+    const update1 = value.project({
+      type: "item.updated",
+      turnId,
+      itemId: agentId,
+      update: {
+        type: "text.append",
+        text: "Inspect [`app.ts`](file:///workspace/src/app.ts#L12-L20) for details.",
+      },
+    });
+
+    expect(update1.messages).toEqual([
+      expect.objectContaining({ method: "item/started" }),
+      expect.objectContaining({
+        method: "item/agentMessage/delta",
+        params: expect.objectContaining({
+          delta: "Inspect [app.ts](/workspace/src/app.ts:12) for details.",
+        }),
+      }),
+    ]);
+
+    const completed = value.project({
+      type: "item.completed",
+      turnId,
+      snapshot: {
+        item: {
+          type: "agentMessage",
+          itemId: agentId,
+          text: "Inspect [`app.ts`](file:///workspace/src/app.ts#L12-L20) for details.",
+        },
+        outcome: { status: "succeeded" },
+      },
+    });
+
+    expect(completed.messages).toEqual([
+      expect.objectContaining({
+        method: "item/completed",
+        params: expect.objectContaining({
+          item: expect.objectContaining({
+            type: "agentMessage",
+            text: "Inspect [app.ts](/workspace/src/app.ts:12) for details.",
+          }),
+        }),
+      }),
+    ]);
+  });
+
+  it("normalizes agentMessage markdown in projectHistoricalTurn", () => {
+    const historical = projectHistoricalTurn({
+      turnId,
+      cwd: "/workspace",
+      snapshot: {
+        nativeTurnRef: nativeTurnRefSchema.parse({
+          harnessId: "kiro-cli",
+          nativeSessionId: "native",
+          nativeTurnKey: "user",
+          formatVersion: 1,
+        }),
+        outcome: { status: "succeeded" },
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+        input: [{ type: "text", text: "Show code" }],
+        items: [
+          {
+            item: {
+              type: "agentMessage",
+              itemId: itemId("hist-agent"),
+              text: "Check [`index.ts`](file:///workspace/index.ts#L5-10)",
+            },
+            outcome: { status: "succeeded" },
+          },
+        ],
+      },
+    });
+
+    expect(historical.items).toContainEqual(
+      expect.objectContaining({
+        type: "agentMessage",
+        text: "Check [index.ts](/workspace/index.ts:5)",
+      }),
+    );
+  });
 });

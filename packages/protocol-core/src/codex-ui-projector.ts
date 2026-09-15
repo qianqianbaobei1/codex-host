@@ -1,4 +1,5 @@
 import type {
+  HostAgentMessageItem,
   HostApprovalInteraction,
   HostFileChange,
   HostItem,
@@ -27,6 +28,10 @@ import {
   projectCodexApprovalRequest,
   type CodexApprovalRequestProjection,
 } from "./codex-approval.js";
+import {
+  StreamingMarkdownNormalizer,
+  normalizeCodexMarkdown,
+} from "./codex-markdown.js";
 import {
   projectCodexQuestionRequest,
   type CodexQuestionRequestProjection,
@@ -69,6 +74,8 @@ interface ProjectedItem {
   wireFileChanges: HostFileChange[] | null;
   startedAtMs?: number;
   durationMs?: number;
+  markdownNormalizer?: StreamingMarkdownNormalizer | undefined;
+  rawText?: string | undefined;
 }
 
 function resolvedItemDurationMs(
@@ -644,6 +651,10 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
           }
           if (isFileMutatingTool(item.toolName)) return [];
         }
+        if (item.type === "agentMessage") {
+          const normalized = normalizeCodexMarkdown(item.text, { cwd });
+          return [projectItem({ ...item, text: normalized }, outcome, cwd, true, "")];
+        }
         return item.type === "reasoning"
           ? [
               projectItem(item, outcome, cwd, true, ""),
@@ -851,14 +862,28 @@ export class CodexTurnProjector {
   #startItem(event: ItemStartedEvent, startedAtMs: number): CodexTurnProjection {
     this.#requireStarted();
     if (this.#items.has(event.item.itemId)) throw new Error("Host Item started more than once");
+    let markdownNormalizer: StreamingMarkdownNormalizer | undefined;
+    let rawText: string | undefined;
+    let initialItem = event.item;
+    if (event.item.type === "agentMessage") {
+      const normalizer = new StreamingMarkdownNormalizer({ cwd: this.#cwd });
+      markdownNormalizer = normalizer;
+      rawText = event.item.text;
+      if (event.item.text.length > 0) {
+        normalizer.append(event.item.text);
+        initialItem = { ...event.item, text: normalizer.currentText };
+      }
+    }
     const projected: ProjectedItem = {
-      item: event.item,
+      item: initialItem,
       outcome: null,
       reasoningPartStarted: false,
       streamedCommandOutput: false,
       wireStarted: false,
       wireFileChanges: null,
       startedAtMs,
+      markdownNormalizer,
+      rawText,
     };
     this.#items.set(event.item.itemId, projected);
     this.#itemOrder.push(event.item.itemId);
@@ -919,16 +944,24 @@ export class CodexTurnProjector {
         if (!projected.wireStarted) {
           messages.push(this.#startWireItem(projected, previous, emittedAtMs));
         }
-        messages.push({
-          method: "item/agentMessage/delta",
-          emittedAtMs,
-          params: {
-            threadId: this.#threadId,
-            turnId: this.#turnId,
-            itemId: event.itemId,
-            delta: event.update.text,
-          },
-        });
+        if (!projected.markdownNormalizer) {
+          projected.markdownNormalizer = new StreamingMarkdownNormalizer({ cwd: this.#cwd });
+        }
+        projected.rawText = (projected.rawText ?? "") + event.update.text;
+        const normalizedDelta = projected.markdownNormalizer.append(event.update.text);
+        projected.item = { ...next, text: projected.markdownNormalizer.currentText };
+        if (normalizedDelta.length > 0) {
+          messages.push({
+            method: "item/agentMessage/delta",
+            emittedAtMs,
+            params: {
+              threadId: this.#threadId,
+              turnId: this.#turnId,
+              itemId: event.itemId,
+              delta: normalizedDelta,
+            },
+          });
+        }
       } else if (next.type === "reasoning") {
         if (!projected.wireStarted) {
           messages.push(
@@ -1005,12 +1038,42 @@ export class CodexTurnProjector {
     if (event.snapshot.item.type !== projected.item.type) {
       throw new Error("Host Item changed type before completion");
     }
-    if (projected.item.type === "agentMessage" || projected.item.type === "reasoning") {
+    const flushMessages: JsonObject[] = [];
+    if (projected.item.type === "agentMessage") {
+      if (projected.markdownNormalizer) {
+        const finalDelta = projected.markdownNormalizer.flush();
+        if (finalDelta.length > 0) {
+          flushMessages.push({
+            method: "item/agentMessage/delta",
+            emittedAtMs,
+            params: {
+              threadId: this.#threadId,
+              turnId: this.#turnId,
+              itemId: event.snapshot.item.itemId,
+              delta: finalDelta,
+            },
+          });
+        }
+        projected.item = { ...projected.item, text: projected.markdownNormalizer.currentText };
+      }
       const completedItem = event.snapshot.item;
       if (
-        (completedItem.type !== "agentMessage" && completedItem.type !== "reasoning") ||
-        completedItem.text !== projected.item.text
+        completedItem.type !== "agentMessage" ||
+        (completedItem.text !== projected.rawText &&
+          completedItem.text !== (projected.item as HostAgentMessageItem).text)
       ) {
+        throw new Error("Host textual Item completion does not match its append updates");
+      }
+      event = {
+        ...event,
+        snapshot: {
+          ...event.snapshot,
+          item: { ...completedItem, text: (projected.item as HostAgentMessageItem).text },
+        },
+      };
+    } else if (projected.item.type === "reasoning") {
+      const completedItem = event.snapshot.item;
+      if (completedItem.type !== "reasoning" || completedItem.text !== projected.item.text) {
         throw new Error("Host textual Item completion does not match its append updates");
       }
     }
@@ -1058,7 +1121,7 @@ export class CodexTurnProjector {
           };
         }
       }
-      return { messages: [] };
+      return { messages: flushMessages };
     }
     const fileItem = wireFileChangeItem(projected);
     const messages = [
@@ -1080,7 +1143,7 @@ export class CodexTurnProjector {
         ),
       );
     }
-    return { messages };
+    return { messages: [...flushMessages, ...messages] };
   }
 
   #closeInteraction(event: InteractionClosedEvent, emittedAtMs: number): CodexTurnProjection {
@@ -1138,7 +1201,13 @@ export class CodexTurnProjector {
                 turnId: this.#turnId,
                 startedAtMs,
                 completedAtMs,
-                item: projectItem(projected.item, projected.outcome, this.#cwd, false, this.#threadId),
+                item: projectItem(
+                  projected.item,
+                  projected.outcome,
+                  this.#cwd,
+                  false,
+                  this.#threadId,
+                ),
               },
             });
           }
@@ -1192,7 +1261,12 @@ export class CodexTurnProjector {
                 turnId: this.#turnId,
                 startedAtMs,
                 completedAtMs,
-                item: projectReasoningTranscriptItem(reasoning, projected.outcome, this.#cwd, durationMs),
+                item: projectReasoningTranscriptItem(
+                  reasoning,
+                  projected.outcome,
+                  this.#cwd,
+                  durationMs,
+                ),
               },
             });
           }

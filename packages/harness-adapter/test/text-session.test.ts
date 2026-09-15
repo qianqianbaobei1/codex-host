@@ -198,6 +198,17 @@ describe("minimal Harness text Session", () => {
     );
   });
 
+  it("fails explicitly instead of retaining an unbounded output backlog", async () => {
+    const channel = new HarnessOutputChannel<string>({ maxBufferedValues: 2 });
+    const iterator = channel.outputs[Symbol.asyncIterator]();
+
+    expect(channel.emit("one")).toBe(true);
+    expect(channel.emit("two")).toBe(true);
+    expect(channel.emit("overflow")).toBe(false);
+    await expect(iterator.next()).rejects.toThrow("output buffer exceeded 2 values");
+    expect(channel.emit("after overflow")).toBe(false);
+  });
+
   it("correlates interleaved Command and Generic Tool lifecycles", async () => {
     const session = new FakeHarnessSession(harnessIdSchema.parse("fake"));
     const collected = collect(session.outputs);

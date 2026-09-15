@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -5,6 +7,7 @@ import {
   desktopRootRunning,
   managedLauncherRunning,
   anyLauncherRunning,
+  launchManagedCodex,
   parseProcessTable,
   run,
 } from "./auto-launch.mjs";
@@ -72,8 +75,52 @@ describe("codexhost macOS auto-launch watcher", () => {
         readDescriptor: async () => null,
       },
     );
-    expect(anyLauncherRunning([{ pid: 201, command: `${launcherExecutable} launch` }], launcherExecutable)).toBe(true);
+    expect(
+      anyLauncherRunning(
+        [{ pid: 201, command: `${launcherExecutable} launch` }],
+        launcherExecutable,
+      ),
+    ).toBe(true);
     expect(result).toBe("already-launching");
+  });
+
+  it("waits for launcher spawn and turns spawn failures into rejected work", async () => {
+    const successfulChild = new EventEmitter();
+    successfulChild.unref = () => undefined;
+    const successful = launchManagedCodex(
+      {
+        root: "/workspace",
+        launcher: launcherExecutable,
+        shim: "/workspace/shim",
+        node: "/workspace/node",
+        hostRuntime: "/workspace/host.js",
+        desktopController: "/workspace/desktop.js",
+        renderer: "/workspace/renderer.js",
+        path: "/usr/bin",
+      },
+      { spawn: () => successfulChild },
+    );
+    successfulChild.emit("spawn");
+    await expect(successful).resolves.toBe(successfulChild);
+
+    const failedChild = new EventEmitter();
+    failedChild.unref = () => undefined;
+    const failed = launchManagedCodex(
+      {
+        root: "/workspace",
+        launcher: launcherExecutable,
+        shim: "/workspace/shim",
+        node: "/workspace/node",
+        hostRuntime: "/workspace/host.js",
+        desktopController: "/workspace/desktop.js",
+        renderer: "/workspace/renderer.js",
+        path: "/usr/bin",
+      },
+      { spawn: () => failedChild },
+    );
+    const error = new Error("spawn ENOENT");
+    failedChild.emit("error", error);
+    await expect(failed).rejects.toBe(error);
   });
 
   it("writes successful notices to the info logger and failures to the error logger", async () => {

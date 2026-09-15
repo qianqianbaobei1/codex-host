@@ -75,6 +75,7 @@ test("keeps the Agent menu anchored inside the Codex window zoom", async ({ page
     '[data-codexhost-agent-control="test-composer"] > button[aria-haspopup="menu"]',
   );
   const menu = page.locator("#test-composer-agent-menu");
+  await expect(menu).toBeHidden();
   await trigger.click();
   await expect(menu).toBeVisible();
 
@@ -82,6 +83,9 @@ test("keeps the Agent menu anchored inside the Codex window zoom", async ({ page
   if (!triggerBox || !menuBox) throw new Error("Agent picker geometry is unavailable");
 
   expect(menuBox.x + menuBox.width).toBeCloseTo(triggerBox.x + triggerBox.width, 0);
-  expect(menuBox.width).toBeCloseTo(224 * 1.6, 0);
+  expect(menuBox.width).toBeCloseTo(260 * 1.6, 0);
   expect(triggerBox.y - (menuBox.y + menuBox.height)).toBeCloseTo(6 * 1.6, 0);
+
+  await trigger.click();
+  await expect(menu).toBeHidden();
 });

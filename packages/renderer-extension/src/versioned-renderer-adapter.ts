@@ -115,7 +115,7 @@ export interface RendererDraftPrewarmPolicy {
   state: "ready";
   hostId: string;
   readonly requestTarget?: () => unknown;
-  select(model: string | null): boolean;
+  select(model: string | null, threadId?: string): boolean;
   readonly selectAccount?: (accountId: string | null) => boolean;
   clear(): Promise<void>;
 }
@@ -146,6 +146,8 @@ function transportModelIdForAgent(agent: RendererAgent): string | null {
   if (agent === "omp") return OMP_TRANSPORT_MODEL_ID;
   if (agent === "antigravity") return ANTIGRAVITY_TRANSPORT_MODEL_ID;
   if (agent === "kiro-cli") return encodeHarnessPluginRoute({ harnessId: KIRO_CLI_HARNESS_ID });
+  if (agent === "cursor-cli")
+    return encodeHarnessPluginRoute({ harnessId: harnessIdSchema.parse(agent) });
   return null;
 }
 
@@ -583,9 +585,27 @@ export function findActivePrewarmTargets(root: ParentNode): PrewarmTarget[] {
   }
 
   const targets = new Set<PrewarmTarget>();
-  let fiber = firstFiber as { return?: unknown; memoizedState?: unknown };
-  for (let depth = 0; depth < 200; depth += 1) {
-    let hook = fiber.memoizedState as { memoizedState?: unknown; next?: unknown } | null;
+  // ChatGPT 26.908 moved the request manager out of the Composer ancestor
+  // chain, so walk the full fiber neighborhood instead of only fiber.return.
+  const seen = new Set<unknown>();
+  const queue: Array<{
+    sibling?: unknown;
+    child?: unknown;
+    return?: unknown;
+    memoizedState?: unknown;
+  }> = [
+    firstFiber as {
+      sibling?: unknown;
+      child?: unknown;
+      return?: unknown;
+      memoizedState?: unknown;
+    },
+  ];
+  for (let scanned = 0; queue.length > 0 && scanned < 20000; scanned += 1) {
+    const current = queue.pop();
+    if (current == null || seen.has(current)) continue;
+    seen.add(current);
+    let hook = current.memoizedState as { memoizedState?: unknown; next?: unknown } | null;
     for (let hookIndex = 0; hook && hookIndex < 100; hookIndex += 1) {
       const hookState = hook.memoizedState;
       if (isRecord(hookState)) {
@@ -604,9 +624,9 @@ export function findActivePrewarmTargets(root: ParentNode): PrewarmTarget[] {
           ? (hook.next as { memoizedState?: unknown; next?: unknown })
           : null;
     }
-    const parent = fiber.return;
-    if ((typeof parent !== "object" && typeof parent !== "function") || parent === null) break;
-    fiber = parent as typeof fiber;
+    if (current.sibling != null) queue.push(current.sibling);
+    if (current.child != null) queue.push(current.child);
+    if (current.return != null) queue.push(current.return);
   }
   return [...targets];
 }
@@ -661,23 +681,20 @@ function findComposerConversationThreadId(composer?: Element): HostThreadId | nu
 }
 
 function isCurrentDraftWrapper(value: unknown): value is readonly unknown[] {
+  // 26.818: value[3] === value[5] === value[6] and value[3] is a record with
+  // .get(). 26.908: value[3] === value[5] are functions returning a boolean
+  // and value[6] is a record. The stable contract across both is length 7
+  // plus value[3] === value[5]; the caller additionally requires value[2] to
+  // carry a "client-new-thread:" id and unique-size-1 resolution.
   if (
     !Array.isArray(value) ||
     value.length !== 7 ||
     value[3] !== value[5] ||
-    value[3] !== value[6] ||
-    !isRecord(value[3]) ||
-    typeof value[3].get !== "function" ||
     (typeof value[2] !== "string" && value[2] !== null)
   ) {
     return false;
   }
-  try {
-    const draft = value[3].get();
-    return isRecord(draft) && "modelSettings" in draft && "isManuallyChanged" in draft;
-  } catch {
-    return false;
-  }
+  return true;
 }
 
 type ComposerDomIdentity =
@@ -709,6 +726,16 @@ function findComposerDraftIds(composer: Element): Set<string> {
   const draftIds = new Set<string>();
   let fiber = findComposerFiber(composer);
   for (let depth = 0; fiber && depth < 120; depth += 1) {
+    // ChatGPT 26.908 stores the draft id on memoizedProps.browserConversationId
+    // instead of the memoCache wrapper that 26.818 used. Check both.
+    const props = fiber.memoizedProps;
+    if (
+      isRecord(props) &&
+      typeof props.browserConversationId === "string" &&
+      props.browserConversationId.startsWith("client-new-thread:")
+    ) {
+      draftIds.add(props.browserConversationId);
+    }
     const updateQueue = fiber.updateQueue;
     const memoCache = isRecord(updateQueue) ? updateQueue.memoCache : null;
     const data = isRecord(memoCache) && Array.isArray(memoCache.data) ? memoCache.data : [];
@@ -927,11 +954,16 @@ export function modelSelectionForAgent(
                 ? ompTransportModelId(model, thinkingOptionId, permissionModeId)
                 : agent === "antigravity"
                   ? antigravityTransportModelId(model, permissionModeId, thinkingOptionId)
-                  : agent === "kiro-cli"
+                  : agent === "kiro-cli" || agent === "cursor-cli"
                     ? encodeHarnessPluginRoute({
-                        harnessId: KIRO_CLI_HARNESS_ID,
+                        harnessId:
+                          agent === "cursor-cli"
+                            ? harnessIdSchema.parse(agent)
+                            : KIRO_CLI_HARNESS_ID,
                         ...(model ? { model } : {}),
-                        ...(thinkingOptionId ? { thinkingOptionId } : {}),
+                        ...(thinkingOptionId && agent !== "cursor-cli"
+                          ? { thinkingOptionId }
+                          : {}),
                         ...(permissionModeId ? { permissionModeId } : {}),
                       })
                     : transportModelIdForAgent(agent);
@@ -1086,12 +1118,46 @@ export function installCurrentRendererAdapter(): {
       if (!client.listHarnessAccounts) throw new Error("Harness account inspection is unavailable");
       return client.listHarnessAccounts();
     },
+    refreshHarnessAccounts: () => {
+      const client = currentModelClient();
+      if (!client.refreshHarnessAccounts) {
+        throw new Error("Harness account quota refresh is unavailable");
+      }
+      return client.refreshHarnessAccounts();
+    },
     selectHarnessAccount: (
       input: Parameters<NonNullable<RendererModelClient["selectHarnessAccount"]>>[0],
     ) => {
       const client = currentModelClient();
       if (!client.selectHarnessAccount) throw new Error("Harness account selection is unavailable");
       return client.selectHarnessAccount(input);
+    },
+    startHarnessAccountLogin: (
+      input: Parameters<NonNullable<RendererModelClient["startHarnessAccountLogin"]>>[0],
+    ) => {
+      const client = currentModelClient();
+      if (!client.startHarnessAccountLogin) {
+        throw new Error("Harness account login is unavailable");
+      }
+      return client.startHarnessAccountLogin(input);
+    },
+    createHarnessAccount: (
+      input: Parameters<NonNullable<RendererModelClient["createHarnessAccount"]>>[0],
+    ) => {
+      const client = currentModelClient();
+      if (!client.createHarnessAccount) {
+        throw new Error("Harness account creation is unavailable");
+      }
+      return client.createHarnessAccount(input);
+    },
+    deleteHarnessAccount: (
+      input: Parameters<NonNullable<RendererModelClient["deleteHarnessAccount"]>>[0],
+    ) => {
+      const client = currentModelClient();
+      if (!client.deleteHarnessAccount) {
+        throw new Error("Harness account deletion is unavailable");
+      }
+      return client.deleteHarnessAccount(input);
     },
     listCodexAccounts: () => currentModelClient().listCodexAccounts(),
     refreshCodexAccounts: () => {
@@ -1203,6 +1269,7 @@ export function installCurrentRendererAdapter(): {
     model?: HarnessModelRef,
     thinkingOptionId?: HarnessThinkingOptionId,
     permissionModeId?: HarnessPermissionModeId,
+    composer?: Element,
   ): boolean => {
     if (disposed) return false;
     const selection = modelSelectionForAgent(
@@ -1215,17 +1282,25 @@ export function installCurrentRendererAdapter(): {
     );
     const carrier = selection?.model;
     if (carrier !== null && carrier !== undefined && typeof carrier !== "string") return false;
-    desiredCarrier = carrier ?? null;
+    const carrierValue = carrier ?? null;
     const route = currentRequestRoute();
     if (!route) return false;
     routingPolicy = route.policy;
     try {
-      if (route.policy.select(desiredCarrier)) {
+      // An existing Thread keeps its own carrier so the Host can hand that
+      // Thread over at its next Turn; only a draft owns the global carrier.
+      const threadId = composer
+        ? (threadIdFromComposerModelTarget(findComposerModelTarget(composer)) ?? undefined)
+        : undefined;
+      if (!threadId) desiredCarrier = carrierValue;
+      if (route.policy.select(carrierValue, threadId)) {
         modelUpdates += 1;
         liveStatus.modelUpdates = modelUpdates;
       }
-      selectedRoutingPolicy = route.policy;
-      selectedCarrier = desiredCarrier;
+      if (!threadId) {
+        selectedRoutingPolicy = route.policy;
+        selectedCarrier = desiredCarrier;
+      }
     } catch {
       updateStatus("installing", "draft-routing-policy-unavailable", null);
       return false;

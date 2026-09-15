@@ -151,6 +151,7 @@ describe("production Desktop Controller", () => {
         "omp",
         "antigravity",
         "kiro-cli",
+        "cursor-cli",
       ],
       timeoutMs: 90_000,
     });
@@ -380,5 +381,46 @@ describe("production Desktop Controller", () => {
     expect(install).toHaveBeenCalledTimes(2);
     expect(firstClose).toHaveBeenCalledOnce();
     expect(secondClose).toHaveBeenCalledOnce();
+  });
+
+  it("resets recovery backoff and reconnects immediately when system wakes from sleep", async () => {
+    const abort = new AbortController();
+    const close = vi.fn();
+    const session: RendererCdpControlSession = {
+      snapshot: controllerSnapshot(),
+      ensureInstalled: vi.fn(),
+      activateDesktop: vi.fn(async () => 1),
+      executeRenderer: vi.fn(),
+      close,
+    };
+    const install = vi
+      .fn<DesktopControllerDependencies["install"]>()
+      .mockRejectedValueOnce(new Error("Initial connection failed"))
+      .mockResolvedValueOnce(session);
+
+    let currentTime = 0;
+    let cycle = 0;
+    const sleep = vi.fn(async () => {
+      cycle += 1;
+      if (cycle === 1) {
+        // First sleep: simulate laptop closed for 1 hour (3_600_000ms)
+        currentTime += 3_600_000;
+      } else {
+        abort.abort();
+      }
+    });
+
+    await runDesktopController(controllerOptions(), abort.signal, {
+      readRenderer: vi.fn(async () => "production renderer"),
+      install,
+      startAttachmentServer: vi.fn(async () => attachmentServer()),
+      ready: vi.fn(),
+      sleep,
+      now: () => currentTime,
+      monitorIntervalMs: 500,
+    });
+
+    expect(install).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledOnce();
   });
 });

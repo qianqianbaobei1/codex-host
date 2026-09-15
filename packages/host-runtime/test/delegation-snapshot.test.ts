@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { projectDelegationThreadSnapshot } from "../src/delegation-snapshot.js";
+import { allVisibleMessages, projectDelegationThreadSnapshot } from "../src/delegation-snapshot.js";
 
 const completedTurns = [
   {
@@ -27,6 +27,32 @@ const completedTurns = [
 ];
 
 describe("delegation snapshot", () => {
+  it("recovers a user message from projected Turn input when no user item exists", () => {
+    expect(
+      allVisibleMessages([
+        {
+          id: "turn-input-only",
+          input: [{ type: "text", text: "continue after the handover" }],
+          items: [{ id: "answer", type: "agentMessage", text: "continuing" }],
+        },
+      ]),
+    ).toEqual([
+      {
+        id: "input-turn-input-only-0",
+        turnId: "turn-input-only",
+        role: "user",
+        text: "continue after the handover",
+      },
+      {
+        id: "answer",
+        turnId: "turn-input-only",
+        role: "agent",
+        phase: "final",
+        text: "continuing",
+      },
+    ]);
+  });
+
   it("returns only visible progress and the final Agent result by default", () => {
     const snapshot = projectDelegationThreadSnapshot({
       threadId: "thread-1",

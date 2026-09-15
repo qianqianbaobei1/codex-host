@@ -39,7 +39,10 @@ export interface ExternalThreadStore {
     goal: StoredExternalGoalV1,
     expectedRevision?: number,
   ): Promise<StoredThreadRecordV1>;
-  clearThreadGoal(hostThreadId: HostThreadId, expectedRevision?: number): Promise<StoredThreadRecordV1>;
+  clearThreadGoal(
+    hostThreadId: HostThreadId,
+    expectedRevision?: number,
+  ): Promise<StoredThreadRecordV1>;
   getDelegation(delegationId: HostThreadId): Promise<StoredDelegationRecordV1 | null>;
   getDelegationByChild(childHostThreadId: HostThreadId): Promise<StoredDelegationRecordV1 | null>;
   findDelegationByRequest(requestId: string): Promise<StoredDelegationRecordV1 | null>;

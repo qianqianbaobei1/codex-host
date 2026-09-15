@@ -13,7 +13,10 @@ import {
 } from "@codexhost/shared-contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ExternalThreadRepository, externalThreadValue } from "../src/external-thread-repository.js";
+import {
+  ExternalThreadRepository,
+  externalThreadValue,
+} from "../src/external-thread-repository.js";
 
 const temporaryDirectories: string[] = [];
 const harnessId = harnessIdSchema.parse("claude-code");

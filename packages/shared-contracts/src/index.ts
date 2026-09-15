@@ -3,15 +3,27 @@ import { WORKSPACE_CONTRACT_VERSION } from "./version.js";
 
 export {
   HARNESS_ACCOUNT_SELECT_METHOD,
+  HARNESS_ACCOUNT_REFRESH_METHOD,
+  HARNESS_ACCOUNT_LOGIN_START_METHOD,
+  HARNESS_ACCOUNT_CREATE_METHOD,
+  HARNESS_ACCOUNT_DELETE_METHOD,
   harnessAccountSnapshotSchema,
   harnessAccountListParamsSchema,
   harnessAccountListResultSchema,
   harnessAccountSelectParamsSchema,
+  harnessAccountLoginStartParamsSchema,
+  harnessAccountLoginStartResultSchema,
+  harnessAccountCreateParamsSchema,
+  harnessAccountDeleteParamsSchema,
 } from "./harness-accounts.js";
 export type {
   HarnessAccountSnapshot,
   HarnessAccountListResult,
   HarnessAccountSelectParams,
+  HarnessAccountLoginStartParams,
+  HarnessAccountLoginStartResult,
+  HarnessAccountCreateParams,
+  HarnessAccountDeleteParams,
 } from "./harness-accounts.js";
 
 export {

@@ -66,6 +66,7 @@ export function createAccountsSettingsPage(
     label: messages.pageLabels.accounts,
     icon: "accounts",
     mount(context: RendererSettingsPageMountContext) {
+      context.content.classList?.add?.("settings-accounts-page");
       const document = context.content.ownerDocument;
       const header = document.createElement("div");
       header.className = "settings-account-header";
@@ -580,6 +581,7 @@ export function createAccountsSettingsPage(
       return () => {
         clearLoginRefresh();
         unsubscribe?.();
+        context.content.classList?.remove?.("settings-accounts-page");
       };
     },
   });

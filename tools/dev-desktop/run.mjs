@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { constants, accessSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { constants, accessSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -380,12 +381,66 @@ function nodeVersionSupported(version = process.versions.node) {
   return supportedNodeMajors.includes(major) && (major !== 22 || minor >= 19);
 }
 
+function nodeVersionAt(nodePath) {
+  if (nodePath === process.execPath) return process.versions.node;
+  try {
+    return execFileSync(nodePath, ["-p", "process.versions.node"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function supportedNodeCandidates(environment, platform) {
+  const candidates = [];
+  const explicit = environment.CODEXHOST_NODE_PATH?.trim();
+  if (explicit) candidates.push(explicit);
+  const home = environment.HOME?.trim();
+  const nvmRoot = environment.NVM_DIR?.trim() || (home ? path.join(home, ".nvm") : null);
+  if (nvmRoot) {
+    try {
+      const versionsRoot = path.join(nvmRoot, "versions", "node");
+      const versions = readdirSync(versionsRoot)
+        .filter((entry) => /^v(?:22|24)\./u.test(entry))
+        .sort()
+        .reverse();
+      for (const version of versions) {
+        candidates.push(
+          path.join(versionsRoot, version, "bin", platform === "win32" ? "node.exe" : "node"),
+        );
+      }
+    } catch {
+      // Optional version-manager directories are not required for startup.
+    }
+  }
+  if (platform === "darwin") {
+    candidates.push("/opt/homebrew/opt/node@24/bin/node", "/usr/local/opt/node@24/bin/node");
+  }
+  return candidates;
+}
+
+export function resolveDevelopmentNodePath({ nodePath, nodeVersion, environment, platform }) {
+  if (nodeVersionSupported(nodeVersion)) return nodePath;
+  // An explicitly supplied version is a test/configuration seam and must be
+  // validated as supplied. Automatic recovery is only for the real npm start
+  // invocation running under an unsupported current Node binary.
+  if (nodePath !== process.execPath || nodeVersion !== process.versions.node) return null;
+  for (const candidate of supportedNodeCandidates(environment, platform)) {
+    const version = nodeVersionAt(candidate);
+    if (version && nodeVersionSupported(version)) return candidate;
+  }
+  return null;
+}
+
 export async function runDevelopmentDesktop({
   arguments_ = process.argv.slice(2),
   root = repositoryRoot,
   environment = process.env,
   platform = process.platform,
   nodePath = process.execPath,
+  nodeVersion = process.versions.node,
   spawnImplementation = spawn,
 } = {}) {
   const options = parseArguments(arguments_);
@@ -393,9 +448,15 @@ export async function runDevelopmentDesktop({
     console.log(usage());
     return 0;
   }
-  if (!nodeVersionSupported()) {
+  const selectedNodePath = resolveDevelopmentNodePath({
+    nodePath,
+    nodeVersion,
+    environment,
+    platform,
+  });
+  if (!selectedNodePath) {
     throw new Error(
-      `npm start requires Node.js ${supportedNodeMajors.join(" or ")}; current version is ${process.versions.node}`,
+      `npm start requires Node.js ${supportedNodeMajors.join(" or ")}; current version is ${nodeVersion}. Set CODEXHOST_NODE_PATH to a supported Node binary or install Node 22/24.`,
     );
   }
 
@@ -414,7 +475,7 @@ export async function runDevelopmentDesktop({
   if (options.build) {
     console.log("codexhost dev: building workspace");
     const buildResult = await runChild(
-      npmBuildInvocation(environment, platform, nodePath),
+      npmBuildInvocation(environment, platform, selectedNodePath),
       root,
       spawnImplementation,
     );
@@ -423,7 +484,7 @@ export async function runDevelopmentDesktop({
     }
   }
 
-  const artifacts = developmentArtifacts(root, platform, nodePath);
+  const artifacts = developmentArtifacts(root, platform, selectedNodePath);
   validateDevelopmentArtifacts(artifacts);
   const piPath = findPathExecutable("pi", { environment, platform });
   if (piPath) console.log(`codexhost dev: using Pi at ${piPath}`);

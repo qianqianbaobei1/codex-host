@@ -252,6 +252,7 @@ export async function runDesktopController(
           "omp",
           "antigravity",
           "kiro-cli",
+          "cursor-cli",
         ],
         timeoutMs: PRODUCTION_INSTALL_TIMEOUT_MS,
       },
@@ -308,6 +309,7 @@ export async function runDesktopController(
       nonce: options.attachmentNonce,
       attach: () =>
         useSession(async () => {
+          nextRecoveryAt = 0;
           const current = await recoverSession();
           await current.activateDesktop();
         }),
@@ -319,9 +321,16 @@ export async function runDesktopController(
       state: "compatible",
       issues: [],
     });
+    let lastTickAt = now();
     while (!signal.aborted) {
       await dependencies.sleep(dependencies.monitorIntervalMs);
       if (signal.aborted) continue;
+      const currentTickAt = now();
+      if (currentTickAt - lastTickAt > Math.max(dependencies.monitorIntervalMs * 3, 5_000)) {
+        nextRecoveryAt = 0;
+        recoveryDelayMs = RECOVERY_RETRY_INITIAL_MS;
+      }
+      lastTickAt = currentTickAt;
       await useSession(async () => {
         if (!session && now() < nextRecoveryAt) return;
         try {

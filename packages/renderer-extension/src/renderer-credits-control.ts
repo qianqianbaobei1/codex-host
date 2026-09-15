@@ -138,14 +138,14 @@ function remainingPercent(usedPercent: number): number {
 function renderCreditsBar(usagePercent: number, color: string): HTMLDivElement {
   const track = document.createElement("div");
   track.dataset.codexhostCreditsBar = "";
-  track.style.height = "6px";
-  track.style.borderRadius = "9999px";
-  track.style.background = "color-mix(in srgb, currentColor 16%, transparent)";
+  track.style.height = "5px";
+  track.style.borderRadius = "3px";
+  track.style.background = "color-mix(in srgb, currentColor 15%, transparent)";
   track.style.overflow = "hidden";
   const fill = document.createElement("span");
   fill.style.display = "block";
   fill.style.height = "100%";
-  fill.style.borderRadius = "9999px";
+  fill.style.borderRadius = "3px";
   fill.style.width = `${Math.min(100, Math.max(0, usagePercent))}%`;
   fill.style.background = color;
   track.append(fill);
@@ -161,61 +161,86 @@ function resetLabel(
   return locale === "zh-CN" ? `${formatted} ${messages.resets}` : `${messages.resets} ${formatted}`;
 }
 
-function renderCreditsHeader(
-  credits: AccountCreditsSnapshot,
+function renderCreditsMeter(
+  periodLabel: string,
+  usagePercent: number,
   locale: RendererSettingsLocale,
   messages: RendererCreditsMessages,
+  resetsAt: string | undefined,
+  featured: boolean,
 ): HTMLDivElement {
-  const wrapper = document.createElement("div");
-  wrapper.style.marginBottom = "11px";
+  const color = toneColor(rendererCreditsTone(usagePercent));
+  const remaining = remainingPercent(usagePercent);
+  const meter = document.createElement("div");
+  meter.style.display = "grid";
+  meter.style.gap = "6px";
+  meter.style.boxSizing = "border-box";
+  meter.style.marginBottom = "0";
+  meter.style.padding = featured ? "8px 0 9px" : "7px 0 8px";
+  meter.style.borderBottom = "1px solid color-mix(in srgb, currentColor 12%, transparent)";
+  meter.setAttribute("aria-label", periodLabel);
 
   const top = document.createElement("div");
   top.style.display = "flex";
   top.style.alignItems = "flex-start";
   top.style.justifyContent = "space-between";
   top.style.gap = "12px";
-  top.style.marginBottom = "5px";
 
   // Same left-label / right-percent column order as each tile below, so the
   // reset line always lands under its own label instead of zig-zagging sides.
   const left = document.createElement("div");
   const label = document.createElement("div");
-  label.textContent = creditsPeriodLabel(credits.periodType, locale);
-  label.style.fontSize = "12.5px";
+  label.textContent = periodLabel;
+  label.style.fontSize = featured ? "12.5px" : "12px";
   label.style.fontWeight = "600";
   left.append(label);
-  if (credits.resetsAt) {
+  if (resetsAt) {
     const reset = document.createElement("div");
-    reset.textContent = resetLabel(credits.resetsAt, locale, messages);
-    reset.style.fontSize = "11px";
+    reset.textContent = resetLabel(resetsAt, locale, messages);
+    reset.style.marginTop = "2px";
+    reset.style.fontSize = "10.5px";
     reset.style.color = "color-mix(in srgb, currentColor 62%, transparent)";
+    reset.style.fontVariantNumeric = "tabular-nums";
     left.append(reset);
   }
 
-  const color = toneColor(rendererCreditsTone(credits.usedPercent));
-  const remaining = remainingPercent(credits.usedPercent);
-  const percent = document.createElement("span");
-  percent.style.display = "inline-flex";
-  percent.style.alignItems = "baseline";
-  percent.style.gap = "4px";
-  percent.style.whiteSpace = "nowrap";
-  percent.style.color = color;
+  const value = document.createElement("div");
+  value.style.display = "flex";
+  value.style.alignItems = "baseline";
+  value.style.gap = "4px";
+  value.style.color = color;
   const remainingLabel = document.createElement("span");
-  remainingLabel.textContent = `${messages.remaining} `;
-  remainingLabel.style.fontSize = "11px";
-  remainingLabel.style.fontWeight = "600";
-  remainingLabel.style.opacity = "0.8";
+  remainingLabel.textContent = messages.remaining;
+  remainingLabel.style.fontSize = "10.5px";
+  remainingLabel.style.fontWeight = "500";
+  remainingLabel.style.opacity = "0.78";
   const remainingValue = document.createElement("span");
   remainingValue.textContent = formatRendererCreditsPercent(remaining);
-  remainingValue.style.fontSize = "26px";
-  remainingValue.style.fontWeight = "700";
+  remainingValue.style.fontSize = featured ? "19px" : "16px";
+  remainingValue.style.fontWeight = "650";
   remainingValue.style.fontVariantNumeric = "tabular-nums";
-  percent.append(remainingLabel, remainingValue);
+  remainingValue.style.lineHeight = "1";
+  value.append(remainingLabel, remainingValue);
 
-  top.append(left, percent);
+  top.append(left, value);
 
-  wrapper.append(top, renderCreditsBar(remaining, color));
-  return wrapper;
+  meter.append(top, renderCreditsBar(remaining, color));
+  return meter;
+}
+
+function renderCreditsHeader(
+  credits: AccountCreditsSnapshot,
+  locale: RendererSettingsLocale,
+  messages: RendererCreditsMessages,
+): HTMLDivElement {
+  return renderCreditsMeter(
+    creditsPeriodLabel(credits.periodType, locale),
+    credits.usedPercent,
+    locale,
+    messages,
+    credits.resetsAt,
+    true,
+  );
 }
 
 function renderCreditsTile(
@@ -225,41 +250,7 @@ function renderCreditsTile(
   messages: RendererCreditsMessages,
   resetsAt?: string,
 ): HTMLDivElement {
-  const color = toneColor(rendererCreditsTone(usagePercent));
-  const remaining = remainingPercent(usagePercent);
-
-  const tile = document.createElement("div");
-  tile.style.marginBottom = "11px";
-
-  const top = document.createElement("div");
-  top.style.display = "flex";
-  top.style.alignItems = "flex-start";
-  top.style.justifyContent = "space-between";
-  top.style.gap = "12px";
-  top.style.marginBottom = "5px";
-
-  const left = document.createElement("div");
-  const name = document.createElement("span");
-  name.textContent = label;
-  name.style.fontSize = "12px";
-  left.append(name);
-  if (resetsAt) {
-    const reset = document.createElement("div");
-    reset.textContent = resetLabel(resetsAt, locale, messages);
-    reset.style.fontSize = "10.5px";
-    reset.style.color = "color-mix(in srgb, currentColor 62%, transparent)";
-    left.append(reset);
-  }
-
-  const percent = document.createElement("span");
-  percent.textContent = `${messages.remaining} ${formatRendererCreditsPercent(remaining)}`;
-  percent.style.fontSize = "12px";
-  percent.style.fontVariantNumeric = "tabular-nums";
-  percent.style.color = color;
-  top.append(left, percent);
-
-  tile.append(top, renderCreditsBar(remaining, color));
-  return tile;
+  return renderCreditsMeter(label, usagePercent, locale, messages, resetsAt, false);
 }
 
 function renderDetails(
@@ -268,11 +259,9 @@ function renderDetails(
   locale: RendererSettingsLocale,
 ): void {
   const messages = rendererCreditsMessages(locale);
-  const glowColor = toneColor(rendererCreditsTone(credits.usedPercent));
-  popover.style.backgroundImage = `radial-gradient(160px 100px at 18% -10%, color-mix(in srgb, ${glowColor} 20%, transparent), transparent 70%)`;
   popover.setAttribute("aria-label", messages.details);
   popover.replaceChildren();
-  popover.append(renderCreditsHeader(credits, locale, messages));
+  const meters = [renderCreditsHeader(credits, locale, messages)];
   const tiles = (credits.productUsage ?? []).map((product) =>
     renderCreditsTile(
       productLabel(product.product, locale),
@@ -282,9 +271,13 @@ function renderDetails(
       product.resetsAt,
     ),
   );
-  const lastTile = tiles.at(-1);
-  if (lastTile) lastTile.style.marginBottom = "0";
-  popover.append(...tiles);
+  meters.push(...tiles);
+  const lastMeter = meters.at(-1);
+  if (lastMeter) {
+    lastMeter.style.marginBottom = "0";
+    lastMeter.style.borderBottom = "0";
+  }
+  popover.append(...meters);
 }
 
 function popoverIsOpen(popover: HTMLDivElement): boolean {
@@ -297,7 +290,7 @@ function popoverIsOpen(popover: HTMLDivElement): boolean {
 
 function positionPopover(control: Pick<RendererCreditsControl, "trigger" | "popover">): void {
   const triggerRect = control.trigger.getBoundingClientRect();
-  const width = Math.min(280, Math.max(220, window.innerWidth - 24));
+  const width = Math.min(300, Math.max(240, window.innerWidth - 24));
   const left = Math.max(12, Math.min(triggerRect.left, window.innerWidth - width - 12));
   control.popover.style.width = `${width}px`;
   control.popover.style.left = `${left}px`;
@@ -385,10 +378,13 @@ export function mountRendererCreditsControl(composerId: string): RendererCredits
   popover.hidden = typeof popover.showPopover !== "function";
   popover.style.position = "fixed";
   popover.style.inset = "auto";
-  popover.style.width = "240px";
-  popover.style.maxWidth = "min(280px, calc(100vw - 24px))";
+  popover.style.width = "280px";
+  popover.style.maxWidth = "min(300px, calc(100vw - 24px))";
   popover.style.padding = "10px 12px";
   applyRendererPopoverChrome(popover);
+  popover.style.borderRadius = "10px";
+  popover.style.boxShadow =
+    "light-dark(0 6px 18px rgba(15, 23, 42, 0.14), 0 10px 24px rgba(0, 0, 0, 0.32))";
   popover.style.font = "13px/1.35 system-ui, sans-serif";
   popover.style.letterSpacing = "0";
   popover.style.zIndex = "2147483647";

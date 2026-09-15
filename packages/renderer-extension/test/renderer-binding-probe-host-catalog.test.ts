@@ -17,6 +17,9 @@ const testState = vi.hoisted(() => ({
   sendButton: null as unknown as HTMLButtonElement,
   renderedModelViews: [] as RendererModelControlView[],
   selectModel: null as null | ((modelId: string) => void),
+  selectAgent: null as null | ((agent: string) => void),
+  selectHarnessAccount: null as null | ((accountId: string) => Promise<void>),
+  refreshHarnessAccounts: null as null | (() => void),
   getConnectionDiagnostics: null as null | (() => RendererConnectionDiagnostics | null),
   getSessionImportClient: null as null | (() => RendererSessionImportClient | null),
   documentListeners: new Map<string, EventListener>(),
@@ -35,6 +38,10 @@ vi.mock("../src/renderer-composer-dom.js", async (importOriginal) => {
       ...args: Parameters<typeof RendererComposerDom.mountComposerAgentControl>
     ) => {
       testState.selectModel = args[9];
+      testState.selectAgent = args[4] as unknown as typeof testState.selectAgent;
+      testState.selectHarnessAccount = args[7] as unknown as typeof testState.selectHarnessAccount;
+      testState.refreshHarnessAccounts =
+        args[8] as unknown as typeof testState.refreshHarnessAccounts;
       return {
         composer: testState.composer,
         composerId: "composer-1",
@@ -163,6 +170,9 @@ function installFakeBrowser(): void {
   testState.sendButton = sendButton;
   testState.renderedModelViews = [];
   testState.selectModel = null;
+  testState.selectAgent = null;
+  testState.selectHarnessAccount = null;
+  testState.refreshHarnessAccounts = null;
   testState.getConnectionDiagnostics = null;
   testState.getSessionImportClient = null;
   testState.documentListeners.clear();
@@ -342,6 +352,69 @@ describe("Renderer binding Host-scoped Claude catalogs", () => {
     expect(probe.lockedSelection()?.model).toEqual(newModel);
     expectSubmissionBlocked(false);
     expect(applyAgent).not.toHaveBeenCalled();
+  });
+
+  it("writes the Thread carrier when the user switches Agent on a locked Thread", async () => {
+    installFakeBrowser();
+    const model = harnessModelRefSchema.parse({ id: "claude-model-v1.b3B1cw" });
+    const host = {
+      inspectHarness: vi.fn(async () => readyInspection(model.id)),
+      inspectThread: vi.fn(async () => ({
+        owner: "external" as const,
+        harnessId: "claude-code",
+        transportModelId:
+          "codexhost/claude-code-native@claude-model-v1.b3B1cw@bypassPermissions@auto",
+        effectiveModel: model,
+        history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
+        locked: true,
+      })),
+      inspectThreadCommands: vi.fn(async () => ({ commands: [] })),
+      inspectThreadUsage: vi.fn(async () => ({
+        threadId: "thread-a",
+        usage: null,
+        accountCredits: null,
+      })),
+      handoverThread: vi.fn(async () => undefined),
+      subscribeThreadUsage: () => () => undefined,
+    };
+    const modelControl = {
+      ...host,
+      currentHostId: () => "local",
+      clientForHost: () => host,
+    };
+    const applyAgent = vi.fn(() => true);
+    const { installRendererBindingProbe } = await import("../src/renderer-binding-probe.js");
+    const probe = installRendererBindingProbe({
+      enabledAgents: ["codex", "claude-code"],
+      defaultAgent: "codex",
+    });
+    probe.setAdapter(
+      { state: "ready", reason: "ready", modelUpdates: 0, hook: "request-bridge" },
+      undefined,
+      applyAgent,
+      modelControl as never,
+    );
+    await vi.waitFor(() => {
+      expect(probe.status().selections).toMatchObject([{ agent: "claude-code", phase: "locked" }]);
+    });
+    // Restoring the Thread must not rewrite the carrier the Host owns.
+    expect(applyAgent).not.toHaveBeenCalled();
+
+    const selectAgent = testState.selectAgent;
+    assert(selectAgent);
+    selectAgent("codex");
+    await vi.waitFor(() => {
+      expect(applyAgent).toHaveBeenCalledWith(
+        "codex",
+        undefined,
+        undefined,
+        undefined,
+        testState.composer,
+      );
+    });
+    await vi.waitFor(() => {
+      expect(host.handoverThread).toHaveBeenCalledWith({ threadId: "thread-a" });
+    });
   });
 
   it("routes Session import to local while the current Composer Host is remote", async () => {
@@ -644,6 +717,79 @@ describe("Renderer binding Host-scoped Claude catalogs", () => {
 
     await vi.waitFor(() => expect(claudeInspections).toBeGreaterThanOrEqual(2));
     expect(testState.renderedModelViews.at(-1)).not.toMatchObject({ status: "error" });
+  });
+
+  it("reloads the mounted External configuration after a Harness account switch", async () => {
+    installFakeBrowser();
+    testState.modelTarget = ["default"];
+    let selectedAccount = "default";
+    const accounts = () => ({
+      accounts: [
+        {
+          harnessId: "antigravity",
+          harnessName: "Antigravity",
+          accountId: "default",
+          label: "默认",
+          isDefault: selectedAccount === "default",
+          selectable: true,
+          credits: { usedPercent: 10, periodType: "weekly" as const },
+        },
+        {
+          harnessId: "antigravity",
+          harnessName: "Antigravity",
+          accountId: "work",
+          label: "工作",
+          isDefault: selectedAccount === "work",
+          selectable: true,
+          credits: { usedPercent: 20, periodType: "weekly" as const },
+        },
+      ],
+    });
+    let inspections = 0;
+    const hostA = {
+      inspectHarness: vi.fn(async () => {
+        inspections += 1;
+        return readyInspection("gemini-model-v1");
+      }),
+      listHarnessAccounts: vi.fn(async () => accounts()),
+      selectHarnessAccount: vi.fn(async ({ accountId }: { accountId: string }) => {
+        selectedAccount = accountId;
+        return accounts();
+      }),
+    };
+    const modelControl = {
+      currentHostId: () => "host-a",
+      clientForHost: vi.fn(() => hostA),
+      inspectHarness: hostA.inspectHarness,
+      inspectThread: vi.fn(),
+      inspectThreadCommands: vi.fn(async () => ({ commands: [] })),
+      inspectThreadUsage: vi.fn(),
+      subscribeThreadUsage: () => () => undefined,
+    };
+    const { installRendererBindingProbe } = await import("../src/renderer-binding-probe.js");
+    const probe = installRendererBindingProbe({
+      enabledAgents: ["codex", "antigravity"],
+      defaultAgent: "antigravity",
+    });
+    probe.setAdapter(
+      { state: "ready", reason: "ready", modelUpdates: 0, hook: "request-bridge" },
+      undefined,
+      undefined,
+      modelControl as never,
+    );
+    await vi.waitFor(() => expect(inspections).toBeGreaterThan(0));
+    testState.refreshHarnessAccounts?.();
+    await vi.waitFor(() => expect(hostA.listHarnessAccounts).toHaveBeenCalled());
+    const before = inspections;
+    await testState.selectHarnessAccount?.("work");
+    await vi.waitFor(() => expect(inspections).toBeGreaterThan(before));
+    expect(testState.renderedModelViews).toContainEqual(
+      expect.objectContaining({ status: "loading" }),
+    );
+    expect(hostA.selectHarnessAccount).toHaveBeenCalledWith({
+      harnessId: "antigravity",
+      accountId: "work",
+    });
   });
 
   it("reloads a same-Host empty Claude catalog on explicit refresh", async () => {

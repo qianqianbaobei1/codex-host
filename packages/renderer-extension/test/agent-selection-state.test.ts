@@ -197,7 +197,7 @@ describe("Renderer draft Agent controller", () => {
     expect(agents.get(composer)).toMatchObject({ agent: "codex", phase: "draft" });
   });
 
-  it("keeps the draft mutable until submission locks the final Agent", async () => {
+  it("keeps the Agent switchable after submission locks the Thread", async () => {
     const composer = {};
     const agents = controller();
     const operations = {
@@ -211,10 +211,12 @@ describe("Renderer draft Agent controller", () => {
     expect(agents.get(composer)).toMatchObject({ agent: "pi", phase: "draft" });
 
     agents.lock(composer);
-    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(false);
+    // The Host hands an existing Thread to the selected Harness at the next
+    // Turn boundary, so a locked Thread keeps its picker live.
+    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(true);
     expect(agents.get(composer)).toEqual({
       composerId: "composer-1",
-      agent: "pi",
+      agent: "codex",
       phase: "locked",
     });
   });

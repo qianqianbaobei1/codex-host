@@ -34,6 +34,20 @@ describe("Protocol Core strict JSONL", () => {
     expect(() => parseJsonFrame(Buffer.from("no-json"))).toThrow("invalid JSONL");
   });
 
+  it("bounds an unterminated frame before it can grow the parser heap", async () => {
+    await expect(async () => {
+      for await (const frame of readLfFrames(Readable.from([Buffer.from("123456789")]), 8)) {
+        expect(frame).toBeDefined();
+      }
+    }).rejects.toThrow("frame exceeded 8 bytes");
+
+    await expect(async () => {
+      for await (const frame of readLfFrames(Readable.from([Buffer.from("123456789\n")]), 8)) {
+        expect(frame).toBeDefined();
+      }
+    }).rejects.toThrow("frame exceeded 8 bytes");
+  });
+
   it("rejects a backpressured write when the stream closes before draining", async () => {
     const output = new PassThrough({ highWaterMark: 1 });
     const write = writeFrame(output, Buffer.from("{}"));

@@ -485,7 +485,10 @@ export function mountRendererModelPicker(
         ? event.target.closest<HTMLButtonElement>("button[data-model-id]")
         : null;
     if (!target?.dataset.modelId) return;
-    close();
+    // Keep the parent menu open while the Host confirms the selection. The
+    // renderer enters `selecting` immediately, and closing both layers here
+    // makes the picker look like it lost state during a slow model switch.
+    closeModelMenu();
     trigger.focus();
     onSelectModel(target.dataset.modelId);
   };

@@ -4,8 +4,15 @@ export class HarnessOutputChannel<T> {
   #ended = false;
   #pending: Array<(result: IteratorResult<T>) => void> = [];
   #values: T[] = [];
+  #overflowError: Error | null = null;
+  readonly #maxBufferedValues: number;
 
-  constructor() {
+  constructor(options: { maxBufferedValues?: number } = {}) {
+    const maxBufferedValues = options.maxBufferedValues ?? 256;
+    if (!Number.isSafeInteger(maxBufferedValues) || maxBufferedValues <= 0) {
+      throw new Error("Harness output buffer limit must be a positive safe integer");
+    }
+    this.#maxBufferedValues = maxBufferedValues;
     this.outputs = {
       [Symbol.asyncIterator]: () => {
         if (this.#consumerCreated) {
@@ -20,10 +27,22 @@ export class HarnessOutputChannel<T> {
   }
 
   emit(value: T): boolean {
-    if (this.#ended) return false;
+    if (this.#ended || this.#overflowError) return false;
     const resolve = this.#pending.shift();
     if (resolve) resolve({ done: false, value });
-    else this.#values.push(value);
+    else if (this.#values.length < this.#maxBufferedValues) this.#values.push(value);
+    else {
+      // A producer must never be allowed to turn a slow Desktop/Host consumer
+      // into an unbounded heap. Drop the retained backlog and make the single
+      // consumer fail explicitly; the owning runtime can then terminalize the
+      // active Turn with a visible error instead of silently losing output.
+      this.#overflowError = new Error(
+        `Harness output buffer exceeded ${this.#maxBufferedValues} values`,
+      );
+      this.#values = [];
+      this.#ended = true;
+      return false;
+    }
     return true;
   }
 
@@ -35,6 +54,7 @@ export class HarnessOutputChannel<T> {
   }
 
   #next(): Promise<IteratorResult<T>> {
+    if (this.#overflowError) return Promise.reject(this.#overflowError);
     const value = this.#values.shift();
     if (value !== undefined) return Promise.resolve({ done: false, value });
     if (this.#ended) return Promise.resolve({ done: true, value: undefined });

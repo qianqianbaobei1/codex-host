@@ -165,19 +165,35 @@ describe("external direction changes use normal Desktop start presentation", () 
   it.each([
     { input: [] },
     { input: [{ type: "text", text: " " }] },
-    { input: [{ type: "image", url: "image" }] },
+    { input: [{ type: "audio" }] },
+  ])(
+    "rejects undeliverable input before cancel or creating a placeholder: %j",
+    async ({ input }) => {
+      const f = fixture();
+      f.args[1] = input;
+      await expect(f.manager.steerTurn(...f.args)).rejects.toThrow("non-empty input");
+      expect(f.manager.startTurn).not.toHaveBeenCalled();
+      expect(f.events).toEqual([]);
+      f.dispose();
+    },
+  );
+
+  it.each([
+    { input: [{ type: "image", url: "https://example.test/image.png" }] },
     {
       input: [
         { type: "text", text: "new input" },
         { type: "localImage", path: "/image.png" },
       ],
     },
-  ])("rejects unsupported input before cancel or creating a placeholder: %j", async ({ input }) => {
+  ])("steers with an attachment, leaving the file reference to the Host: %j", async ({ input }) => {
     const f = fixture();
     f.args[1] = input;
-    await expect(f.manager.steerTurn(...f.args)).rejects.toThrow("text input");
-    expect(f.manager.startTurn).not.toHaveBeenCalled();
-    expect(f.events).toEqual([]);
+    await expect(f.manager.steerTurn(...f.args)).resolves.toEqual({ turnId: "replacement" });
+    expect(f.manager.startTurn).toHaveBeenCalledOnce();
+    expect(f.rpc).toHaveBeenLastCalledWith("turn/steer", expect.objectContaining({ input }), {
+      timeoutMs: 30_000,
+    });
     f.dispose();
   });
 

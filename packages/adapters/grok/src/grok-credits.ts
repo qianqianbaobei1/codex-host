@@ -192,6 +192,7 @@ export async function fetchGrokCredits(
   const account = await fetchGrokAccount(input);
   if (!account) return null;
   const { credits } = account;
+  if (!credits) return null;
   return {
     usedPercent: credits.usedPercent,
     periodType:

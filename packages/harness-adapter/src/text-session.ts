@@ -344,6 +344,10 @@ export interface HostSubagentState {
   nativeSubagentId?: string;
   description: string;
   role?: string;
+  /** Native child Model ID, when explicitly supplied or reported; not a display label. */
+  model?: string;
+  /** Native child reasoning effort, when known; do not infer from parent settings. */
+  reasoningEffort?: string;
   background: boolean;
   status: HostSubagentStatus;
   resultSummary?: string;
@@ -567,8 +571,16 @@ export interface HarnessAdapter {
    * than reported with fabricated quota.
    */
   inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[] | null>;
+  /** Explicitly refresh read-only quota telemetry without changing account selection. */
+  refreshAccountCredits?(): Promise<void>;
   /** Select the default account used by newly created Threads. Existing Threads keep theirs. */
   selectAccount?(accountId: string): Promise<void>;
+  /** Start an explicit user-authorized login without performing background auth. */
+  loginAccount?(accountId: string): Promise<void>;
+  /** Create a new isolated native account (metadata and shadow environment). */
+  createAccount?(accountId: string, name?: string): Promise<void>;
+  /** Delete a custom isolated native account. */
+  deleteAccount?(accountId: string): Promise<void>;
   /** Capabilities safe to report before a native Session is opened. */
   readonly cachedThreadCapabilities?: HarnessSessionCapabilities;
 

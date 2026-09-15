@@ -11,11 +11,13 @@ import { modelSelectionForAgent } from "../src/versioned-renderer-adapter.js";
 
 import {
   applyComposerModelWrite,
+  composerPermissionMode,
   draftPermissionMode,
   draftThinkingOptionForModel,
   isLateConversationTarget,
   isComposerModelWriteAllowed,
   isOwnershipSubmissionBlocked,
+  shouldBlockComposerBeforeInput,
   lockedPermissionMode,
   permissionModeSelectionLocked,
   lateConversationTargetResolution,
@@ -173,6 +175,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual([]);
@@ -201,6 +204,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -229,6 +233,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -255,6 +260,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual(["pi", "claude-code", "deepseek-harness", "opencode", "grok", "omp", "antigravity"]);
@@ -283,6 +289,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual([]);
@@ -311,6 +318,7 @@ describe("Renderer Composer DOM behavior", () => {
           omp: undefined,
           antigravity: undefined,
           "kiro-cli": undefined,
+          "cursor-cli": undefined,
         },
       ),
     ).toEqual(["deepseek-harness"]);
@@ -1103,6 +1111,27 @@ describe("Renderer Composer DOM behavior", () => {
     expect(isOwnershipSubmissionBlocked("error")).toBe(true);
     expect(isOwnershipSubmissionBlocked("ready")).toBe(false);
     expect(isOwnershipSubmissionBlocked("not-required")).toBe(false);
+    expect(
+      shouldBlockComposerBeforeInput({
+        switching: true,
+        agentApplied: false,
+        ownershipBlocked: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockComposerBeforeInput({
+        switching: false,
+        agentApplied: false,
+        ownershipBlocked: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockComposerBeforeInput({
+        switching: false,
+        agentApplied: false,
+        ownershipBlocked: false,
+      }),
+    ).toBe(false);
   });
 
   it("resolves Draft Thinking from the selected Model's in-memory Catalog entry", () => {
@@ -1164,6 +1193,26 @@ describe("Renderer Composer DOM behavior", () => {
     expect(() => lockedPermissionMode(catalog, undefined, foreign)).toThrow(
       "absent from the current Catalog",
     );
+  });
+
+  it("uses the catalog default when switching Agent on a locked Thread", () => {
+    const catalog = harnessPermissionModeCatalogSchema.parse({
+      modes: [
+        { id: "ask", label: "Ask" },
+        { id: "always-approve", label: "Always approve" },
+      ],
+      defaultModeId: "always-approve",
+    });
+    const ask = harnessPermissionModeIdSchema.parse("ask");
+    const alwaysApprove = harnessPermissionModeIdSchema.parse("always-approve");
+
+    expect(
+      composerPermissionMode(catalog, { userSwitched: true, previous: ask, restored: ask }),
+    ).toBe(alwaysApprove);
+    expect(composerPermissionMode(catalog, { userSwitched: true })).toBe(alwaysApprove);
+    expect(
+      composerPermissionMode(catalog, { userSwitched: false, restored: ask, previous: ask }),
+    ).toBe(ask);
   });
 
   it("locks Permission Mode selection only for an existing atCreate Session", () => {

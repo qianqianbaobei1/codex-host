@@ -514,6 +514,78 @@ describe("Renderer draft prewarm policy", () => {
     });
   });
 
+  it("injects a Thread's own carrier into its next Turn without leaking to another Thread", async () => {
+    const sendRequest = vi.fn(async () => ({ thread: { id: "thread-a" } }));
+    const manager = requestManagerFixture();
+    const bridge = requestBridgeFixture({ sendRequest });
+    const target: DraftPrewarmPolicyTarget = {};
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const policy = target.__codexhostDraftPrewarmPolicyV1 as {
+      select(model: string | null, threadId?: string): boolean;
+    };
+
+    expect(policy.select("codexhost/claude-code-native", "thread-a")).toBe(true);
+    await bridge.sendRequest("turn/start", {
+      threadId: "thread-a",
+      model: "gpt-5",
+      input: [{ type: "text", text: "continue" }],
+    });
+    await bridge.sendRequest("turn/start", {
+      threadId: "thread-b",
+      model: "gpt-5",
+      input: [{ type: "text", text: "other" }],
+    });
+
+    expect(sendRequest).toHaveBeenNthCalledWith(1, "turn/start", {
+      threadId: "thread-a",
+      model: "codexhost/claude-code-native",
+      input: [{ type: "text", text: "continue" }],
+    });
+    expect(sendRequest).toHaveBeenNthCalledWith(2, "turn/start", {
+      threadId: "thread-b",
+      model: "gpt-5",
+      input: [{ type: "text", text: "other" }],
+    });
+  });
+
+  it("does not bleed draft model carrier into historical thread after thread inspection", async () => {
+    const sendRequest = vi.fn(async (method: string) => {
+      if (method === "codexhost/thread/inspect") {
+        return { owner: "codex" };
+      }
+      return { thread: { id: "thread-hist" } };
+    });
+    const manager = requestManagerFixture();
+    const bridge = requestBridgeFixture({ sendRequest });
+    const target: DraftPrewarmPolicyTarget = {};
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const policy = target.__codexhostDraftPrewarmPolicyV1 as {
+      select(model: string | null): boolean;
+    };
+
+    expect(policy.select("codexhost/antigravity-native")).toBe(true);
+    await bridge.sendRequest("thread/start", { cwd: "/tmp", model: "gpt-5" });
+
+    // Inspect an existing official thread (e.g. user clicked on it in the sidebar)
+    await bridge.sendRequest("codexhost/thread/inspect", { threadId: "official-thread" });
+
+    await bridge.sendRequest("turn/start", {
+      threadId: "official-thread",
+      model: "gpt-5",
+      input: [{ type: "text", text: "hello in official thread" }],
+    });
+
+    expect(sendRequest).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "official-thread",
+      model: "gpt-5",
+      input: [{ type: "text", text: "hello in official thread" }],
+    });
+  });
+
   it("tunnels private Host requests through the stock Remote Control app-server", async () => {
     const manager = requestManagerFixture();
     const originalNotification = manager.onNotification as ReturnType<typeof vi.fn>;

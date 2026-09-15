@@ -8,7 +8,7 @@ export const harnessAccountSnapshotSchema = z
     email: z.string().trim().min(1).max(320).optional(),
     label: z.string().trim().min(1).max(256).optional(),
     plan: z.string().trim().min(1).max(128).optional(),
-    credits: accountCreditsSnapshotSchema,
+    credits: accountCreditsSnapshotSchema.optional(),
     /**
      * Present only for Harnesses that expose more than one selectable native
      * account. `accountId` is opaque and owned by the adapter.
@@ -22,6 +22,7 @@ export const harnessAccountSnapshotSchema = z
       .optional(),
     isDefault: z.boolean().optional(),
     selectable: z.boolean().optional(),
+    authState: z.enum(["ready", "needs_login", "cooldown", "disabled"]).optional(),
   })
   .strict();
 export type HarnessAccountSnapshot = z.infer<typeof harnessAccountSnapshotSchema>;
@@ -44,6 +45,29 @@ export type HarnessAccountListResult = z.infer<typeof harnessAccountListResultSc
 /** Select the default native account for a Harness that exposes selectable accounts. */
 export const HARNESS_ACCOUNT_SELECT_METHOD = "codexhost/harness/accounts/select" as const;
 
+/** Explicitly refresh read-only quota telemetry for all reported Harness accounts. */
+export const HARNESS_ACCOUNT_REFRESH_METHOD = "codexhost/harness/accounts/refresh" as const;
+
+/** Start an explicit, user-authorized login for one native Harness account. */
+export const HARNESS_ACCOUNT_LOGIN_START_METHOD = "codexhost/harness/accounts/login/start" as const;
+
+/** Create a new isolated account for a Harness that supports multi-account management. */
+export const HARNESS_ACCOUNT_CREATE_METHOD = "codexhost/harness/accounts/create" as const;
+
+export const harnessAccountCreateParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+    name: z.string().trim().min(1).max(256).optional(),
+  })
+  .strict();
+export type HarnessAccountCreateParams = z.infer<typeof harnessAccountCreateParamsSchema>;
+
 export const harnessAccountSelectParamsSchema = z
   .object({
     harnessId: harnessIdSchema,
@@ -56,3 +80,47 @@ export const harnessAccountSelectParamsSchema = z
   })
   .strict();
 export type HarnessAccountSelectParams = z.infer<typeof harnessAccountSelectParamsSchema>;
+
+export const harnessAccountLoginStartParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type HarnessAccountLoginStartParams = z.infer<typeof harnessAccountLoginStartParamsSchema>;
+
+export const harnessAccountLoginStartResultSchema = z
+  .object({
+    started: z.literal(true),
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type HarnessAccountLoginStartResult = z.infer<typeof harnessAccountLoginStartResultSchema>;
+
+/** Delete a custom isolated account for a Harness that supports multi-account management. */
+export const HARNESS_ACCOUNT_DELETE_METHOD = "codexhost/harness/accounts/delete" as const;
+
+export const harnessAccountDeleteParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type HarnessAccountDeleteParams = z.infer<typeof harnessAccountDeleteParamsSchema>;
+

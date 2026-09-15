@@ -37,7 +37,8 @@ describe("mergeAntigravityHistoryTurns", () => {
     (stale as { outcome: { status: string } }).outcome = { status: "failed" } as never;
     const merged = mergeAntigravityHistoryTurns(native, [stale]);
     expect(merged).toHaveLength(1);
-    expect(merged[0].outcome.status).toBe("succeeded");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.outcome.status).toBe("succeeded");
   });
 
   it("keeps sidecar-only Turns so the final reply before a crash survives", () => {
@@ -54,7 +55,10 @@ describe("mergeAntigravityHistoryTurns", () => {
   });
 
   it("returns the sidecar as-is when Native history is empty", () => {
-    const sidecar = [turn("conversation-merge-test:turn:2"), turn("conversation-merge-test:turn:1")];
+    const sidecar = [
+      turn("conversation-merge-test:turn:2"),
+      turn("conversation-merge-test:turn:1"),
+    ];
     expect(mergeAntigravityHistoryTurns([], sidecar)).toEqual(sidecar);
   });
 });

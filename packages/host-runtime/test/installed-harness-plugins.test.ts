@@ -4,7 +4,6 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { HarnessInspection } from "@codexhost/harness-adapter";
 import { warmup as warmupClaude } from "@codexhost/adapter-claude-code/plugin";
-import { warmup as warmupAntigravity } from "@codexhost/adapter-antigravity/plugin";
 
 import { installedHarnessPluginOptions, loadHarnessPlugins } from "../src/index.js";
 
@@ -19,6 +18,7 @@ const classes = {
   omp: "OmpAdapter",
   antigravity: "AntigravityAdapter",
   "kiro-cli": "KiroAdapter",
+  "cursor-cli": "CursorAdapter",
 };
 
 const unavailable: HarnessInspection = {
@@ -39,27 +39,21 @@ function load(environment: NodeJS.ProcessEnv = {}) {
 }
 
 describe("installed Harness composition", () => {
-  it.each([
-    ["Claude Code", warmupClaude],
-    ["Antigravity", warmupAntigravity],
-  ] as const)(
-    "preserves %s best-effort asynchronous prefetch inside the plugin",
-    async (_name, warmup) => {
-      const deferred = Promise.withResolvers<HarnessInspection>();
-      const inspect = vi.fn(() => deferred.promise);
-      const prefetch = warmup({ inspect });
-      expect(inspect).toHaveBeenCalledOnce();
-      deferred.resolve(unavailable);
-      await expect(prefetch).resolves.toBeUndefined();
-      await expect(
-        warmup({
-          inspect: async () => {
-            throw new Error("synthetic");
-          },
-        }),
-      ).resolves.toBeUndefined();
-    },
-  );
+  it("preserves Claude Code best-effort asynchronous prefetch inside the plugin", async () => {
+    const deferred = Promise.withResolvers<HarnessInspection>();
+    const inspect = vi.fn(() => deferred.promise);
+    const prefetch = warmupClaude({ inspect });
+    expect(inspect).toHaveBeenCalledOnce();
+    deferred.resolve(unavailable);
+    await expect(prefetch).resolves.toBeUndefined();
+    await expect(
+      warmupClaude({
+        inspect: async () => {
+          throw new Error("synthetic");
+        },
+      }),
+    ).resolves.toBeUndefined();
+  });
 
   // Cold bundle imports can exceed Vitest's 5s default on CI; the loader retains its 10s budget.
   it("loads all preinstalled plugin factories without static registration or executable discovery", async () => {
@@ -103,6 +97,7 @@ describe("installed Harness composition", () => {
         "/kiro-spec",
         "/kiro-vibe",
       ],
+      "cursor-cli": [],
     };
     const registry = await load();
     try {

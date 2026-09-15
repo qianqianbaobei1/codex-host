@@ -76,6 +76,41 @@ function openConnectionsSettings(opener?: HTMLElement): void {
   openSettingsPage("connections", opener);
 }
 
+function createCheckmarkSvg(ownerDocument: Document): SVGSVGElement {
+  const svg = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.style.width = "14px";
+  svg.style.height = "14px";
+  svg.style.flex = "none";
+  svg.style.fill = "none";
+  svg.style.stroke = "currentColor";
+  svg.style.strokeWidth = "1.8";
+  svg.style.strokeLinecap = "round";
+  svg.style.strokeLinejoin = "round";
+  const path = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M3.5 8.5l3 3 6-6");
+  svg.append(path);
+  return svg;
+}
+
+function createPlusSvg(ownerDocument: Document): SVGSVGElement {
+  const svg = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.style.width = "14px";
+  svg.style.height = "14px";
+  svg.style.flex = "none";
+  svg.style.fill = "none";
+  svg.style.stroke = "currentColor";
+  svg.style.strokeWidth = "1.5";
+  svg.style.strokeLinecap = "round";
+  const path = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M8 3.5v9M3.5 8h9");
+  svg.append(path);
+  return svg;
+}
+
 export const RENDERER_AGENT_INSTALL_URLS: Readonly<Record<ExternalRendererAgent, string>> = {
   pi: "https://pi.dev/",
   "claude-code": "https://code.claude.com/docs/en/quickstart",
@@ -85,12 +120,13 @@ export const RENDERER_AGENT_INSTALL_URLS: Readonly<Record<ExternalRendererAgent,
   omp: "https://github.com/can1357/oh-my-pi",
   antigravity: "https://antigravity.google/product/antigravity-cli",
   "kiro-cli": "https://kiro.dev/docs/cli/",
+  "cursor-cli": "https://cursor.com/docs/cli/installation",
 };
 
 type AgentAvailability = Partial<Record<ExternalRendererAgent, RendererAgentAvailability>>;
 
 export const CONTROL_ATTRIBUTE = "data-codexhost-agent-control";
-const AGENT_MENU_WIDTH = 224;
+const AGENT_MENU_WIDTH = 260;
 // Below this many enabled Agents, the picker stays a flat list — grouping
 // only earns its keep once there are enough Harnesses to make scanning slow.
 const AGENT_GROUP_CTA_THRESHOLD = 5;
@@ -99,6 +135,8 @@ interface AgentOptionControl {
   row: HTMLElement;
   button: HTMLButtonElement;
   check: HTMLElement;
+  accountCount: HTMLSpanElement | null;
+  manageButton: HTMLButtonElement | null;
   // Shared 24x24 slot: renders as an Install ("+") action when the Agent is
   // not installed, or a red error ("!") action once it has failed — the two
   // are mutually exclusive since `RendererAgentAvailability` is a single
@@ -179,7 +217,6 @@ export function rendererAgentPickerView(
     agents.map((agent) => [
       agent,
       switching ||
-        state.phase === "locked" ||
         (agent !== "codex" && (adapterState !== "ready" || availability[agent] !== "ready")),
     ]),
   ) as Partial<Record<RendererAgent, boolean>>;
@@ -195,8 +232,7 @@ export function rendererAgentPickerView(
   ) as Partial<Record<ExternalRendererAgent, boolean>>;
   return {
     label: RENDERER_AGENT_LABELS[state.agent],
-    triggerDisabled:
-      switching || state.phase === "locked" || (agents.length < 2 && codexAccountCount < 2),
+    triggerDisabled: switching || (agents.length < 2 && codexAccountCount < 2),
     nativeModelHidden: switching || state.agent !== "codex",
     optionDisabled,
     downloadVisible,
@@ -305,12 +341,13 @@ export function mountRendererAgentPicker(
   menu.style.position = "fixed";
   menu.style.inset = "auto";
   menu.style.width = `${AGENT_MENU_WIDTH}px`;
-  menu.style.padding = "4px";
-  menu.style.border = "0";
-  menu.style.borderRadius = "6px";
-  menu.style.background = "Canvas";
-  menu.style.color = "CanvasText";
-  menu.style.boxShadow = "0 8px 24px rgba(0, 0, 0, 0.28)";
+  menu.style.padding = "5px";
+  menu.style.border = "1px solid light-dark(#E6E6E6, color-mix(in srgb, CanvasText 14%, transparent))";
+  menu.style.borderRadius = "10px";
+  menu.style.background = "light-dark(#FFFFFF, Canvas)";
+  menu.style.color = "light-dark(#171717, CanvasText)";
+  menu.style.boxShadow =
+    "light-dark(0 6px 20px rgba(0, 0, 0, 0.08), 0 8px 20px rgba(0, 0, 0, 0.28))";
   menu.style.boxSizing = "border-box";
   menu.style.maxHeight = "min(420px, calc(100vh - 16px))";
   menu.style.overflowX = "hidden";
@@ -323,9 +360,12 @@ export function mountRendererAgentPicker(
   const groupMessages = pickerGroupMessages();
 
   const close = (): void => {
-    if (!popoverOpen(menu)) return;
-    if (typeof menu.hidePopover === "function") menu.hidePopover();
-    else menu.hidden = true;
+    if (popoverOpen(menu)) {
+      if (typeof menu.hidePopover === "function") menu.hidePopover();
+      else menu.hidden = true;
+    } else if (typeof menu.showPopover !== "function") {
+      menu.hidden = true;
+    }
     trigger.setAttribute("aria-expanded", "false");
   };
   const codexAccountGroup = createRendererCodexAccountGroup({
@@ -344,7 +384,6 @@ export function mountRendererAgentPicker(
   });
   const codexAccountOptions = codexAccountGroup.options;
   const codexAccountContainer = codexAccountGroup.root;
-  trigger.append(codexAccountGroup.badge);
 
   const harnessAccountGroup = createRendererHarnessAccountGroup({
     ownerDocument: document,
@@ -382,32 +421,46 @@ export function mountRendererAgentPicker(
   };
 
   for (const agent of enabledAgents) {
+    const isHarnessWithAccounts = agent === "codex" || agent === "antigravity";
+    const accountGroup =
+      agent === "codex" ? codexAccountGroup : agent === "antigravity" ? harnessAccountGroup : null;
+    const manageButton = accountGroup?.manageButton ?? null;
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.agent = agent;
     button.setAttribute("role", "menuitemradio");
+    button.style.position = "relative";
     button.style.display = "flex";
     button.style.alignItems = "center";
     button.style.gap = "8px";
     button.style.minWidth = "0";
     button.style.width = "100%";
     button.style.flex = "1 1 auto";
-    button.style.height = "36px";
-    button.style.padding = "0 34px 0 8px";
+    button.style.height = `${isHarnessWithAccounts ? 36 : 34}px`;
+    button.style.padding = `0 ${isHarnessWithAccounts ? 64 : 28}px 0 8px`;
     button.style.border = "0";
-    button.style.borderRadius = "4px";
+    button.style.borderRadius = "6px";
     button.style.background = "transparent";
-    button.style.color = "inherit";
-    button.style.font = "500 13px/1 system-ui, sans-serif";
-    button.style.letterSpacing = "0";
+    button.style.color = "light-dark(#171717, #f0f0f0)";
+    button.style.font = "500 13px/1.3 system-ui, -apple-system, sans-serif";
+    button.style.letterSpacing = "-0.1px";
     button.style.textAlign = "left";
     button.style.cursor = "pointer";
+    button.style.boxSizing = "border-box";
+    button.style.transition = "background 120ms ease-out";
     const updateHighlight = (active: boolean): void => {
       const selected = button.getAttribute("aria-checked") === "true";
-      button.style.background =
-        selected || (active && !button.disabled)
-          ? `rgba(127, 127, 127, ${selected ? "0.16" : "0.1"})`
+      button.style.background = selected
+        ? "light-dark(#F2F2F2, rgba(255, 255, 255, 0.12))"
+        : active && !button.disabled
+          ? "light-dark(#F7F7F7, rgba(255, 255, 255, 0.06))"
           : "transparent";
+      if (row.dataset.section === "more" && !selected) {
+        button.style.color =
+          active && !button.disabled
+            ? "light-dark(#3F3F3F, #e0e0e0)"
+            : "light-dark(#707070, #aaaaaa)";
+      }
     };
     button.addEventListener("pointerenter", () => updateHighlight(true));
     button.addEventListener("pointerleave", () => updateHighlight(false));
@@ -415,12 +468,25 @@ export function mountRendererAgentPicker(
     button.addEventListener("blur", () => updateHighlight(false));
 
     const check = document.createElement("span");
-    check.textContent = "\u2713";
     check.setAttribute("aria-hidden", "true");
-    check.style.width = "24px";
+    check.style.display = "inline-flex";
+    check.style.alignItems = "center";
+    check.style.justifyContent = "center";
+    check.style.width = "18px";
+    check.style.height = "18px";
     check.style.flex = "none";
-    check.style.textAlign = "center";
+    check.style.color = "light-dark(#171717, #f0f0f0)";
     check.style.visibility = "hidden";
+    check.replaceChildren(createCheckmarkSvg(document));
+
+    const iconSlot = document.createElement("span");
+    iconSlot.style.display = "inline-flex";
+    iconSlot.style.alignItems = "center";
+    iconSlot.style.justifyContent = "center";
+    iconSlot.style.width = "20px";
+    iconSlot.style.height = "20px";
+    iconSlot.style.flex = "none";
+    iconSlot.append(createRendererAgentIcon(agent));
 
     const label = document.createElement("span");
     label.textContent = RENDERER_AGENT_LABELS[agent];
@@ -429,7 +495,19 @@ export function mountRendererAgentPicker(
     label.style.overflow = "hidden";
     label.style.textOverflow = "ellipsis";
     label.style.whiteSpace = "nowrap";
-    button.append(createRendererAgentIcon(agent), label);
+
+    const accountCount = accountGroup ? document.createElement("span") : null;
+    if (accountCount) {
+      accountCount.hidden = true;
+      accountCount.style.display = "inline-block";
+      accountCount.style.minWidth = "12px";
+      accountCount.style.color = "light-dark(#777777, #999999)";
+      accountCount.style.font = "400 11px/1 system-ui, sans-serif";
+      accountCount.style.fontVariantNumeric = "tabular-nums";
+      accountCount.style.flex = "none";
+      accountCount.style.pointerEvents = "none";
+    }
+    button.append(iconSlot, label);
     button.addEventListener("click", () => {
       const selected = button.getAttribute("aria-pressed") === "true";
       close();
@@ -443,21 +521,20 @@ export function mountRendererAgentPicker(
         : (() => {
             const control = document.createElement("button");
             control.type = "button";
-            control.style.position = "absolute";
-            control.style.inset = "0";
             control.style.display = "inline-flex";
             control.style.alignItems = "center";
             control.style.justifyContent = "center";
-            control.style.width = "24px";
-            control.style.height = "24px";
+            control.style.width = "18px";
+            control.style.height = "18px";
             control.style.flex = "none";
             control.style.padding = "0";
             control.style.border = "0";
             control.style.borderRadius = "4px";
             control.style.background = "transparent";
             control.style.cursor = "pointer";
+            control.style.transition = "background 120ms ease-out";
             control.addEventListener("pointerenter", () => {
-              if (!control.disabled) control.style.background = "rgba(127, 127, 127, 0.16)";
+              if (!control.disabled) control.style.background = "light-dark(#EEEEEE, rgba(255, 255, 255, 0.12))";
             });
             control.addEventListener("pointerleave", () => {
               control.style.background = "transparent";
@@ -478,23 +555,47 @@ export function mountRendererAgentPicker(
             });
             return control;
           })();
+
+    const actionSlot = document.createElement("span");
+    actionSlot.style.display = "inline-flex";
+    actionSlot.style.alignItems = "center";
+    actionSlot.style.justifyContent = "center";
+    actionSlot.style.width = "18px";
+    actionSlot.style.height = "18px";
+    actionSlot.style.flex = "none";
+    actionSlot.style.pointerEvents = "none";
+    actionSlot.append(check);
+    if (action) actionSlot.append(action);
+
+    const rightCluster = document.createElement("div");
+    rightCluster.style.position = "absolute";
+    rightCluster.style.right = "6px";
+    rightCluster.style.top = "0";
+    rightCluster.style.bottom = "0";
+    rightCluster.style.display = "flex";
+    rightCluster.style.alignItems = "center";
+    rightCluster.style.gap = "6px";
+    rightCluster.style.pointerEvents = "none";
+    rightCluster.style.zIndex = "1";
+
+    if (accountCount) rightCluster.append(accountCount);
+    if (manageButton) {
+      manageButton.style.pointerEvents = "auto";
+      manageButton.style.position = "static";
+      rightCluster.append(manageButton);
+    }
+    rightCluster.append(actionSlot);
+
     const row = document.createElement("div");
     row.style.position = "relative";
     row.style.display = "flex";
     row.style.alignItems = "center";
-    const actionSlot = document.createElement("span");
-    actionSlot.style.position = "absolute";
-    actionSlot.style.top = "6px";
-    actionSlot.style.right = "4px";
-    actionSlot.style.zIndex = "1";
-    actionSlot.style.display = "inline-block";
-    actionSlot.style.width = "24px";
-    actionSlot.style.height = "24px";
-    actionSlot.style.pointerEvents = "none";
-    actionSlot.append(check);
-    if (action) actionSlot.append(action);
-    row.append(button, actionSlot);
-    options[agent] = { row, button, check, action };
+    row.style.width = "100%";
+    row.append(button, rightCluster);
+    row.addEventListener("pointerenter", () => updateHighlight(true));
+    row.addEventListener("pointerleave", () => updateHighlight(false));
+
+    options[agent] = { row, button, check, accountCount, manageButton, action };
     rowsByAgent.set(agent, row);
   }
 
@@ -505,7 +606,13 @@ export function mountRendererAgentPicker(
   const mainGroup = document.createElement("div");
   mainGroup.style.display = "flex";
   mainGroup.style.flexDirection = "column";
-  mainGroup.style.gap = "2px";
+  mainGroup.style.gap = "1px";
+
+  const groupDivider = document.createElement("div");
+  groupDivider.style.display = "none";
+  groupDivider.style.height = "1px";
+  groupDivider.style.margin = "4px 8px 3px 8px";
+  groupDivider.style.background = "light-dark(#F0F0F0, rgba(255, 255, 255, 0.08))";
 
   let moreOpen = false;
   const moreToggle = document.createElement("button");
@@ -518,49 +625,66 @@ export function mountRendererAgentPicker(
   moreToggle.style.marginTop = "2px";
   moreToggle.style.padding = "0 8px";
   moreToggle.style.border = "0";
-  moreToggle.style.borderRadius = "4px";
+  moreToggle.style.borderRadius = "6px";
   moreToggle.style.background = "transparent";
   moreToggle.style.color = "inherit";
-  moreToggle.style.font = "500 12px/1 system-ui, sans-serif";
-  moreToggle.style.opacity = "0.72";
   moreToggle.style.cursor = "pointer";
+  moreToggle.style.transition = "background 120ms ease-out";
   moreToggle.addEventListener("pointerenter", () => {
-    moreToggle.style.background = "rgba(127, 127, 127, 0.1)";
+    moreToggle.style.background = "light-dark(#F7F7F7, rgba(255, 255, 255, 0.06))";
   });
   moreToggle.addEventListener("pointerleave", () => {
     moreToggle.style.background = "transparent";
   });
   const moreArrow = document.createElement("span");
   moreArrow.setAttribute("aria-hidden", "true");
-  moreArrow.style.width = "12px";
+  moreArrow.style.display = "inline-flex";
+  moreArrow.style.alignItems = "center";
+  moreArrow.style.justifyContent = "center";
+  moreArrow.style.width = "10px";
+  moreArrow.style.height = "10px";
   moreArrow.style.flex = "none";
+  moreArrow.style.color = "light-dark(#666666, #999999)";
+  moreArrow.style.fontSize = "10px";
+  moreArrow.style.lineHeight = "1";
   moreArrow.textContent = "▸";
   const moreLabel = document.createElement("span");
+  moreLabel.style.display = "flex";
+  moreLabel.style.alignItems = "baseline";
+  moreLabel.style.gap = "4px";
   moreToggle.append(moreArrow, moreLabel);
 
   const morePanel = document.createElement("div");
   morePanel.style.display = "none";
   morePanel.style.flexDirection = "column";
-  morePanel.style.gap = "2px";
-  morePanel.style.paddingLeft = "8px";
+  morePanel.style.gap = "1px";
+  morePanel.style.paddingLeft = "0";
   const moreRows = document.createElement("div");
   moreRows.style.display = "flex";
   moreRows.style.flexDirection = "column";
-  moreRows.style.gap = "2px";
+  moreRows.style.gap = "1px";
   const manageLink = document.createElement("button");
   manageLink.type = "button";
   manageLink.textContent = `${groupMessages.pickerManageLink} →`;
   manageLink.style.display = "flex";
+  manageLink.style.alignItems = "center";
   manageLink.style.width = "100%";
   manageLink.style.height = "28px";
   manageLink.style.marginTop = "2px";
-  manageLink.style.padding = "0 12px";
+  manageLink.style.padding = "0 8px";
   manageLink.style.border = "0";
-  manageLink.style.borderRadius = "4px";
+  manageLink.style.borderRadius = "5px";
   manageLink.style.background = "transparent";
-  manageLink.style.color = "#6d9fff";
+  manageLink.style.color = "light-dark(#0b75d1, #66aaf9)";
   manageLink.style.font = "500 11px/1 system-ui, sans-serif";
   manageLink.style.cursor = "pointer";
+  manageLink.style.transition = "background 120ms ease-out";
+  manageLink.addEventListener("pointerenter", () => {
+    manageLink.style.background = "light-dark(#F7F7F7, rgba(255, 255, 255, 0.06))";
+  });
+  manageLink.addEventListener("pointerleave", () => {
+    manageLink.style.background = "transparent";
+  });
   manageLink.addEventListener("click", () => openConnectionsSettings(trigger));
   morePanel.append(moreRows, manageLink);
 
@@ -570,23 +694,24 @@ export function mountRendererAgentPicker(
   cta.style.alignItems = "center";
   cta.style.gap = "6px";
   cta.style.width = "100%";
-  cta.style.height = "32px";
-  cta.style.marginTop = "2px";
+  cta.style.height = "30px";
+  cta.style.marginTop = "3px";
   cta.style.padding = "0 8px";
-  cta.style.borderWidth = "1px 0 0 0";
-  cta.style.borderStyle = "solid";
-  cta.style.borderColor = "rgba(127, 127, 127, 0.16)";
+  cta.style.border = "0";
+  cta.style.borderRadius = "5px";
   cta.style.background = "transparent";
-  cta.style.color = "inherit";
-  cta.style.font = "500 12px/1 system-ui, sans-serif";
-  cta.style.opacity = "0.72";
+  cta.style.color = "light-dark(#777777, #999999)";
+  cta.style.font = "500 11px/1 system-ui, sans-serif";
   cta.style.cursor = "pointer";
+  cta.style.transition = "background 120ms ease-out, color 120ms ease-out";
   cta.textContent = `⚙ ${groupMessages.pickerHideUnusedAgentsCta} →`;
   cta.addEventListener("pointerenter", () => {
-    cta.style.background = "rgba(127, 127, 127, 0.1)";
+    cta.style.background = "light-dark(#F7F7F7, rgba(255, 255, 255, 0.06))";
+    cta.style.color = "light-dark(#171717, #f0f0f0)";
   });
   cta.addEventListener("pointerleave", () => {
     cta.style.background = "transparent";
+    cta.style.color = "light-dark(#777777, #999999)";
   });
   cta.addEventListener("click", () => openConnectionsSettings(trigger));
 
@@ -626,25 +751,58 @@ export function mountRendererAgentPicker(
 
     mainAgents = nextMain;
     moreAgents = nextMore;
-    const mainChildren: HTMLElement[] = [];
-    for (const agent of mainAgents) {
+
+    const applyRowSectionTheme = (agent: RendererAgent, section: "main" | "more"): void => {
       const row = rowsByAgent.get(agent);
-      if (row) mainChildren.push(row);
-      if (agent === "codex") mainChildren.push(codexAccountContainer);
-      if (agent === "antigravity") mainChildren.push(harnessAccountContainer);
-    }
-    mainGroup.replaceChildren(...mainChildren);
-    moreRows.replaceChildren(
-      ...moreAgents
-        .map((agent) => rowsByAgent.get(agent))
-        .filter((el): el is HTMLDivElement => !!el),
-    );
+      if (!row) return;
+      row.dataset.section = section;
+      const button = row.querySelector<HTMLButtonElement>('[role="menuitemradio"]');
+      if (!button) return;
+      const isMore = section === "more";
+      const isHarnessWithAccounts = agent === "codex" || agent === "antigravity";
+      button.style.height = isMore ? "34px" : `${isHarnessWithAccounts ? 36 : 34}px`;
+      button.style.borderRadius = "6px";
+      button.style.fontSize = isMore ? "12px" : "13px";
+      button.style.fontWeight = isMore ? "400" : "500";
+      const isSelected = button.getAttribute("aria-checked") === "true";
+      if (!isSelected) {
+        button.style.color = isMore
+          ? "light-dark(#707070, #aaaaaa)"
+          : "light-dark(#171717, #f0f0f0)";
+      }
+    };
+    for (const agent of nextMain) applyRowSectionTheme(agent, "main");
+    for (const agent of nextMore) applyRowSectionTheme(agent, "more");
+
+    const childrenFor = (agents: readonly RendererAgent[]): HTMLElement[] => {
+      const children: HTMLElement[] = [];
+      for (const agent of agents) {
+        const row = rowsByAgent.get(agent);
+        if (row) children.push(row);
+        if (agent === "codex") children.push(codexAccountContainer);
+        if (agent === "antigravity") children.push(harnessAccountContainer);
+      }
+      return children;
+    };
+    mainGroup.replaceChildren(...childrenFor(mainAgents));
+    moreRows.replaceChildren(...childrenFor(moreAgents));
     const showMoreGroup = moreAgents.length > 0;
     const showCta = !showMoreGroup && enabledAgents.length > AGENT_GROUP_CTA_THRESHOLD;
+    groupDivider.style.display = showMoreGroup ? "block" : "none";
     moreToggle.style.display = showMoreGroup ? "flex" : "none";
     morePanel.style.display = showMoreGroup && moreOpen ? "flex" : "none";
     cta.style.display = showCta ? "flex" : "none";
-    moreLabel.textContent = `${groupMessages.pickerMoreAgentsLabel} (${moreAgents.length})`;
+
+    moreLabel.replaceChildren();
+    const titleSpan = document.createElement("span");
+    titleSpan.textContent = groupMessages.pickerMoreAgentsLabel;
+    titleSpan.style.font = "500 12px/1 system-ui, sans-serif";
+    titleSpan.style.color = "light-dark(#555555, #bbbbbb)";
+    const countSpan = document.createElement("span");
+    countSpan.textContent = ` (${moreAgents.length})`;
+    countSpan.style.font = "400 12px/1 system-ui, sans-serif";
+    countSpan.style.color = "light-dark(#777777, #888888)";
+    moreLabel.append(titleSpan, countSpan);
     moreArrow.textContent = moreOpen ? "▾" : "▸";
   };
   moreToggle.addEventListener("click", () => {
@@ -654,11 +812,20 @@ export function mountRendererAgentPicker(
   regroup();
   const unsubscribeGroup = groupPreference.subscribe(regroup);
 
-  menu.append(mainGroup, moreToggle, morePanel, cta);
+  menu.append(mainGroup, groupDivider, moreToggle, morePanel, cta);
   root.append(trigger, menu);
 
+  let triggerPointerDownWhileOpen = false;
+  const onTriggerPointerDown = (): void => {
+    // An `auto` popover is light-dismissed during pointerdown before the
+    // trigger's click handler runs. Remember the pre-dismiss state so that
+    // click does not immediately reopen the menu.
+    triggerPointerDownWhileOpen = popoverOpen(menu);
+  };
   const onTriggerClick = (): void => {
-    if (popoverOpen(menu)) close();
+    const wasOpen = triggerPointerDownWhileOpen;
+    triggerPointerDownWhileOpen = false;
+    if (wasOpen || popoverOpen(menu)) close();
     else open();
   };
   const onTriggerKeyDown = (event: KeyboardEvent): void => {
@@ -700,6 +867,7 @@ export function mountRendererAgentPicker(
     if (popoverOpen(menu)) setMenuPosition(control);
   };
   trigger.addEventListener("click", onTriggerClick);
+  trigger.addEventListener("pointerdown", onTriggerPointerDown);
   trigger.addEventListener("keydown", onTriggerKeyDown);
   menu.addEventListener("keydown", onMenuKeyDown);
   menu.addEventListener("toggle", onToggle);
@@ -727,6 +895,7 @@ export function mountRendererAgentPicker(
       close();
       unsubscribeGroup();
       trigger.removeEventListener("click", onTriggerClick);
+      trigger.removeEventListener("pointerdown", onTriggerPointerDown);
       trigger.removeEventListener("keydown", onTriggerKeyDown);
       menu.removeEventListener("keydown", onMenuKeyDown);
       menu.removeEventListener("toggle", onToggle);
@@ -750,8 +919,6 @@ export function renderRendererAgentPicker(
   harnessAccountId: string | null = null,
 ): RendererAgentPickerView {
   control.codexAccounts = [...codexAccounts];
-  const codexOption = control.options.codex;
-  if (codexOption) codexOption.row.hidden = codexAccounts.length > 0;
   const view = rendererAgentPickerView(
     state,
     adapterState,
@@ -779,7 +946,6 @@ export function renderRendererAgentPicker(
     accounts: codexAccounts,
     selectedAccountId: state.agent === "codex" ? (activeAccount?.accountId ?? null) : null,
     disabled: switching || state.phase === "locked",
-    showBadge: state.agent === "codex" && codexAccounts.length > 1,
   });
   control.harnessAccountGroup.render({
     entries: harnessAccounts,
@@ -806,10 +972,24 @@ export function renderRendererAgentPicker(
     option.button.disabled = view.optionDisabled[agent] ?? true;
     option.button.setAttribute("aria-checked", String(selected));
     option.button.setAttribute("aria-pressed", String(selected));
-    option.button.style.background = selected ? "rgba(127, 127, 127, 0.16)" : "transparent";
+    option.button.style.background = selected
+      ? "light-dark(#F2F2F2, rgba(255, 255, 255, 0.12))"
+      : "transparent";
+    option.button.style.color = selected
+      ? "light-dark(#171717, #f0f0f0)"
+      : option.row.dataset.section === "more"
+        ? "light-dark(#707070, #aaaaaa)"
+        : "light-dark(#171717, #f0f0f0)";
     option.button.style.cursor = option.button.disabled ? "not-allowed" : "pointer";
     option.button.style.opacity = option.button.disabled && !selected ? "0.5" : "1";
     option.check.style.visibility = selected ? "visible" : "hidden";
+    if (option.accountCount) {
+      const count = agent === "codex" ? codexAccounts.length : harnessAccounts.length;
+      option.accountCount.hidden = count === 0;
+      option.accountCount.textContent = `${count}`;
+      option.accountCount.title = `${count} account${count === 1 ? "" : "s"}`;
+      option.accountCount.style.color = "light-dark(#777777, #999999)";
+    }
     if (option.action) {
       const externalAgent = agent as ExternalRendererAgent;
       const showInstall = view.downloadVisible[externalAgent] === true;
@@ -831,10 +1011,10 @@ export function renderRendererAgentPicker(
         option.action.title = label;
       } else {
         option.action.dataset.mode = "install";
-        option.action.textContent = "+";
-        option.action.style.color = "inherit";
-        option.action.style.font = "600 18px/1 system-ui, sans-serif";
-        option.action.style.opacity = "0.72";
+        option.action.textContent = "";
+        option.action.replaceChildren(createPlusSvg(document));
+        option.action.style.color = "light-dark(#666666, #999999)";
+        option.action.style.opacity = "1";
         const label = `Install ${RENDERER_AGENT_LABELS[agent]}`;
         option.action.setAttribute("aria-label", label);
         option.action.title = label;

@@ -47,6 +47,18 @@ while read -r line; do
 done
 `;
 
+const SLOW_INIT_SCRIPT = `#!/bin/bash
+sleep 0.25
+echo '${INIT_LINE}'
+while read -r line; do
+  case "$line" in
+    *user*)
+      echo '${RESULT_LINE}'
+      ;;
+  esac
+done
+`;
+
 const STAYING_ALIVE_AFTER_RESULT_SCRIPT = `#!/bin/bash
 echo "$AGY_TEST_PID_FILE" >/dev/null
 echo "$$" > "$AGY_TEST_PID_FILE"
@@ -55,6 +67,18 @@ while read -r line; do
   case "$line" in
     *user*)
       echo '${RESULT_LINE}'
+      sleep 60
+      ;;
+  esac
+done
+`;
+
+const QUOTA_SCRIPT = `#!/bin/bash
+echo '${INIT_LINE}'
+while read -r line; do
+  case "$line" in
+    *user*)
+      echo "ERROR: logging before google.Init: I0910 00:02:37.879455 13 run.go:371] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h48m22s.)" >&2
       sleep 60
       ;;
   esac
@@ -146,6 +170,55 @@ describe("AntigravityCliTransport turn liveness (activity-aware timeout)", () =>
       expect(outcome.settled).toBe(true);
       expect(outcome.error ?? "").toContain("Antigravity Turn execution timed out");
       expect(outcome.error ?? "").toContain("no stream activity");
+      await transport.close().catch(() => undefined);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  it("fails a Turn as soon as AGY reports an exhausted quota", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-quota-"));
+    try {
+      const command = await writeAgy(root, "quota.sh", QUOTA_SCRIPT);
+      const faults: string[] = [];
+      const transport = new AntigravityCliTransport({
+        cwd: root,
+        command,
+        onFault: (error) => faults.push(error.kind),
+        // Both watchdogs are far beyond the test timeout: only the stderr
+        // quota signal can settle this Turn in time.
+        idleTimeoutMs: 30_000,
+        turnDeadlineMs: 30_000,
+      });
+
+      await transport.start();
+      await expect(transport.runTurn("do work", () => undefined)).rejects.toThrow(
+        /quota is exhausted/iu,
+      );
+      expect(faults).toEqual(["quotaExhausted"]);
+      await transport.close().catch(() => undefined);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  it("lets a later start() join a live spawn after the first waiter times out", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-slow-init-"));
+    try {
+      const command = await writeAgy(root, "slow-init.sh", SLOW_INIT_SCRIPT);
+      const transport = new AntigravityCliTransport({
+        cwd: root,
+        command,
+        startupTimeoutMs: 50,
+      });
+
+      await expect(transport.start()).rejects.toThrow("Antigravity Session startup timed out");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const init = await transport.start();
+      expect(init.conversationId).toBe("conv-live");
+      await expect(transport.runTurn("after join", () => undefined)).resolves.toMatchObject({
+        response: "done",
+      });
       await transport.close().catch(() => undefined);
     } finally {
       await rm(root, { recursive: true, force: true });

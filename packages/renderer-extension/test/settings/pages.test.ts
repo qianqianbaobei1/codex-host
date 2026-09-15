@@ -283,6 +283,218 @@ describe("Read-only Harness accounts", () => {
     await refresh;
     expect(visibleText(content)).not.toContain("person@example.com");
   });
+
+  it("shows the account row while an explicit quota refresh is still pending", async () => {
+    const document = new FakeDocument();
+    const content = document.createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const pending = deferred<HarnessAccountListResult>();
+    const baseline: HarnessAccountListResult = {
+      accounts: [
+        {
+          harnessId: harnessIdSchema.parse("grok"),
+          harnessName: "Grok Build",
+          email: "person@example.com",
+        },
+      ],
+    };
+    const listHarnessAccounts = vi.fn(async () => baseline);
+    const refreshHarnessAccounts = vi.fn(() => pending.promise);
+    const mounted = mountHarnessAccounts(
+      {
+        content: content as unknown as HTMLElement,
+        signal: scope.signal,
+        runLatest: (op, handlers) => scope.runLatest(op, handlers),
+      },
+      rendererSettingsMessages("zh-CN"),
+      () => ({ listHarnessAccounts, refreshHarnessAccounts }),
+      vi.fn(),
+    );
+
+    const refresh = mounted.refresh();
+    await vi.waitFor(() => expect(visibleText(content)).toContain("person@example.com"));
+    expect(visibleText(content)).toContain("正在读取额度");
+    pending.resolve(result);
+    await refresh;
+    expect(visibleText(content)).toContain("75%");
+  });
+
+  it("shows an explicit login action for an unavailable Harness account", async () => {
+    const document = new FakeDocument();
+    const content = document.createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const startHarnessAccountLogin = vi.fn(async () => ({
+      started: true as const,
+      harnessId: harnessIdSchema.parse("antigravity"),
+      accountId: "work",
+    }));
+    const mounted = mountHarnessAccounts(
+      {
+        content: content as unknown as HTMLElement,
+        signal: scope.signal,
+        runLatest: (op, handlers) => scope.runLatest(op, handlers),
+      },
+      rendererSettingsMessages("zh-CN"),
+      () => ({
+        listHarnessAccounts: async () => ({
+          accounts: [
+            {
+              harnessId: harnessIdSchema.parse("antigravity"),
+              harnessName: "Antigravity CLI",
+              accountId: "work",
+              label: "工作号",
+              authState: "needs_login" as const,
+              selectable: false,
+            },
+          ],
+        }),
+        startHarnessAccountLogin,
+      }),
+      vi.fn(),
+    );
+    await mounted.refresh();
+    const signIn = descendants(content).find(
+      (node) => node.tagName === "button" && node.textContent === "登录",
+    );
+    if (!signIn) throw new Error("Harness account login button was not rendered");
+    signIn.dispatch("click", { target: signIn });
+    await vi.waitFor(() => expect(startHarnessAccountLogin).toHaveBeenCalledOnce());
+    expect(startHarnessAccountLogin).toHaveBeenCalledWith({
+      harnessId: "antigravity",
+      accountId: "work",
+    });
+  });
+
+  it("shows re-authenticate and delete actions for connected Harness accounts", async () => {
+    const document = new FakeDocument();
+    const content = document.createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const startHarnessAccountLogin = vi.fn(async () => ({
+      started: true as const,
+      harnessId: harnessIdSchema.parse("antigravity"),
+      accountId: "work",
+    }));
+    const deleteHarnessAccount = vi.fn(async () => ({
+      accounts: [
+        {
+          harnessId: harnessIdSchema.parse("antigravity"),
+          harnessName: "Antigravity CLI",
+          accountId: "default",
+          isDefault: true,
+          selectable: true,
+        },
+      ],
+    }));
+    const mounted = mountHarnessAccounts(
+      {
+        content: content as unknown as HTMLElement,
+        signal: scope.signal,
+        runLatest: (op, handlers) => scope.runLatest(op, handlers),
+      },
+      rendererSettingsMessages("zh-CN"),
+      () => ({
+        listHarnessAccounts: async () => ({
+          accounts: [
+            {
+              harnessId: harnessIdSchema.parse("antigravity"),
+              harnessName: "Antigravity CLI",
+              accountId: "default",
+              isDefault: true,
+              selectable: true,
+            },
+            {
+              harnessId: harnessIdSchema.parse("antigravity"),
+              harnessName: "Antigravity CLI",
+              accountId: "work",
+              label: "工作号",
+              isDefault: false,
+              selectable: true,
+            },
+          ],
+        }),
+        startHarnessAccountLogin,
+        deleteHarnessAccount,
+      }),
+      vi.fn(),
+    );
+    await mounted.refresh();
+    const reauthBtn = descendants(content).find(
+      (node) => node.tagName === "button" && node.textContent === "重新登录",
+    );
+    expect(reauthBtn).toBeDefined();
+    reauthBtn?.dispatch("click", { target: reauthBtn });
+    await vi.waitFor(() => expect(startHarnessAccountLogin).toHaveBeenCalledOnce());
+
+    const deleteBtn = descendants(content).find(
+      (node) => node.tagName === "button" && node.attributes.get("aria-label")?.includes("删除: 工作号"),
+    );
+    expect(deleteBtn).toBeDefined();
+    deleteBtn?.dispatch("click", { target: deleteBtn });
+    await vi.waitFor(() => expect(deleteHarnessAccount).toHaveBeenCalledOnce());
+    expect(deleteHarnessAccount).toHaveBeenCalledWith({
+      harnessId: "antigravity",
+      accountId: "work",
+    });
+  });
+
+  it("expands and collapses Grok sub-product credits", async () => {
+    const document = new FakeDocument();
+    const content = document.createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const mounted = mountHarnessAccounts(
+      {
+        content: content as unknown as HTMLElement,
+        signal: scope.signal,
+        runLatest: (op, handlers) => scope.runLatest(op, handlers),
+      },
+      rendererSettingsMessages("zh-CN"),
+      () => ({
+        listHarnessAccounts: async () => ({
+          accounts: [
+            {
+              harnessId: harnessIdSchema.parse("grok"),
+              harnessName: "Grok Build",
+              credits: {
+                usedPercent: 20,
+                periodType: "weekly",
+                productUsage: [
+                  { product: "Build", usagePercent: 30 },
+                  { product: "Chat", usagePercent: 50 },
+                ],
+              },
+            },
+          ],
+        }),
+      }),
+      vi.fn(),
+    );
+    await mounted.refresh();
+    const metersCollapsed = descendants(content).filter(
+      (node) => node.attributes.get("role") === "meter",
+    );
+    expect(metersCollapsed).toHaveLength(1);
+
+    const toggleBtn = descendants(content).find(
+      (node) => node.tagName === "button" && node.className.includes("settings-grok-expand-btn"),
+    );
+    expect(toggleBtn).toBeDefined();
+    toggleBtn?.dispatch("click", { target: toggleBtn });
+
+    const metersExpanded = descendants(content).filter(
+      (node) => node.attributes.get("role") === "meter",
+    );
+    expect(metersExpanded).toHaveLength(3);
+
+    const collapseBtn = descendants(content).find(
+      (node) => node.tagName === "button" && node.className.includes("settings-grok-expand-btn"),
+    );
+    expect(collapseBtn).toBeDefined();
+    collapseBtn?.dispatch("click", { target: collapseBtn });
+    const metersCollapsedAgain = descendants(content).filter(
+      (node) => node.attributes.get("role") === "meter",
+    );
+    expect(metersCollapsedAgain).toHaveLength(1);
+  });
 });
 
 describe("Renderer Connections page", () => {

@@ -4,6 +4,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * Host delivers attachments to a text-only Harness as file references, so a Turn
+ * carrying one is deliverable. Only input with nothing to send stays rejected -
+ * and rejected BEFORE the running Turn is cancelled.
+ */
+function hasDeliverableInput(input: unknown): boolean {
+  if (!Array.isArray(input) || input.length === 0) return false;
+  return input.some((item) => {
+    if (!isRecord(item)) return false;
+    if (item.type === "text") return typeof item.text === "string" && item.text.trim().length > 0;
+    return ["path", "url", "name"].some(
+      (key) => typeof item[key] === "string" && (item[key] as string).trim().length > 0,
+    );
+  });
+}
+
 type RendererMethod = (...args: unknown[]) => unknown;
 interface SteeringManager {
   sendRequest: RendererMethod;
@@ -231,15 +247,8 @@ export function installRendererExternalSteering(target: unknown): (() => void) |
     const currentRole = manager.getStreamRole?.(threadId);
     if (isRecord(currentRole) && currentRole.role === "follower")
       return originalSteer.apply(manager, args);
-    if (
-      !Array.isArray(input) ||
-      input.length === 0 ||
-      input.some(
-        (item) => !isRecord(item) || item.type !== "text" || typeof item.text !== "string",
-      ) ||
-      !input.some((item) => isRecord(item) && typeof item.text === "string" && item.text.trim())
-    ) {
-      throw new Error("External steering requires non-empty text input");
+    if (!hasDeliverableInput(input)) {
+      throw new Error("External steering requires non-empty input");
     }
     if (toolOutput != null) throw new Error("External steering cannot replace a tool response");
     if (!isRecord(restoreMessage) || !isRecord(restoreMessage.context)) {

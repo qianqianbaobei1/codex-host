@@ -74,6 +74,11 @@ export interface RendererSettingsMessages {
   readonly accountNoMatches: string;
   readonly accountLoginHelp: string;
   readonly harnessAccountsTitle: string;
+  readonly harnessAccountsDescription: string;
+  readonly harnessAccountNeedsLogin: string;
+  readonly harnessAccountViewAllCredits: string;
+  readonly harnessAccountCollapseCredits: string;
+  readonly addGeminiAccount: string;
   readonly accountCreditsRemaining: string;
   readonly accountCreditsLoading: string;
   readonly accountCreditsEmpty: string;
@@ -89,6 +94,7 @@ export interface RendererSettingsMessages {
   readonly accountActive: string;
   readonly accountUse: string;
   readonly accountSignIn: string;
+  readonly accountReauth: string;
   readonly accountSigningIn: string;
   readonly accountDeviceCodePrerequisite: string;
   readonly accountVerificationDescription: string;
@@ -106,6 +112,8 @@ export interface RendererSettingsMessages {
   readonly accountCreditsPeriodSevenDay: string;
   readonly accountCreditsPeriodUnknown: string;
   readonly accountCreditsBuild: string;
+  readonly accountCreditsOwnModels: string;
+  readonly accountCreditsOtherModels: string;
   readonly accountResetCredits: string;
   readonly accountResetCreditsUse: string;
   readonly accountResetCreditsConfirm: string;
@@ -277,6 +285,11 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountNoMatches: "No matching accounts.",
   accountLoginHelp: "Before signing in",
   harnessAccountsTitle: "Other detected accounts",
+  harnessAccountsDescription: "System detected the following local or third-party CLI accounts",
+  harnessAccountNeedsLogin: "Needs sign-in before this account can run",
+  harnessAccountViewAllCredits: "View all limits",
+  harnessAccountCollapseCredits: "Collapse limits",
+  addGeminiAccount: "Add Gemini Account",
   accountCreditsRemaining: "Remaining",
   accountCreditsLoading: "Loading limits…",
   accountCreditsEmpty: "No limit data available",
@@ -292,6 +305,7 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountActive: "Default",
   accountUse: "Set as default",
   accountSignIn: "Sign in",
+  accountReauth: "Re-authenticate",
   accountSigningIn: "Starting device sign-in...",
   accountDeviceCodePrerequisite:
     "Before signing in, enable “Enable device code authorization for Codex” in Web Settings → Account security & sign-in.",
@@ -310,6 +324,8 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountCreditsPeriodSevenDay: "7-day",
   accountCreditsPeriodUnknown: "Limit",
   accountCreditsBuild: "Build",
+  accountCreditsOwnModels: "Native models · Gemini",
+  accountCreditsOtherModels: "Other models · Claude / GPT",
   accountResetCredits: "Reset cards",
   accountResetCreditsUse: "Use reset",
   accountResetCreditsConfirm:
@@ -494,6 +510,11 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountNoMatches: "没有匹配的账号。",
   accountLoginHelp: "登录前须知",
   harnessAccountsTitle: "其他已识别账号",
+  harnessAccountsDescription: "系统已识别以下本地或第三方 CLI 账号",
+  harnessAccountNeedsLogin: "需要重新登录后才能使用此账号",
+  harnessAccountViewAllCredits: "查看全部额度",
+  harnessAccountCollapseCredits: "收起全部额度",
+  addGeminiAccount: "添加 Gemini 账号",
   accountCreditsRemaining: "剩余",
   accountCreditsLoading: "正在读取额度…",
   accountCreditsEmpty: "暂无额度数据",
@@ -509,6 +530,7 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountActive: "默认账号",
   accountUse: "设为默认",
   accountSignIn: "登录",
+  accountReauth: "重新登录",
   accountSigningIn: "正在启动设备登录...",
   accountDeviceCodePrerequisite:
     "登录前，请先在 Web 端的“设置 → 账号安全与登录”中开启“为 Codex 启用设备代码授权”。",
@@ -527,6 +549,8 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   accountCreditsPeriodSevenDay: "7 天",
   accountCreditsPeriodUnknown: "额度",
   accountCreditsBuild: "Build",
+  accountCreditsOwnModels: "自有模型 · Gemini",
+  accountCreditsOtherModels: "其他模型 · Claude / GPT",
   accountResetCredits: "重置卡",
   accountResetCreditsUse: "使用重置",
   accountResetCreditsConfirm: "将消耗 1 张重置卡，同时重置 5 小时和 7 天额度。此操作无法撤销。",

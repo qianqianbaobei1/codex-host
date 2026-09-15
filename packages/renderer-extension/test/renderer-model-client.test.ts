@@ -1,5 +1,6 @@
 import {
   harnessIdSchema,
+  HARNESS_ACCOUNT_REFRESH_METHOD,
   harnessModelRefSchema,
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
@@ -175,7 +176,9 @@ describe("Renderer fixed Model request client", () => {
     const sendRequest = vi.fn().mockResolvedValue({ accounts: [account] });
     const client = createRendererModelClient([{ sendRequest }]);
     expect(await client?.listHarnessAccounts?.()).toEqual({ accounts: [account] });
-    expect(sendRequest).toHaveBeenCalledExactlyOnceWith("codexhost/harness/accounts/list", {});
+    expect(await client?.refreshHarnessAccounts?.()).toEqual({ accounts: [account] });
+    expect(sendRequest).toHaveBeenNthCalledWith(1, "codexhost/harness/accounts/list", {});
+    expect(sendRequest).toHaveBeenNthCalledWith(2, HARNESS_ACCOUNT_REFRESH_METHOD, {});
     sendRequest.mockResolvedValueOnce({ accounts: [{ ...account, token: "private" }] });
     await expect(client?.listHarnessAccounts?.()).rejects.toThrow();
   });
@@ -285,7 +288,9 @@ describe("Renderer fixed Model request client", () => {
       "checkUpdate",
       "consumeCodexAccountResetCredit",
       "createCodexAccount",
+      "createHarnessAccount",
       "deleteCodexAccount",
+      "deleteHarnessAccount",
       "executeThreadCommand",
       "forkThread",
       "handoverThread",
@@ -305,11 +310,13 @@ describe("Renderer fixed Model request client", () => {
       "openHarnessWebUi",
       "readUpdateStatus",
       "refreshCodexAccounts",
+      "refreshHarnessAccounts",
       "selectHarnessAccount",
       "selectThreadModel",
       "selectThreadPermissionMode",
       "selectThreadThinking",
       "startCodexAccountLogin",
+      "startHarnessAccountLogin",
       "startUpdate",
       "subscribeCodexAccountLogin",
       "subscribeThreadUsage",

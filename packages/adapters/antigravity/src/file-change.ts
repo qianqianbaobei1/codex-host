@@ -33,9 +33,7 @@ export function projectAntigravityFileChange(
     const oldHeader = kind === "add" ? "/dev/null" : `a/${displayPath}`;
     const newHeader = `b/${displayPath}`;
     const hunkHeader =
-      kind === "add"
-        ? `@@ -0,0 +1,${lines.length} @@`
-        : `@@ -1,0 +1,${lines.length} @@`;
+      kind === "add" ? `@@ -0,0 +1,${lines.length} @@` : `@@ -1,0 +1,${lines.length} @@`;
 
     const diffLines = lines.map((line) => `+${line}`);
     const unifiedDiff = [`--- ${oldHeader}`, `+++ ${newHeader}`, hunkHeader, ...diffLines, ""].join(
@@ -58,7 +56,9 @@ export function projectAntigravityFileChange(
 
     const displayPath = normalizeDisplayPath(targetFile, cwd);
     const startLine =
-      typeof args.StartLine === "number" && Number.isSafeInteger(args.StartLine) && args.StartLine > 0
+      typeof args.StartLine === "number" &&
+      Number.isSafeInteger(args.StartLine) &&
+      args.StartLine > 0
         ? args.StartLine
         : 1;
 

@@ -2,6 +2,7 @@ import codexAgentIconUrl from "./assets/codex-agent.png";
 import grokAgentIconUrl from "./assets/grok-agent.png";
 import antigravityAgentIconUrl from "./assets/antigravity-agent.svg";
 import kiroAgentIconUrl from "./assets/kiro-agent.svg";
+import cursorAgentIconUrl from "./assets/cursor-agent.svg";
 import ompAgentIconUrl from "./assets/omp-agent.svg";
 import openCodeAgentIconUrl from "./assets/opencode-agent.png";
 import type { RendererAgent } from "./agent-selection-state.js";
@@ -16,6 +17,7 @@ export const RENDERER_AGENT_LABELS: Record<RendererAgent, string> = {
   omp: "Oh My Pi",
   antigravity: "Antigravity CLI",
   "kiro-cli": "Kiro CLI",
+  "cursor-cli": "Cursor CLI (Experimental)",
 };
 
 const PI_PATHS = [
@@ -59,9 +61,22 @@ function createSvgIcon(
   return svg;
 }
 
+export const RENDERER_AGENT_OPTICAL_SIZES: Record<RendererAgent, number> = {
+  codex: 18,
+  pi: 16,
+  opencode: 16,
+  antigravity: 18,
+  "deepseek-harness": 17,
+  grok: 17,
+  omp: 17,
+  "kiro-cli": 17,
+  "cursor-cli": 17,
+  "claude-code": 18,
+};
+
 export function createRendererAgentIcon(
   agent: RendererAgent,
-  size = 20,
+  size = RENDERER_AGENT_OPTICAL_SIZES[agent] ?? 18,
   ownerDocument: Document = document,
 ): Element {
   if (agent === "codex") {
@@ -111,9 +126,14 @@ export function createRendererAgentIcon(
     image.style.flex = "none";
     return image;
   }
-  if (agent === "antigravity" || agent === "kiro-cli") {
+  if (agent === "antigravity" || agent === "kiro-cli" || agent === "cursor-cli") {
     const image = ownerDocument.createElement("img");
-    image.src = agent === "kiro-cli" ? kiroAgentIconUrl : antigravityAgentIconUrl;
+    image.src =
+      agent === "cursor-cli"
+        ? cursorAgentIconUrl
+        : agent === "kiro-cli"
+          ? kiroAgentIconUrl
+          : antigravityAgentIconUrl;
     image.alt = "";
     image.draggable = false;
     image.style.width = `${size}px`;

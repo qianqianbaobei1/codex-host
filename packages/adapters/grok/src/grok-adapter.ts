@@ -39,6 +39,7 @@ import {
   type ModelSelectCommand,
   type ModelSelectCompleted,
   type OpenSessionInput,
+  type ResumeSessionInput,
   type PermissionModeSelectCommand,
   type PermissionModeSelectCompleted,
   type ThinkingSelectCommand,
@@ -53,7 +54,6 @@ import {
   harnessCommandCatalogSchema,
   harnessIdSchema,
   type HarnessPermissionModeId,
-  harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostInteractionIdSchema,
   hostItemIdSchema,
@@ -70,6 +70,7 @@ import {
   GrokAcpTransport,
   GrokTransportError,
   grokNativeSessionDirectory,
+  readGrokNativeHistory,
   type GrokAcpTransportOptions,
   type GrokNativeSessionLocation,
   type GrokOpenInput,
@@ -84,9 +85,9 @@ import { forkGrokSession } from "./grok-fork.js";
 import { mapGrokReplay } from "./grok-history.js";
 import { rewindGrokLastTurn } from "./grok-rewind.js";
 import {
-  GROK_DEFAULT_PERMISSION_MODE_ID,
   GROK_PERMISSION_MODE_CATALOG,
   decodeGrokPermissionModeId,
+  resolveGrokPermissionModeId,
 } from "./permission-modes.js";
 import {
   applyGrokToolProjection,
@@ -200,6 +201,16 @@ const grokCommandCatalog = harnessCommandCatalogSchema.parse({
     },
   ],
 });
+const GROK_CACHED_THREAD_CAPABILITIES: HarnessSessionCapabilities = {
+  configuration: {
+    selectModel: true,
+    selectThinkingOption: true,
+    selectPermissionMode: true,
+    permissionModeScope: "atCreate",
+  },
+  history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
+};
+
 function capabilitiesForModels(modelState: GrokModelState): HarnessSessionCapabilities {
   return {
     configuration: {
@@ -208,7 +219,7 @@ function capabilitiesForModels(modelState: GrokModelState): HarnessSessionCapabi
       selectPermissionMode: true,
       permissionModeScope: "atCreate",
     },
-    history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
+    history: GROK_CACHED_THREAD_CAPABILITIES.history,
   };
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
@@ -1262,6 +1273,7 @@ class GrokHarnessSession implements HarnessSession {
 export class GrokAdapter implements HarnessAdapter {
   readonly commandCatalog = grokCommandCatalog;
   readonly harnessId: HarnessId = grokHarnessId;
+  readonly cachedThreadCapabilities = GROK_CACHED_THREAD_CAPABILITIES;
   readonly #closeTimeoutMs: number;
   readonly #dependencies: GrokAdapterDependencies;
   readonly #environment: NodeJS.ProcessEnv | undefined;
@@ -1295,6 +1307,45 @@ export class GrokAdapter implements HarnessAdapter {
               ? { environment: this.#environment }
               : {},
         ));
+  }
+
+  async readCachedSnapshot(
+    input: ResumeSessionInput,
+  ): Promise<HarnessResult<HostThreadSnapshot | null>> {
+    try {
+      const parsedRef = nativeSessionRefSchema.safeParse(input.nativeRef);
+      if (!parsedRef.success || parsedRef.data.harnessId !== this.harnessId) {
+        return { ok: true, value: null };
+      }
+      const cwd = path.resolve(input.cwd);
+      const environment = { ...this.#environment, ...input.environment };
+      const history = await readGrokNativeHistory(
+        { cwd, ...(environment ? { environment } : {}) },
+        parsedRef.data.nativeSessionId,
+      );
+      if (history.length === 0) return { ok: true, value: null };
+      const sessionDirectory = grokNativeSessionDirectory(
+        { cwd, environment },
+        parsedRef.data.nativeSessionId,
+      );
+      return {
+        ok: true,
+        value: {
+          ...mapGrokReplay(
+            history,
+            this.harnessId,
+            parsedRef.data.nativeSessionId,
+            cwd,
+            input.knownTurnRefs ?? [],
+            this.#toolOutputLimit,
+            sessionDirectory,
+          ),
+          state: { nativeRef: parsedRef.data },
+        },
+      };
+    } catch {
+      return { ok: true, value: null };
+    }
   }
 
   async inspectAccount(): Promise<HarnessAccountSnapshot | null> {
@@ -1389,13 +1440,11 @@ export class GrokAdapter implements HarnessAdapter {
       };
     const requestedPermissionModeId =
       input.kind === "create"
-        ? (input.permissionModeId ??
-          (input.executionPolicy === "unattended-full-access"
-            ? harnessPermissionModeIdSchema.parse("always-approve")
-            : GROK_DEFAULT_PERMISSION_MODE_ID))
-        : input.kind === "resume"
-          ? (input.permissionModeId ?? GROK_DEFAULT_PERMISSION_MODE_ID)
-          : GROK_DEFAULT_PERMISSION_MODE_ID;
+        ? resolveGrokPermissionModeId(input.permissionModeId)
+        : resolveGrokPermissionModeId(
+            input.kind === "resume" ? input.permissionModeId : undefined,
+            { migrateAsk: true },
+          );
     try {
       decodeGrokPermissionModeId(requestedPermissionModeId);
     } catch {
@@ -1540,8 +1589,10 @@ export class GrokAdapter implements HarnessAdapter {
       const retainedConfiguration = sourceConfiguration;
       if ((input.kind === "rollbackLastTurn" || input.kind === "fork") && retainedConfiguration) {
         const operation = input.kind === "rollbackLastTurn" ? "Rewind" : "Fork";
-        initialPermissionModeId =
-          retainedConfiguration.permissionModeId ?? GROK_DEFAULT_PERMISSION_MODE_ID;
+        initialPermissionModeId = resolveGrokPermissionModeId(
+          retainedConfiguration.permissionModeId,
+          { migrateAsk: true },
+        );
         const catalogModel = modelState.catalog.models.find(
           ({ ref }) => ref.id === retainedConfiguration.model.id,
         );

@@ -91,14 +91,8 @@ enabled = false
     const workspace = await mkdtemp(path.join(os.tmpdir(), "codexhost-workspace-"));
     try {
       await mkdir(path.join(home, ".codex"), { recursive: true });
-      await writeFile(
-        path.join(home, ".codex", "AGENTS.md"),
-        "Global rule: preserve formatting.",
-      );
-      await writeFile(
-        path.join(workspace, "AGENTS.md"),
-        "Workspace rule: target Python 3.12.",
-      );
+      await writeFile(path.join(home, ".codex", "AGENTS.md"), "Global rule: preserve formatting.");
+      await writeFile(path.join(workspace, "AGENTS.md"), "Workspace rule: target Python 3.12.");
 
       const prompt = await readSelectedPluginSkillPrompt("run task", { HOME: home }, workspace);
       expect(prompt).toContain("Global rule: preserve formatting.");
@@ -115,5 +109,46 @@ enabled = false
     const existing = "# AGENTS.md instructions\n<INSTRUCTIONS>Already there</INSTRUCTIONS>\nhello";
     const prompt = composePluginBridgePrompt(existing, [], "New rules");
     expect(prompt).toBe(existing);
+  });
+
+  it("skips rule bridge when CODEXHOST_DISABLE_RULE_BRIDGE is enabled", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "codexhost-rules-skip-env-"));
+    try {
+      await mkdir(path.join(home, ".codex"), { recursive: true });
+      await writeFile(
+        path.join(home, ".codex", "AGENTS.md"),
+        "# Personal Codex defaults\n\nRule here.\n",
+      );
+
+      const prompt = await readSelectedPluginSkillPrompt("hello", {
+        HOME: home,
+        CODEXHOST_DISABLE_RULE_BRIDGE: "1",
+      });
+      expect(prompt).toBe("hello");
+      expect(prompt).not.toContain("# AGENTS.md instructions");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("skips rule bridge when config.toml sets [codexhost] bridge_rules = false", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "codexhost-rules-skip-cfg-"));
+    try {
+      await mkdir(path.join(home, ".codex"), { recursive: true });
+      await writeFile(
+        path.join(home, ".codex", "AGENTS.md"),
+        "# Personal Codex defaults\n\nRule here.\n",
+      );
+      await writeFile(
+        path.join(home, ".codex", "config.toml"),
+        "[codexhost]\nbridge_rules = false\n",
+      );
+
+      const prompt = await readSelectedPluginSkillPrompt("hello", { HOME: home });
+      expect(prompt).toBe("hello");
+      expect(prompt).not.toContain("# AGENTS.md instructions");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });

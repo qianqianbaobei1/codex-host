@@ -9,7 +9,9 @@ export type GrokPermissionMode = "ask" | "auto" | "always-approve";
 
 const nativePermissionModes = new Set<GrokPermissionMode>(["ask", "auto", "always-approve"]);
 
-export const GROK_DEFAULT_PERMISSION_MODE_ID = harnessPermissionModeIdSchema.parse("ask");
+export const GROK_DEFAULT_PERMISSION_MODE_ID =
+  harnessPermissionModeIdSchema.parse("always-approve");
+const GROK_ASK_PERMISSION_MODE_ID = harnessPermissionModeIdSchema.parse("ask");
 
 export const GROK_PERMISSION_MODE_CATALOG: HarnessPermissionModeCatalog =
   harnessPermissionModeCatalogSchema.parse({
@@ -42,6 +44,16 @@ export function decodeGrokPermissionModeId(
     throw new Error("Grok Permission Mode belongs to another Adapter");
   }
   return parsed as GrokPermissionMode;
+}
+
+export function resolveGrokPermissionModeId(
+  requested: HarnessPermissionModeId | undefined,
+  options: { readonly migrateAsk?: boolean } = {},
+): HarnessPermissionModeId {
+  if (!requested || (options.migrateAsk === true && requested === GROK_ASK_PERMISSION_MODE_ID)) {
+    return GROK_DEFAULT_PERMISSION_MODE_ID;
+  }
+  return requested;
 }
 
 export function grokPermissionModeSessionMeta(permissionMode: GrokPermissionMode): {

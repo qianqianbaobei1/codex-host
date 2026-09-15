@@ -85,7 +85,7 @@ describe("Account limit windows", () => {
     expect(elements(result).filter((el) => el.attributes.get("role") === "meter")).toHaveLength(1);
   });
 
-  it("preserves primary and product windows without summing or deduplicating them", () => {
+  it("shows native and other model quotas as two compact, named groups", () => {
     const result = renderAccountUsage(
       document,
       {
@@ -93,9 +93,40 @@ describe("Account limit windows", () => {
         credits: {
           ...credits,
           productUsage: [
-            { product: "7-day window", usagePercent: 0 },
-            { product: "GPT-5.3-Codex-Spark", usagePercent: 25 },
+            { product: "Gemini models · 5-hour window", usagePercent: 0 },
+            { product: "Gemini models · 7-day window", usagePercent: 25 },
+            { product: "Claude and GPT models · 5-hour window", usagePercent: 100 },
+            { product: "Claude and GPT models · 7-day window", usagePercent: 67.7 },
           ],
+        },
+      },
+      messages,
+      "remaining",
+      vi.fn(),
+    );
+    if (!result) throw new Error("Expected limits");
+    expect(text(result)).toContain("自有模型 · Gemini");
+    expect(text(result)).toContain("其他模型 · Claude / GPT");
+    expect(text(result)).toContain("5h 100%");
+    expect(text(result)).toContain("7 天 75%");
+    expect(text(result)).toContain("5h 0%");
+    expect(text(result)).toContain("7 天 32.3%");
+    expect(
+      elements(result).filter((el) =>
+        el.className.includes("settings-account-usage__meter--group"),
+      ),
+    ).toHaveLength(2);
+    expect(elements(result).some((el) => el.attributes.get("role") === "meter")).toBe(false);
+  });
+
+  it("keeps generic product limits in the detailed fallback renderer", () => {
+    const result = renderAccountUsage(
+      document,
+      {
+        status: "ready",
+        credits: {
+          ...credits,
+          productUsage: [{ product: "GPT-5.3-Codex-Spark", usagePercent: 25 }],
         },
       },
       messages,
@@ -103,16 +134,12 @@ describe("Account limit windows", () => {
       vi.fn(),
     );
     if (!result) throw new Error("Expected limits");
+    expect(text(result)).toContain("GPT-5.3-Codex-Spark");
     expect(
       elements(result)
         .filter((el) => el.attributes.get("role") === "meter")
         .map((el) => el.attributes.get("aria-valuenow")),
-    ).toEqual(["91", "0", "25"]);
-    expect(text(result)).toContain("7 天");
-    expect(text(result)).toContain("GPT-5.3-Codex-Spark");
-    expect(
-      elements(result).filter((el) => el.className === "settings-account-usage__sub"),
-    ).toHaveLength(1);
+    ).toEqual(["91", "25"]);
   });
 
   it("places the display label beside the percent and keeps warnings based on used usage", () => {

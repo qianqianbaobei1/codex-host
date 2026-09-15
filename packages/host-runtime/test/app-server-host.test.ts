@@ -7,16 +7,23 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
+import { HarnessOutputChannel } from "@codexhost/harness-adapter";
 import type {
   HarnessAdapter,
+  HarnessError,
   HarnessResult,
+  HarnessSessionCapabilities,
+  HarnessSession,
+  HarnessOutput,
   HarnessSessionState,
   HostThreadSnapshot,
 } from "@codexhost/harness-adapter";
 import { FakeHarnessAdapter, FakeHarnessSession } from "@codexhost/harness-adapter/testing";
 import { MappingStore } from "@codexhost/mapping-store";
 import {
+  ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID,
   CLAUDE_CODE_NATIVE_TRANSPORT_MODEL_ID,
+  GROK_NATIVE_TRANSPORT_MODEL_ID,
   encodeClaudeTransportModel,
   encodeGrokTransportModel,
   encodePiTransportModel,
@@ -206,6 +213,179 @@ function rollbackCapableAdapter(): FakeHarnessAdapter {
   );
 }
 
+class CachedThreadInspectionAdapter extends FakeHarnessAdapter {
+  readonly cachedThreadCapabilities: HarnessSessionCapabilities = {
+    configuration: {
+      selectModel: true,
+      selectThinkingOption: true,
+      selectPermissionMode: false,
+      permissionModeScope: "live",
+    },
+    history: { fork: false, forkAcrossCwd: false, rollbackLastTurn: false },
+  };
+  override readonly readCachedSnapshot = vi.fn(async () => ({
+    ok: true as const,
+    value: { turns: [] } satisfies HostThreadSnapshot,
+  }));
+
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    if (input.kind === "resume") {
+      return {
+        ok: false as const,
+        error: {
+          code: "unavailable" as const,
+          message: "synthetic cold restore",
+          retryable: true,
+        },
+      };
+    }
+    return super.open(input);
+  }
+}
+
+class SlowCachedHistoryAdapter extends FakeHarnessAdapter {
+  override async readCachedSnapshot(): Promise<HarnessResult<HostThreadSnapshot | null>> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    return { ok: true, value: null };
+  }
+}
+
+class ProjectionFailureSession {
+  readonly harnessId = harnessIdSchema.parse("pi");
+  readonly capabilities: HarnessSessionCapabilities = {
+    configuration: {
+      selectModel: true,
+      selectThinkingOption: false,
+      selectPermissionMode: false,
+      permissionModeScope: "live",
+    },
+    history: { fork: false, forkAcrossCwd: false, rollbackLastTurn: false },
+  };
+  readonly initialState: HarnessSessionState = {
+    nativeRef: {
+      harnessId: this.harnessId,
+      nativeSessionId: "projection-failure",
+      formatVersion: 1,
+    },
+  };
+  readonly initialUsage = null;
+  readonly #channel = new HarnessOutputChannel<HarnessOutput>();
+  readonly outputs = this.#channel.outputs;
+
+  async readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>> {
+    return { ok: true, value: { turns: [] } };
+  }
+
+  async execute(command: { type: string; turnId?: string }): Promise<HarnessResult<unknown>> {
+    if (command.type !== "turn.start" || typeof command.turnId !== "string") {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: "Synthetic Session only starts Turns",
+          retryable: false,
+        },
+      };
+    }
+    const turnId = hostTurnIdSchema.parse(command.turnId);
+    this.#channel.emit({ kind: "event", event: { type: "turn.started", turnId } });
+    this.#channel.emit({
+      kind: "event",
+      event: {
+        type: "item.updated",
+        turnId,
+        itemId: hostItemIdSchema.parse("missing-item"),
+        update: { type: "text.append", text: "unprojectable" },
+      },
+    });
+    return { ok: true, value: { turnId } };
+  }
+
+  async close(): Promise<void> {
+    this.#channel.end();
+  }
+}
+
+class ProjectionFailureAdapter extends FakeHarnessAdapter {
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    if (input.kind === "create") {
+      return {
+        ok: true as const,
+        value: new ProjectionFailureSession() as unknown as HarnessSession,
+      };
+    }
+    return super.open(input);
+  }
+}
+
+const sessionFault: HarnessError = {
+  code: "nativeFailure",
+  message: "synthetic failure",
+  retryable: false,
+};
+
+class FaultedOnlySession {
+  readonly harnessId = harnessIdSchema.parse("pi");
+  readonly capabilities: HarnessSessionCapabilities = {
+    configuration: {
+      selectModel: true,
+      selectThinkingOption: false,
+      selectPermissionMode: false,
+      permissionModeScope: "live",
+    },
+    history: { fork: false, forkAcrossCwd: false, rollbackLastTurn: false },
+  };
+  readonly initialState: HarnessSessionState = {
+    nativeRef: {
+      harnessId: this.harnessId,
+      nativeSessionId: "faulted-only",
+      formatVersion: 1,
+    },
+  };
+  readonly initialUsage = null;
+  readonly #channel = new HarnessOutputChannel<HarnessOutput>();
+  readonly outputs = this.#channel.outputs;
+
+  async readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>> {
+    return { ok: true, value: { turns: [] } };
+  }
+
+  async execute(command: { type: string; turnId?: string }): Promise<HarnessResult<unknown>> {
+    if (command.type !== "turn.start" || typeof command.turnId !== "string") {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: "Synthetic Session only starts Turns",
+          retryable: false,
+        },
+      };
+    }
+    return { ok: true, value: { turnId: hostTurnIdSchema.parse(command.turnId) } };
+  }
+
+  fault(error: HarnessError): void {
+    this.#channel.emit({ kind: "event", event: { type: "session.faulted", error } });
+  }
+
+  async close(): Promise<void> {
+    this.#channel.end();
+  }
+}
+
+class FaultedOnlyAdapter extends FakeHarnessAdapter {
+  faultedSession: FaultedOnlySession | undefined;
+
+  override async open(input: Parameters<FakeHarnessAdapter["open"]>[0]) {
+    if (input.kind === "create") {
+      const session = new FaultedOnlySession();
+      this.faultedSession = session;
+      return { ok: true as const, value: session as unknown as HarnessSession };
+    }
+    return super.open(input);
+  }
+}
+
 class ResumeStateRollbackAdapter extends FakeHarnessAdapter {
   rollbackReplacementStateAtFirstRead: HarnessSessionState | undefined;
 
@@ -299,6 +479,8 @@ function createFixture(
     threadAccountStore?: ThreadAccountStore;
     updateCoordinator?: HostUpdateCoordinator;
     onDelegationApi?: (api: DelegationControlRegistration) => (() => void) | undefined;
+    controlPlaneTimeoutMs?: number;
+    externalOperationTimeoutMs?: number;
   } = {},
 ) {
   const adapter =
@@ -351,6 +533,12 @@ function createFixture(
     threadAccountStore,
     ...(options.updateCoordinator ? { updateCoordinator: options.updateCoordinator } : {}),
     ...(options.onDelegationApi ? { onDelegationApi: options.onDelegationApi } : {}),
+    ...(options.controlPlaneTimeoutMs !== undefined
+      ? { controlPlaneTimeoutMs: options.controlPlaneTimeoutMs }
+      : {}),
+    ...(options.externalOperationTimeoutMs !== undefined
+      ? { externalOperationTimeoutMs: options.externalOperationTimeoutMs }
+      : {}),
   });
   const running = host.run();
   return {
@@ -582,11 +770,15 @@ describe("AppServerHost installed Harness plugins", () => {
       export function createHarnessAdapter() {
         const adapter = new FakeHarnessAdapter("multi-agent");
         let selected = "default";
+        let refreshed = false;
         adapter.inspectAccounts = async () => [
-          { accountId: "default", label: "本机", isDefault: selected === "default", selectable: true, credits: { usedPercent: 25, periodType: "weekly" } },
-          { accountId: "work", label: "工作", isDefault: selected === "work", selectable: true, credits: { usedPercent: 80, periodType: "weekly" } },
+          { accountId: "default", label: "本机", isDefault: selected === "default", selectable: true, ...(refreshed ? { credits: { usedPercent: 25, periodType: "weekly" } } : {}) },
+          { accountId: "work", label: "工作", isDefault: selected === "work", selectable: true, ...(refreshed ? { credits: { usedPercent: 80, periodType: "weekly" } } : {}) },
         ];
+        adapter.refreshAccountCredits = async () => { refreshed = true; };
         adapter.selectAccount = async (accountId) => { selected = accountId; };
+        adapter.loginAccount = async () => {};
+        adapter.createAccount = async () => {};
         return adapter;
       }
     `,
@@ -608,6 +800,20 @@ describe("AppServerHost installed Harness plugins", () => {
       });
 
       writeRequest(fixture.desktopInput, {
+        id: 923,
+        method: "codexhost/harness/accounts/refresh",
+        params: {},
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 923))).toMatchObject({
+        result: {
+          accounts: [
+            { accountId: "default", credits: { usedPercent: 25 } },
+            { accountId: "work", credits: { usedPercent: 80 } },
+          ],
+        },
+      });
+
+      writeRequest(fixture.desktopInput, {
         id: 922,
         method: "codexhost/harness/accounts/select",
         params: { harnessId: "multi-agent", accountId: "work" },
@@ -622,20 +828,42 @@ describe("AppServerHost installed Harness plugins", () => {
       });
 
       writeRequest(fixture.desktopInput, {
-        id: 923,
+        id: 924,
+        method: "codexhost/harness/accounts/login/start",
+        params: { harnessId: "multi-agent", accountId: "work" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 924))).toMatchObject({
+        started: true,
+        harnessId: "multi-agent",
+        accountId: "work",
+      });
+
+      writeRequest(fixture.desktopInput, {
+        id: 927,
+        method: "codexhost/harness/accounts/create",
+        params: { harnessId: "multi-agent", accountId: "personal", name: "个人账号" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 927))).toMatchObject({
+        result: {
+          accounts: expect.any(Array),
+        },
+      });
+
+      writeRequest(fixture.desktopInput, {
+        id: 926,
         method: "codexhost/harness/accounts/select",
         params: { harnessId: "multi-agent", accountId: "bad/id" },
       });
-      expect(await fixture.collector.waitFor((message) => requestId(message, 923))).toMatchObject({
+      expect(await fixture.collector.waitFor((message) => requestId(message, 926))).toMatchObject({
         error: { code: -32602 },
       });
 
       writeRequest(fixture.desktopInput, {
-        id: 924,
+        id: 925,
         method: "codexhost/harness/accounts/select",
         params: { harnessId: "missing-agent", accountId: "work" },
       });
-      expect(await fixture.collector.waitFor((message) => requestId(message, 924))).toMatchObject({
+      expect(await fixture.collector.waitFor((message) => requestId(message, 925))).toMatchObject({
         error: { code: -32077 },
       });
     } finally {
@@ -2214,6 +2442,129 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
+  it("inspects a cold Grok Thread from its local cache before native restore", async () => {
+    const seedAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("grok"));
+    const seed = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["grok", seedAdapter]]),
+    });
+    const mappingStoreDirectory = seed.mappingStoreDirectory;
+    let threadId: string;
+    try {
+      threadId = await startExternalThread(seed, GROK_NATIVE_TRANSPORT_MODEL_ID);
+      await closeFixture(seed);
+    } catch (error) {
+      await stopFixture(seed).catch(() => undefined);
+      throw error;
+    }
+
+    const adapter = new CachedThreadInspectionAdapter(harnessIdSchema.parse("grok"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["grok", adapter]]),
+      mappingStoreDirectory,
+    });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "codexhost/thread/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({
+        id: 2,
+        result: {
+          owner: "external",
+          harnessId: "grok",
+          transportModelId: GROK_NATIVE_TRANSPORT_MODEL_ID,
+          history: { fork: false, rollbackLastTurn: false },
+          locked: true,
+        },
+      });
+      expect(adapter.readCachedSnapshot).toHaveBeenCalledOnce();
+      expect(adapter.sessions).toHaveLength(0);
+
+      writeRequest(fixture.desktopInput, {
+        id: 4,
+        method: "thread/read",
+        params: { threadId, includeTurns: true },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 4)),
+      ).resolves.toMatchObject({ id: 4, result: { thread: { turns: [] } } });
+      expect(adapter.sessions).toHaveLength(0);
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("inspects a cold Antigravity Thread from its local cache before native restore", async () => {
+    const seedAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("antigravity"));
+    const seed = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([
+        ["antigravity", seedAdapter],
+      ]),
+    });
+    const mappingStoreDirectory = seed.mappingStoreDirectory;
+    let threadId: string;
+    try {
+      threadId = await startExternalThread(seed, ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID);
+      await closeFixture(seed);
+    } catch (error) {
+      await stopFixture(seed).catch(() => undefined);
+      throw error;
+    }
+
+    const adapter = new CachedThreadInspectionAdapter(harnessIdSchema.parse("antigravity"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["antigravity", adapter]]),
+      mappingStoreDirectory,
+    });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "codexhost/thread/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({
+        id: 2,
+        result: {
+          owner: "external",
+          harnessId: "antigravity",
+          transportModelId: ANTIGRAVITY_NATIVE_TRANSPORT_MODEL_ID,
+          history: { fork: false, rollbackLastTurn: false },
+          locked: true,
+        },
+      });
+      expect(adapter.readCachedSnapshot).toHaveBeenCalledOnce();
+      expect(adapter.sessions).toHaveLength(0);
+
+      writeRequest(fixture.desktopInput, {
+        id: 3,
+        method: "codexhost/thread/commands/inspect",
+        params: { threadId },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 3)),
+      ).resolves.toMatchObject({ id: 3, result: { commands: [] } });
+
+      // Opening the conversation itself must also paint from the cache instead
+      // of blocking on a native AGY restore.
+      writeRequest(fixture.desktopInput, {
+        id: 4,
+        method: "thread/read",
+        params: { threadId, includeTurns: true },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 4)),
+      ).resolves.toMatchObject({ id: 4, result: { thread: { turns: [] } } });
+      expect(adapter.sessions).toHaveLength(0);
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
   it("dispatches inspection by registered Harness ID and rejects unknown Harnesses", async () => {
     const pi = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
     const claude = new FakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
@@ -2427,6 +2778,37 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
+  it("coalesces concurrent inspections of the same Harness without sharing the response ID", async () => {
+    const fixture = createFixture();
+    const release = Promise.withResolvers<undefined>();
+    const inspect = fixture.adapter.inspect.bind(fixture.adapter);
+    fixture.adapter.inspect = async (input) => {
+      await release.promise;
+      return inspect(input);
+    };
+    writeRequest(fixture.desktopInput, {
+      id: 38,
+      method: "codexhost/harness/inspect",
+      params: { harnessId: "pi" },
+    });
+    writeRequest(fixture.desktopInput, {
+      id: 39,
+      method: "codexhost/harness/inspect",
+      params: { harnessId: "pi" },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(fixture.adapter.inspectionCalls).toBe(0);
+    release.resolve(undefined);
+    await expect(
+      Promise.all([
+        fixture.collector.waitFor((message) => requestId(message, 38)),
+        fixture.collector.waitFor((message) => requestId(message, 39)),
+      ]),
+    ).resolves.toHaveLength(2);
+    expect(fixture.adapter.inspectionCalls).toBe(1);
+    await stopFixture(fixture);
+  });
+
   it("answers a Harness inspect while official thread/list is still pending", async () => {
     const fixture = createFixture();
     writeRequest(fixture.desktopInput, {
@@ -2444,6 +2826,196 @@ describe("AppServerHost HarnessAdapter projection", () => {
     ).resolves.toMatchObject({ result: { status: "ready" } });
     expect(fixture.collector.messages.some((message) => requestId(message, 35))).toBe(false);
     await stopFixture(fixture);
+  });
+
+  it("starts a new External Thread whose first message carries an image", async () => {
+    const fixture = createFixture();
+    try {
+      const threadId = await startPiThread(fixture);
+      const session = fixture.adapter.sessions[0];
+      if (!session) throw new Error("Fake Pi Session was not opened");
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [
+            { type: "text", text: "describe this image" },
+            { type: "localImage", path: "/tmp/codexhost-screenshot.png" },
+          ],
+        },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({ result: { turn: { id: expect.any(String) } } });
+      expect(session.turnInputs).toEqual([
+        "describe this image\n[图片附件] /tmp/codexhost-screenshot.png",
+      ]);
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("materializes inline image data so an External Turn still reaches the Harness", async () => {
+    const fixture = createFixture();
+    try {
+      const threadId = await startPiThread(fixture);
+      const session = fixture.adapter.sessions[0];
+      if (!session) throw new Error("Fake Pi Session was not opened");
+      const payload = Buffer.from("codexhost inline image").toString("base64");
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [
+            { type: "text", text: "describe this image" },
+            { type: "image", url: `data:image/png;base64,${payload}` },
+          ],
+        },
+      });
+      await vi.waitFor(() => expect(session.turnInputs).toHaveLength(1));
+      const reference = /\[图片附件\] (\S+)$/u.exec(session.turnInputs[0] ?? "")?.[1] ?? "";
+      expect(reference).toMatch(/codexhost-attachment-[0-9a-f-]+\.png$/u);
+      expect(readFileSync(reference, "base64")).toBe(payload);
+      rmSync(reference, { force: true });
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("rejects an External Turn attachment that has no readable reference", async () => {
+    const fixture = createFixture();
+    try {
+      const threadId = await startPiThread(fixture);
+      const session = fixture.adapter.sessions[0];
+      if (!session) throw new Error("Fake Pi Session was not opened");
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [{ type: "text", text: "listen to this" }, { type: "audio" }],
+        },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({
+        error: {
+          code: -32602,
+          message: expect.stringContaining("audio"),
+        },
+      });
+      expect(session.turnInputs).toHaveLength(0);
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("cancels a late External Turn start after the restore timeout and ignores its events", async () => {
+    const fixture = createFixture({
+      controlPlaneTimeoutMs: 25,
+      externalOperationTimeoutMs: 25,
+    });
+    try {
+      const threadId = await startPiThread(fixture);
+      const session = fixture.adapter.sessions[0];
+      if (!session) throw new Error("Fake Pi Session was not opened");
+      const original = session.execute.bind(session);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const commandTypes: string[] = [];
+      session.execute = (async (command) => {
+        commandTypes.push(command.type);
+        if (command.type === "turn.start") await gate;
+        return original(command as never);
+      }) as typeof session.execute;
+      writeRequest(fixture.desktopInput, {
+        id: 2,
+        method: "turn/start",
+        params: { threadId, input: [{ type: "text", text: "late execution" }] },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 2)),
+      ).resolves.toMatchObject({
+        error: { message: expect.stringContaining("timed out after 25ms") },
+      });
+      expect(session.turnInputs).toHaveLength(0);
+      release();
+      await vi.waitFor(() => expect(commandTypes).toContain("turn.cancel"));
+      await vi.waitFor(() => expect(session.turnInputs).toEqual(["late execution"]));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(fixture.collector.messages.some((message) => method(message, "turn/started"))).toBe(
+        false,
+      );
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("times out a forwarded official history request and ignores its late response", async () => {
+    const fixture = createFixture({ controlPlaneTimeoutMs: 25 });
+    await bindOfficialThread(fixture, "official-thread");
+    writeRequest(fixture.desktopInput, {
+      id: 37,
+      method: "thread/read",
+      params: { threadId: "official-thread", includeTurns: true },
+    });
+    const forwarded = await readJsonLine(fixture.official.stdin);
+    expect(forwarded).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "official-thread", includeTurns: true },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 37)),
+    ).resolves.toMatchObject({ error: { code: -32076 } });
+
+    fixture.official.stdout.write(
+      `${JSON.stringify({ id: forwarded.id, result: { late: true } })}\n`,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(fixture.collector.messages.filter((message) => requestId(message, 37))).toHaveLength(1);
+    await stopFixture(fixture);
+  });
+
+  it("does not block later control requests while cold external history is slow", async () => {
+    const seed = createFixture();
+    const mappingStoreDirectory = seed.mappingStoreDirectory;
+    const threadId = await startPiThread(seed);
+    await closeFixture(seed);
+
+    const adapter = new SlowCachedHistoryAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+      mappingStoreDirectory,
+      externalOperationTimeoutMs: 500,
+    });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 40,
+        method: "thread/read",
+        params: { threadId, includeTurns: true },
+      });
+      writeRequest(fixture.desktopInput, {
+        id: 41,
+        method: "codexhost/harness/inspect",
+        params: { harnessId: "pi" },
+      });
+      const inspectionResponse = fixture.collector.waitFor((message) => requestId(message, 41));
+      await expect(
+        Promise.race([
+          inspectionResponse.then(() => "response"),
+          new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 50)),
+        ]),
+      ).resolves.toBe("response");
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 40)),
+      ).resolves.toMatchObject({ error: { code: expect.any(Number) } });
+    } finally {
+      await stopFixture(fixture);
+    }
   });
 
   it("projects delegated input while reading visible progress from a running external Turn", async () => {
@@ -3960,6 +4532,18 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     expect(session.snapshotReads).toBe(1);
 
+    // Switching back to the same already hydrated Thread must reuse its
+    // projected history instead of rereading the native Session.
+    writeRequest(fixture.desktopInput, {
+      id: 19,
+      method: "thread/turns/list",
+      params: { threadId, limit: 2, itemsView: "summary" },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 19)),
+    ).resolves.toMatchObject({ result: { data: expect.any(Array) } });
+    expect(session.snapshotReads).toBe(1);
+
     writeRequest(fixture.desktopInput, {
       id: 17,
       method: "thread/resume",
@@ -4365,6 +4949,93 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
+  it("returns an empty queue for an External Thread without aborting submit", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 31,
+      method: "thread/queue/list",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 31)),
+    ).resolves.toMatchObject({ result: { data: [] } });
+    await stopFixture(fixture);
+  });
+
+  it("surfaces an output projection failure as a visible failed Turn", async () => {
+    const adapter = new ProjectionFailureAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 4,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "trigger projection failure" }] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 4)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+
+    await expect(
+      fixture.collector.waitFor(
+        (message) =>
+          method(message, "turn/completed") &&
+          messageParams(message).threadId === threadId &&
+          (messageParams(message).turn as JsonObject | undefined)?.status === "failed",
+      ),
+    ).resolves.toMatchObject({
+      method: "turn/completed",
+      params: {
+        turn: {
+          status: "failed",
+          error: { message: expect.stringContaining("could not be displayed") },
+        },
+      },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => threadStatus(message, threadId, "idle")),
+    ).resolves.toBeDefined();
+    await stopFixture(fixture);
+  });
+
+  it("terminalizes an active External Turn when its Session faults", async () => {
+    const adapter = new FaultedOnlyAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+    writeRequest(fixture.desktopInput, {
+      id: 32,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "trigger session fault" }] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 32)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+
+    adapter.faultedSession?.fault(sessionFault);
+    await expect(
+      fixture.collector.waitFor(
+        (message) =>
+          method(message, "turn/completed") &&
+          messageParams(message).threadId === threadId &&
+          (messageParams(message).turn as JsonObject | undefined)?.status === "failed",
+      ),
+    ).resolves.toMatchObject({
+      params: {
+        turn: {
+          status: "failed",
+          error: { message: expect.stringContaining("synthetic failure") },
+        },
+      },
+    });
+    await stopFixture(fixture);
+  });
+
   it("projects autonomous Harness Turn input in the live turn/started payload", async () => {
     const fixture = createFixture();
     await startPiThread(fixture);
@@ -4760,6 +5431,7 @@ describe("AppServerHost HarnessAdapter projection", () => {
       params: {
         turn: {
           items: [
+            { type: "userMessage" },
             {
               id: `${reasoningId}-summary`,
               type: "reasoning",
@@ -6577,7 +7249,7 @@ describe("AppServerHost HarnessAdapter projection", () => {
       params: {
         turn: {
           status: "completed",
-          items: [{ type: "fileChange" }, { type: "agentMessage" }],
+          items: [{ type: "userMessage" }, { type: "fileChange" }, { type: "agentMessage" }],
         },
       },
     });
@@ -7035,36 +7707,21 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
-  it("handles synchronous external cancellation and rejects stale or unsupported steer input locally", async () => {
+  it("handles synchronous external cancellation and rejects a stale steer target locally", async () => {
     const fixture = createFixture();
     const threadId = await startPiThread(fixture);
     const oldTurnId = await startPiTurn(fixture, threadId);
     const session = fixture.adapter.sessions[0];
     if (!session) throw new Error("Fake Pi Session was not opened");
     const execute = vi.spyOn(session, "execute");
-    for (const [id, params] of [
-      [100, { threadId, expectedTurnId: "stale", input: [{ type: "text", text: "new" }] }],
-      [
-        101,
-        {
-          threadId,
-          expectedTurnId: oldTurnId,
-          input: [
-            { type: "text", text: "new" },
-            { type: "image", url: "image" },
-          ],
-        },
-      ],
-    ] as const) {
-      writeRequest(fixture.desktopInput, {
-        id,
-        method: "turn/steer",
-        params: JSON.parse(JSON.stringify(params)),
-      });
-      await expect(
-        fixture.collector.waitFor((message) => requestId(message, id)),
-      ).resolves.toHaveProperty("error");
-    }
+    writeRequest(fixture.desktopInput, {
+      id: 100,
+      method: "turn/steer",
+      params: { threadId, expectedTurnId: "stale", input: [{ type: "text", text: "new" }] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 100)),
+    ).resolves.toHaveProperty("error");
     expect(execute).not.toHaveBeenCalled();
     session.completeCancellationOnRequest();
     writeRequest(fixture.desktopInput, {
@@ -7074,6 +7731,32 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     const response = await fixture.collector.waitFor((message) => requestId(message, 102));
     expect(response).toHaveProperty("result.turnId");
+    session.succeedTurn();
+    await stopFixture(fixture);
+  });
+
+  it("handles a steered Turn's attachment to the Harness as a file reference", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const oldTurnId = await startPiTurn(fixture, threadId);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    session.completeCancellationOnRequest();
+    writeRequest(fixture.desktopInput, {
+      id: 100,
+      method: "turn/steer",
+      params: {
+        threadId,
+        expectedTurnId: oldTurnId,
+        input: [
+          { type: "text", text: "改看这张" },
+          { type: "localImage", path: "/tmp/codexhost-steer.png" },
+        ],
+      },
+    });
+    const response = await fixture.collector.waitFor((message) => requestId(message, 100));
+    expect(response).toHaveProperty("result.turnId");
+    expect(session.turnInputs.at(-1)).toBe("改看这张\n[图片附件] /tmp/codexhost-steer.png");
     session.succeedTurn();
     await stopFixture(fixture);
   });
@@ -7280,12 +7963,27 @@ describe("AppServerHost HarnessAdapter projection", () => {
     ).resolves.toMatchObject({
       result: {
         harnessId: "claude-code",
-        transportModelId: encodeClaudeTransportModel(secondModel),
+        transportModelId: encodeClaudeTransportModel(
+          firstModel,
+          undefined,
+          harnessThinkingOptionIdSchema.parse("off"),
+        ),
         effectiveModel: firstModel,
         resolvedModelLabel: "fake-runtime-primary",
       },
     });
+    await expect(
+      fixture.mappingStore.getThread(hostThreadIdSchema.parse(firstThreadId)),
+    ).resolves.toMatchObject({
+      transportModelId: encodeClaudeTransportModel(
+        firstModel,
+        undefined,
+        harnessThinkingOptionIdSchema.parse("off"),
+      ),
+    });
 
+    // A carrier from another Harness no longer rejects the Turn: the Host
+    // hands the Thread over to that Harness at this boundary.
     writeRequest(fixture.desktopInput, {
       id: 24,
       method: "turn/start",
@@ -7298,12 +7996,335 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await expect(
       fixture.collector.waitFor((message) => requestId(message, 24)),
     ).resolves.toMatchObject({
-      error: {
-        code: -32602,
-        message: "Turn Model carrier does not belong to the Thread Harness",
+      result: {
+        turn: {
+          status: "inProgress",
+        },
       },
     });
+    expect(piAdapter.sessions).toHaveLength(1);
     expect(claudeAdapter.sessions[1]?.state.effectiveModel).toEqual(firstModel);
+    await stopFixture(fixture);
+  });
+
+  it("hands an External Thread to another Harness and seeds it with the Thread history", async () => {
+    const piAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const claudeAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([
+        ["pi", piAdapter],
+        ["claude-code", claudeAdapter],
+      ]),
+    });
+    const threadId = await startExternalThread(
+      fixture,
+      encodeClaudeTransportModel(claudeAdapter.catalog.defaultModel),
+      30,
+    );
+
+    writeRequest(fixture.desktopInput, {
+      id: 31,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "remember the answer is 42" }] },
+    });
+    await fixture.collector.waitFor((message) => requestId(message, 31));
+    const claudeSession = claudeAdapter.sessions[0];
+    if (!claudeSession) throw new Error("Fake Claude Session was not opened");
+    claudeSession.appendText("noted");
+    claudeSession.succeedTurn();
+    await fixture.collector.waitFor(
+      (message) =>
+        method(message, "turn/completed") && (message.params as JsonObject).threadId === threadId,
+    );
+
+    writeRequest(fixture.desktopInput, {
+      id: 32,
+      method: "turn/start",
+      params: {
+        threadId,
+        model: encodePiTransportModel(piAdapter.catalog.defaultModel),
+        input: [{ type: "text", text: "what was the answer?" }],
+      },
+    });
+    await fixture.collector.waitFor((message) => requestId(message, 32));
+    const piSession = piAdapter.sessions[0];
+    if (!piSession) throw new Error("Fake Pi Session was not opened");
+    expect(piSession.turnInputs.at(-1)).toContain("noted");
+    expect(piSession.turnInputs.at(-1)).toContain("what was the answer?");
+    await stopFixture(fixture);
+  });
+
+  it("takes an official Codex Thread over for a Harness with its official history", async () => {
+    const piAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", piAdapter]]),
+    });
+    await bindOfficialThread(fixture, "official-thread");
+
+    writeRequest(fixture.desktopInput, {
+      id: 40,
+      method: "turn/start",
+      params: {
+        threadId: "official-thread",
+        cwd: "/synthetic",
+        model: encodePiTransportModel(piAdapter.catalog.defaultModel),
+        input: [{ type: "text", text: "continue here" }],
+      },
+    });
+
+    const read = await readJsonLine(fixture.official.stdin);
+    expect(read).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "official-thread", includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: read.id,
+        result: {
+          thread: {
+            id: "official-thread",
+            cwd: "/synthetic",
+            title: "Official Thread",
+            turns: [
+              {
+                id: "official-turn-1",
+                status: "completed",
+                items: [
+                  {
+                    id: "official-item-1",
+                    type: "userMessage",
+                    content: [{ type: "text", text: "keep this in mind" }],
+                  },
+                  { id: "official-item-2", type: "agentMessage", text: "understood" },
+                ],
+              },
+            ],
+          },
+        },
+      })}\n`,
+    );
+
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 40)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+    const piSession = piAdapter.sessions[0];
+    if (!piSession) throw new Error("Fake Pi Session was not opened");
+    expect(piSession.turnInputs.at(-1)).toContain("keep this in mind");
+    expect(piSession.turnInputs.at(-1)).toContain("understood");
+    expect(piSession.turnInputs.at(-1)).toContain("continue here");
+    await stopFixture(fixture);
+  });
+
+  it("injects External additions into Official Codex before releasing the Thread", async () => {
+    const piAdapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", piAdapter]]),
+    });
+    await bindOfficialThread(fixture, "official-thread-with-handover");
+
+    writeRequest(fixture.desktopInput, {
+      id: 45,
+      method: "turn/start",
+      params: {
+        threadId: "official-thread-with-handover",
+        cwd: "/synthetic",
+        model: encodePiTransportModel(piAdapter.catalog.defaultModel),
+        input: [{ type: "text", text: "continue the official conversation" }],
+      },
+    });
+    const officialRead = await readJsonLine(fixture.official.stdin);
+    expect(officialRead).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "official-thread-with-handover", includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialRead.id,
+        result: {
+          thread: {
+            id: "official-thread-with-handover",
+            cwd: "/synthetic",
+            title: "Official Thread",
+            turns: [
+              {
+                id: "official-turn-1",
+                status: "completed",
+                items: [
+                  {
+                    id: "official-user-1",
+                    type: "userMessage",
+                    content: [{ type: "text", text: "remember this" }],
+                  },
+                  { id: "official-agent-1", type: "agentMessage", text: "I remember" },
+                ],
+              },
+            ],
+          },
+        },
+      })}\n`,
+    );
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 45)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+    const piSession = piAdapter.sessions[0];
+    if (!piSession) throw new Error("Fake Pi Session was not opened");
+    piSession.appendText("Pi added this context");
+    piSession.succeedTurn();
+    await fixture.collector.waitFor(
+      (message) =>
+        method(message, "turn/completed") &&
+        messageParams(message).threadId === "official-thread-with-handover",
+    );
+
+    writeRequest(fixture.desktopInput, {
+      id: 46,
+      method: "codexhost/thread/handover",
+      params: { threadId: "official-thread-with-handover", target: "codex" },
+    });
+    const officialReadForRelease = await readJsonLine(fixture.official.stdin);
+    expect(officialReadForRelease).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "official-thread-with-handover", includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialReadForRelease.id,
+        result: {
+          thread: {
+            id: "official-thread-with-handover",
+            cwd: "/synthetic",
+            turns: [
+              {
+                id: "official-turn-1",
+                status: "completed",
+                items: [
+                  {
+                    id: "official-user-1",
+                    type: "userMessage",
+                    content: [{ type: "text", text: "remember this" }],
+                  },
+                  { id: "official-agent-1", type: "agentMessage", text: "I remember" },
+                ],
+              },
+            ],
+          },
+        },
+      })}\n`,
+    );
+    const inject = await readJsonLine(fixture.official.stdin);
+    expect(inject).toMatchObject({
+      method: "thread/inject_items",
+      params: {
+        threadId: "official-thread-with-handover",
+        items: expect.arrayContaining([
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue the official conversation" }],
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Pi added this context" }],
+          },
+        ]),
+      },
+    });
+    fixture.official.stdout.write(`${JSON.stringify({ id: inject.id, result: {} })}\n`);
+    await expect(fixture.collector.waitFor((message) => requestId(message, 46))).resolves.toEqual({
+      id: 46,
+      result: { ok: true },
+    });
+    expect(
+      await fixture.mappingStore.getThread(
+        hostThreadIdSchema.parse("official-thread-with-handover"),
+      ),
+    ).toBeNull();
+    await stopFixture(fixture);
+  });
+
+  it("seeds an External Goal from the `/goal` chat input", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+
+    writeRequest(fixture.desktopInput, {
+      id: 60,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "/goal 把测试跑通，预算: 5000" }],
+      },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 60)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+    // The Harness receives the seeded Goal prompt, not the raw command.
+    expect(session.turnInputs.at(-1)).toContain("把测试跑通");
+    expect(session.turnInputs.at(-1)).not.toBe("/goal 把测试跑通，预算: 5000");
+    await expect(
+      fixture.collector.waitFor(
+        (message) =>
+          method(message, "thread/goal/updated") &&
+          (message.params as JsonObject).threadId === threadId,
+      ),
+    ).resolves.toBeDefined();
+    await stopFixture(fixture);
+  });
+
+  it("continues an External Goal after the first Turn completes", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+
+    writeRequest(fixture.desktopInput, {
+      id: 61,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "/goal finish the synthetic task" }] },
+    });
+    const response = await fixture.collector.waitFor((message) => requestId(message, 61));
+    const turnId = ((response.result as JsonObject).turn as JsonObject).id;
+    if (typeof turnId !== "string") throw new Error("Goal Turn has no id");
+    session.appendText("progress");
+    session.succeedTurn();
+    await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turnId));
+
+    await vi.waitFor(() => expect(session.turnInputs).toHaveLength(2));
+    expect(session.turnInputs.at(-1)).toContain("%%GOAL_CONTINUE%%");
+    await stopFixture(fixture);
+  });
+
+  it("preserves a directly-created External Thread when Official Codex has no identity", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture, "codexhost/pi-native");
+    writeRequest(fixture.desktopInput, {
+      id: 62,
+      method: "codexhost/thread/handover",
+      params: { threadId, target: "codex" },
+    });
+    const officialRead = await readJsonLine(fixture.official.stdin);
+    expect(officialRead).toMatchObject({
+      method: "thread/read",
+      params: { threadId, includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialRead.id,
+        error: { code: -32000, message: "Thread not found" },
+      })}\n`,
+    );
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 62)),
+    ).resolves.toMatchObject({
+      error: {
+        code: -32078,
+        message:
+          "External Thread cannot be handed over to Official Codex because the official Thread does not exist",
+      },
+    });
+    expect(await fixture.mappingStore.getThread(hostThreadIdSchema.parse(threadId))).not.toBeNull();
     await stopFixture(fixture);
   });
 

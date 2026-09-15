@@ -16,6 +16,7 @@ import {
   type ExternalThreadRepository,
 } from "./external-thread-repository.js";
 import { DELEGATION_THREAD_ID_ENV } from "./delegation-types.js";
+import { withTimeout } from "./operation-timeout.js";
 import type { ExternalThread, ExternalThreadRuntime } from "./external-thread-runtime.js";
 
 export type ExternalThreadForkResult =
@@ -34,8 +35,10 @@ export async function executeExternalThreadFork(input: {
   repository: ExternalThreadRepository;
   runtime: ExternalThreadRuntime;
   environment?: NodeJS.ProcessEnv;
+  operationTimeoutMs?: number;
 }): Promise<ExternalThreadForkResult> {
   const { source, fork, adapters, repository, runtime } = input;
+  const operationTimeoutMs = input.operationTimeoutMs ?? 30_000;
   const targetCwd = fork.cwd ?? source.cwd;
   const changesCwd = targetCwd !== source.cwd;
   if (
@@ -127,16 +130,20 @@ export async function executeExternalThreadFork(input: {
 
   let opened: Awaited<ReturnType<HarnessAdapter["open"]>>;
   try {
-    opened = await adapter.open({
-      kind: "fork",
-      cwd: targetCwd,
-      environment: {
-        ...(input.environment ?? process.env),
-        [DELEGATION_THREAD_ID_ENV]: provisional.hostThreadId,
-      },
-      sourceRef: nativeSessionRef as NativeSessionRef,
-      checkpoint: boundary.nativeCheckpointRef as NativeCheckpointRef,
-    });
+    opened = await withTimeout(
+      adapter.open({
+        kind: "fork",
+        cwd: targetCwd,
+        environment: {
+          ...(input.environment ?? process.env),
+          [DELEGATION_THREAD_ID_ENV]: provisional.hostThreadId,
+        },
+        sourceRef: nativeSessionRef as NativeSessionRef,
+        checkpoint: boundary.nativeCheckpointRef as NativeCheckpointRef,
+      }),
+      operationTimeoutMs,
+      `External Thread '${source.id}' fork`,
+    );
   } catch {
     await repository.removeProvisional(provisional.hostThreadId).catch(() => undefined);
     return { ok: false, error: { code: -32076, message: "External Thread fork failed" } };
@@ -155,7 +162,11 @@ export async function executeExternalThreadFork(input: {
     ) {
       throw new Error("External Fork did not create a distinct Native Session");
     }
-    const snapshot = await session.readSnapshot();
+    const snapshot = await withTimeout(
+      session.readSnapshot(),
+      operationTimeoutMs,
+      `External Fork Thread '${provisional.hostThreadId}' history`,
+    );
     if (!snapshot.ok) {
       await session.close().catch(() => undefined);
       await repository.removeProvisional(provisional.hostThreadId).catch(() => undefined);

@@ -43,7 +43,68 @@ const { outputFiles } = await build({
         const native = new Promise(resolve => { resolveNative = resolve; });
         const calls = { inspect:[],deleted:[],reset:[],activate:[],login:[] };
         const client = {
-          ...(scenario === "external" ? {listHarnessAccounts: async () => ({accounts:harnessAccounts})} : {}),
+          ...(scenario === "external"
+            ? { listHarnessAccounts: async () => ({ accounts: harnessAccounts }) }
+            : scenario === "full-accounts"
+              ? {
+                  listHarnessAccounts: async () => ({
+                    accounts: [
+                      {
+                        harnessId: "antigravity",
+                        harnessName: "Antigravity CLI",
+                        accountId: "default",
+                        label: "个人账号",
+                        isDefault: true,
+                        selectable: true,
+                        credits: {
+                          label: "Gemini Models",
+                          usedPercent: 13,
+                          periodType: "weekly",
+                          productUsage: [
+                            { product: "Weekly limit", usagePercent: 2.1 },
+                            { product: "3P Weekly limit", usagePercent: 0 },
+                            { product: "3P 5-hour limit", usagePercent: 0 },
+                          ],
+                        },
+                      },
+                      {
+                        harnessId: "antigravity",
+                        harnessName: "Antigravity CLI",
+                        accountId: "work",
+                        label: "情倩工作",
+                        isDefault: false,
+                        selectable: true,
+                        credits: {
+                          label: "Gemini Models",
+                          usedPercent: 12,
+                          periodType: "weekly",
+                        },
+                      },
+                      {
+                        harnessId: "grok",
+                        harnessName: "Grok",
+                        accountId: "grok-1",
+                        email: "1057290182@qq.com",
+                        credits: {
+                          usedPercent: 79,
+                          periodType: "weekly",
+                          resetsAt: "2026-09-18T09:46:00Z",
+                          productUsage: [
+                            { product: "Build", usagePercent: 45 },
+                            { product: "GrokPlugins", usagePercent: 23 },
+                            { product: "Chat", usagePercent: 6 },
+                            { product: "Voice", usagePercent: 5 },
+                          ],
+                        },
+                      },
+                    ],
+                  }),
+                  selectHarnessAccount: async () => ({ accounts: [] }),
+                  createHarnessAccount: async () => ({ accounts: [] }),
+                  deleteHarnessAccount: async () => ({ accounts: [] }),
+                  startHarnessAccountLogin: async () => ({ started: true }),
+                }
+              : {}),
           listCodexAccounts: async () => ({accounts:scenario === "late" ? accounts.slice(0,1) : accounts}),
           refreshCodexAccounts: async () => scenario === "late" ? live : ({accounts}),
           inspectCodexAccountUsage: async ({accountId}) => {
@@ -461,3 +522,20 @@ for (const locale of ["zh-CN", "en"]) {
     });
   }
 }
+
+test("renders full accounts management page with independent cards, Grok expand, delete, and re-login", async ({
+  page,
+}) => {
+  await setup(page, { scenario: "full-accounts", locale: "zh-CN", theme: "light" });
+  const harnessSection = page.locator(".settings-harness-accounts");
+  await expect(harnessSection).toBeVisible();
+  await harnessSection.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "test-results/full-accounts-harness.png" });
+  const grokExpand = page.locator(".settings-grok-expand-btn");
+  await expect(grokExpand).toBeVisible();
+  await grokExpand.click();
+  const grokRow = page.locator(".settings-harness-account").nth(2);
+  await grokRow.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "test-results/full-accounts-expanded.png" });
+});
+

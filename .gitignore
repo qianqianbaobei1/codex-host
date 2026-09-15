@@ -31,6 +31,7 @@ coverage/
 playwright-report/
 blob-report/
 test-results/
+tmp/
 *.lcov
 *.profraw
 *.rs.bk
@@ -43,6 +44,11 @@ test-results/
 npm-debug.log*
 *.pid
 *.pid.lock
+
+# Scratch test scripts
+/e2e_test.mjs
+/e2e_switch_test.mjs
+/perf_test.mjs
 
 # Editors
 /.idea/

@@ -13,12 +13,7 @@ export const GOAL_MAX_LOOP_TURNS = 50;
 export const GOAL_STALL_THRESHOLD = 3;
 
 export type ThreadGoalStatus =
-  | "active"
-  | "paused"
-  | "blocked"
-  | "usage_limited"
-  | "budget_limited"
-  | "complete";
+  "active" | "paused" | "blocked" | "usage_limited" | "budget_limited" | "complete";
 
 export type GoalLoopStatus = ThreadGoalStatus;
 
@@ -138,10 +133,7 @@ export function createGoalLoop(
   if (normalized.length > GOAL_MAX_OBJECTIVE_LENGTH) {
     throw new Error(`Goal objective must be at most ${GOAL_MAX_OBJECTIVE_LENGTH} characters`);
   }
-  if (
-    tokenBudget !== undefined &&
-    (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0)
-  ) {
+  if (tokenBudget !== undefined && (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0)) {
     throw new Error("Goal tokenBudget must be a positive safe integer");
   }
   return {
@@ -204,9 +196,7 @@ export function toStoredGoal(goal: GoalLoopState, harnessId: string): StoredExte
     ...(goal.lastCompletedTurnId
       ? { lastCompletedTurnId: hostTurnIdSchema.parse(goal.lastCompletedTurnId) }
       : {}),
-    ...(goal.inFlightTurnId
-      ? { inFlightTurnId: hostTurnIdSchema.parse(goal.inFlightTurnId) }
-      : {}),
+    ...(goal.inFlightTurnId ? { inFlightTurnId: hostTurnIdSchema.parse(goal.inFlightTurnId) } : {}),
     ...(goal.blockerFingerprint ? { blockerFingerprint: goal.blockerFingerprint } : {}),
     blockerStallCount: goal.blockerStallCount,
     ...(goal.lastProgressAtMs !== undefined
@@ -342,10 +332,7 @@ export function lastAgentMessageText(turn: unknown): string {
 }
 
 /** Evidence-based progress heuristic used only when no external evaluator is configured. */
-export function hasTurnProgress(
-  turn: unknown,
-  decision: GoalTurnDecision | null = null,
-): boolean {
+export function hasTurnProgress(turn: unknown, decision: GoalTurnDecision | null = null): boolean {
   if (decision?.progressEvidence.length) return true;
   if (!isRecord(turn) || !Array.isArray(turn.items)) return false;
   return turn.items.some((item) => {
@@ -367,7 +354,8 @@ export function advanceGoalLoop(
 ): GoalLoopStatus {
   if (goal.status !== "active") return goal.status;
   updateGoalActiveTime(goal, nowMs);
-  goal.tokensUsed += Number.isSafeInteger(tokensThisTurn) && tokensThisTurn > 0 ? tokensThisTurn : 0;
+  goal.tokensUsed +=
+    Number.isSafeInteger(tokensThisTurn) && tokensThisTurn > 0 ? tokensThisTurn : 0;
   goal.loopTurnCount += 1;
 
   if (goal.tokenBudget !== undefined && goal.tokensUsed >= goal.tokenBudget) {

@@ -55,7 +55,8 @@ const USAGE = `用法: antigravity-account <command> [id] [flags]
   purge <id> --yes        物理删除账号 HOME（不可恢复）
   default <id>            设为默认账号（新线程使用）
   enable|disable <id>     启用/停用
-  login <id>              打印该账号的登录命令
+  login <id> [--run]      登录账号（--run 自动接管隔离钥匙串与 HOME）
+  ready <id>              官方登录成功后解除 needs_login 保险丝
   where <id>              打印该账号的 HOME 路径
 `;
 
@@ -80,6 +81,7 @@ const { values: flags, positionals } = parseArgs({
   options: {
     name: { type: "string" },
     yes: { type: "boolean", default: false },
+    run: { type: "boolean", default: false },
   },
 });
 
@@ -136,11 +138,46 @@ switch (command) {
   case "login": {
     const account = requireId();
     if (account.legacy) {
-      console.log("该账号使用真实 HOME，直接运行： agy");
+      if (flags.run) {
+        const { spawnSync } = await import("node:child_process");
+        spawnSync("agy", [], { stdio: "inherit" });
+      } else {
+        console.log("该账号使用真实 HOME，直接运行： agy");
+      }
       break;
     }
     const home = await store.ensureHome(account);
-    console.log(`HOME=${home} agy`);
+    if (flags.run) {
+      console.log(`正在为账号 '${account.id}' 启动隔离登录（专用钥匙串 + 影子 HOME）...`);
+      const release = await store.acquireKeychainIsolation(account);
+      try {
+        const { spawnSync } = await import("node:child_process");
+        const agyCmd = process.env.CODEXHOST_ANTIGRAVITY_COMMAND || "agy";
+        spawnSync(agyCmd, [], {
+          stdio: "inherit",
+          env: {
+            ...process.env,
+            HOME: home,
+          },
+        });
+        await store.markReady(account.id);
+        console.log(`\n账号 '${account.id}' 登录已完成并标记为 ready`);
+      } finally {
+        await release();
+      }
+    } else {
+      console.log(`HOME=${home} agy`);
+      console.log(`\n💡 提示：如需直接启动交互登录并接管隔离钥匙串，请执行：`);
+      console.log(
+        `  node ${path.relative(process.cwd(), path.join(here, "antigravity-account.mjs"))} login ${account.id} --run`,
+      );
+    }
+    break;
+  }
+  case "ready": {
+    const account = requireId();
+    await store.markReady(account.id);
+    console.log(`账号 '${account.id}' 已恢复为 ready`);
     break;
   }
   case "where": {
@@ -177,6 +214,30 @@ switch (command) {
     if (!flags.yes) fail(`purge 会删除 ${accountDir}，请加 --yes 确认`);
     if (account) await store.removeAccount(accountId).catch(() => undefined);
     await rm(accountDir, { recursive: true, force: true });
+    if (process.platform === "darwin") {
+      const realKeychain = path.join(store.realHome, "Library", "Keychains", "login.keychain-db");
+      try {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const exec = promisify(execFile);
+        const { stdout: curDefault } = await exec("security", ["default-keychain", "-d", "user"]);
+        const { stdout: curList } = await exec("security", ["list-keychains", "-d", "user"]);
+        // Restore if default OR search list still points at this account (or at a
+        // now-missing file). Checking only default-keychain misses the case where
+        // default was already reset but list-keychains still names the shadow db.
+        if (
+          curDefault.includes(accountId) ||
+          curList.includes(accountId) ||
+          curList.includes(accountDir) ||
+          !curList.includes(realKeychain)
+        ) {
+          await exec("security", ["default-keychain", "-d", "user", "-s", realKeychain]);
+          await exec("security", ["list-keychains", "-d", "user", "-s", realKeychain]);
+        }
+      } catch {
+        // Ignore errors during best-effort keychain recovery.
+      }
+    }
     console.log(`已物理删除 '${accountId}' 的 HOME`);
     break;
   }

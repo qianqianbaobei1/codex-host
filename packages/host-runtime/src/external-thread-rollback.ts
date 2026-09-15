@@ -22,6 +22,7 @@ import {
   type ExternalThreadRepository,
 } from "./external-thread-repository.js";
 import { DELEGATION_THREAD_ID_ENV } from "./delegation-types.js";
+import { withTimeout } from "./operation-timeout.js";
 import type { ExternalThread, ExternalThreadRuntime } from "./external-thread-runtime.js";
 
 export type ExternalThreadRollbackResult =
@@ -63,25 +64,34 @@ function sameCurrentConfiguration(
 async function restoreCurrentConfiguration(
   session: HarnessSession,
   configuration: HarnessSessionState,
+  operationTimeoutMs: number,
 ): Promise<ExternalThreadRpcError | null> {
   if (configuration.effectiveModel) {
     if (!session.capabilities.configuration.selectModel) {
       return { code: -32076, message: "External rollback cannot restore the current Model" };
     }
-    const selected = await session.execute({
-      type: "model.select",
-      model: configuration.effectiveModel,
-    });
+    const selected = await withTimeout(
+      session.execute({
+        type: "model.select",
+        model: configuration.effectiveModel,
+      }),
+      operationTimeoutMs,
+      "External rollback Model restore",
+    );
     if (!selected.ok) return mapExternalThreadHarnessError(selected.error, "fork");
   }
   if (configuration.effectiveThinkingOptionId) {
     if (!session.capabilities.configuration.selectThinkingOption) {
       return { code: -32076, message: "External rollback cannot restore current Thinking" };
     }
-    const selected = await session.execute({
-      type: "thinking.select",
-      thinkingOptionId: configuration.effectiveThinkingOptionId,
-    });
+    const selected = await withTimeout(
+      session.execute({
+        type: "thinking.select",
+        thinkingOptionId: configuration.effectiveThinkingOptionId,
+      }),
+      operationTimeoutMs,
+      "External rollback Thinking restore",
+    );
     if (!selected.ok) return mapExternalThreadHarnessError(selected.error, "fork");
   }
   if (
@@ -94,10 +104,14 @@ async function restoreCurrentConfiguration(
         message: "External rollback cannot restore the current Permission Mode",
       };
     }
-    const selected = await session.execute({
-      type: "permissionMode.select",
-      permissionModeId: configuration.effectivePermissionModeId,
-    });
+    const selected = await withTimeout(
+      session.execute({
+        type: "permissionMode.select",
+        permissionModeId: configuration.effectivePermissionModeId,
+      }),
+      operationTimeoutMs,
+      "External rollback Permission Mode restore",
+    );
     if (!selected.ok) return mapExternalThreadHarnessError(selected.error, "fork");
   }
   return null;
@@ -109,8 +123,10 @@ async function executeCurrentLastTurnRollback(input: {
   repository: ExternalThreadRepository;
   runtime: ExternalThreadRuntime;
   environment?: NodeJS.ProcessEnv;
+  operationTimeoutMs?: number;
 }): Promise<ExternalThreadRollbackResult> {
   const { current, adapters, repository, runtime } = input;
+  const operationTimeoutMs = input.operationTimeoutMs ?? 30_000;
   if (current.record.turnMappings.length === 0) {
     return {
       ok: false,
@@ -129,22 +145,26 @@ async function executeCurrentLastTurnRollback(input: {
   const configuration = currentConfiguration(current);
   let opened: Awaited<ReturnType<HarnessAdapter["open"]>>;
   try {
-    opened = await adapter.open({
-      kind: "rollbackLastTurn",
-      cwd: current.cwd,
-      environment: {
-        ...(input.environment ?? process.env),
-        [DELEGATION_THREAD_ID_ENV]: current.id,
-      },
-      sourceRef: currentNativeRef as NativeSessionRef,
-      ...(configuration.effectiveModel ? { model: configuration.effectiveModel } : {}),
-      ...(configuration.effectiveThinkingOptionId
-        ? { thinkingOptionId: configuration.effectiveThinkingOptionId }
-        : {}),
-      ...(configuration.effectivePermissionModeId
-        ? { permissionModeId: configuration.effectivePermissionModeId }
-        : {}),
-    });
+    opened = await withTimeout(
+      adapter.open({
+        kind: "rollbackLastTurn",
+        cwd: current.cwd,
+        environment: {
+          ...(input.environment ?? process.env),
+          [DELEGATION_THREAD_ID_ENV]: current.id,
+        },
+        sourceRef: currentNativeRef as NativeSessionRef,
+        ...(configuration.effectiveModel ? { model: configuration.effectiveModel } : {}),
+        ...(configuration.effectiveThinkingOptionId
+          ? { thinkingOptionId: configuration.effectiveThinkingOptionId }
+          : {}),
+        ...(configuration.effectivePermissionModeId
+          ? { permissionModeId: configuration.effectivePermissionModeId }
+          : {}),
+      }),
+      operationTimeoutMs,
+      `External Thread '${current.id}' rollback`,
+    );
   } catch {
     return { ok: false, error: { code: -32076, message: "External Thread rollback failed" } };
   }
@@ -161,12 +181,35 @@ async function executeCurrentLastTurnRollback(input: {
       error: { code: -32076, message: "External rollback did not return a valid Session" },
     };
   }
-  const configurationError = await restoreCurrentConfiguration(session, configuration);
+  let configurationError: ExternalThreadRpcError | null;
+  try {
+    configurationError = await restoreCurrentConfiguration(
+      session,
+      configuration,
+      operationTimeoutMs,
+    );
+  } catch {
+    await session.close().catch(() => undefined);
+    return {
+      ok: false,
+      error: { code: -32076, message: "External rollback configuration timed out" },
+    };
+  }
   if (configurationError) {
     await session.close().catch(() => undefined);
     return { ok: false, error: configurationError };
   }
-  const snapshot = await session.readSnapshot();
+  let snapshot: Awaited<ReturnType<HarnessSession["readSnapshot"]>>;
+  try {
+    snapshot = await withTimeout(
+      session.readSnapshot(),
+      operationTimeoutMs,
+      `External Thread '${current.id}' rollback history`,
+    );
+  } catch {
+    await session.close().catch(() => undefined);
+    return { ok: false, error: { code: -32076, message: "External rollback history timed out" } };
+  }
   if (!snapshot.ok) {
     await session.close().catch(() => undefined);
     return { ok: false, error: mapExternalThreadHarnessError(snapshot.error, "read") };
@@ -225,8 +268,10 @@ export async function executeExternalThreadRollback(input: {
   runtime: ExternalThreadRuntime;
   expectedLastTurnId?: HostTurnId;
   environment?: NodeJS.ProcessEnv;
+  operationTimeoutMs?: number;
 }): Promise<ExternalThreadRollbackResult> {
   const { derived, rollback, adapters, repository, runtime, expectedLastTurnId } = input;
+  const operationTimeoutMs = input.operationTimeoutMs ?? 30_000;
   if (derived.running) {
     return { ok: false, error: { code: -32072, message: "External Thread has an active Turn" } };
   }
@@ -248,6 +293,7 @@ export async function executeExternalThreadRollback(input: {
       repository,
       runtime,
       ...(input.environment ? { environment: input.environment } : {}),
+      operationTimeoutMs,
     });
   }
 
@@ -327,16 +373,20 @@ export async function executeExternalThreadRollback(input: {
 
   let opened: Awaited<ReturnType<HarnessAdapter["open"]>>;
   try {
-    opened = await adapter.open({
-      kind: "fork",
-      cwd: derived.cwd,
-      environment: {
-        ...(input.environment ?? process.env),
-        [DELEGATION_THREAD_ID_ENV]: derived.id,
-      },
-      sourceRef: sourceNativeRef as NativeSessionRef,
-      checkpoint: boundary.nativeCheckpointRef as NativeCheckpointRef,
-    });
+    opened = await withTimeout(
+      adapter.open({
+        kind: "fork",
+        cwd: derived.cwd,
+        environment: {
+          ...(input.environment ?? process.env),
+          [DELEGATION_THREAD_ID_ENV]: derived.id,
+        },
+        sourceRef: sourceNativeRef as NativeSessionRef,
+        checkpoint: boundary.nativeCheckpointRef as NativeCheckpointRef,
+      }),
+      operationTimeoutMs,
+      `External Thread '${derived.id}' rollback fork`,
+    );
   } catch {
     return { ok: false, error: { code: -32076, message: "External Thread fork failed" } };
   }
@@ -357,7 +407,17 @@ export async function executeExternalThreadRollback(input: {
       error: { code: -32076, message: "External rollback did not create a distinct Session" },
     };
   }
-  const snapshot = await session.readSnapshot();
+  let snapshot: Awaited<ReturnType<HarnessSession["readSnapshot"]>>;
+  try {
+    snapshot = await withTimeout(
+      session.readSnapshot(),
+      operationTimeoutMs,
+      `External Thread '${derived.id}' rollback fork history`,
+    );
+  } catch {
+    await session.close().catch(() => undefined);
+    return { ok: false, error: { code: -32076, message: "External rollback history timed out" } };
+  }
   if (!snapshot.ok) {
     await session.close().catch(() => undefined);
     return { ok: false, error: mapExternalThreadHarnessError(snapshot.error, "read") };

@@ -180,7 +180,7 @@ export async function runHostRuntime(input: {
             environment: delegationEnvironment,
             ...installedHarnessPluginOptions(delegationEnvironment, false, input.hostRuntimeUrl),
             onDelegationApi,
-                        ...(updateCoordinator ? { updateCoordinator } : {}),
+            ...(updateCoordinator ? { updateCoordinator } : {}),
           });
           return host.run();
         },
@@ -216,7 +216,7 @@ export async function runHostRuntime(input: {
           closeMappingStoreOnExit: false,
           createOfficialConnection,
           onDelegationApi,
-                    ...(updateCoordinator ? { updateCoordinator } : {}),
+          ...(updateCoordinator ? { updateCoordinator } : {}),
         });
         const listener = createRemoteAppServerWebSocketListener({
           socketPath: remoteControlPlan.pipePath,
@@ -236,7 +236,7 @@ export async function runHostRuntime(input: {
               closeMappingStoreOnExit: false,
               createOfficialConnection,
               onDelegationApi: (api) => registry.register(api),
-                            ...(updateCoordinator ? { updateCoordinator } : {}),
+              ...(updateCoordinator ? { updateCoordinator } : {}),
             });
           },
         });
@@ -303,7 +303,7 @@ export async function runHostRuntime(input: {
             createOfficialConnection: () =>
               createRemoteOfficialAppServerConnection(officialPlan.socketPath),
             onDelegationApi: (api) => registry.register(api),
-                        ...(updateCoordinator ? { updateCoordinator } : {}),
+            ...(updateCoordinator ? { updateCoordinator } : {}),
           });
         },
       });

@@ -85,6 +85,17 @@ export async function launchManagedCodex(options, dependencies = {}) {
     windowsHide: false,
   });
   child.unref?.();
+  await new Promise((resolve, reject) => {
+    const onSpawn = () => {
+      resolve();
+    };
+    const onError = (error) => {
+      child.removeListener?.("spawn", onSpawn);
+      reject(error);
+    };
+    child.once?.("spawn", onSpawn);
+    child.once?.("error", onError);
+  });
   return child;
 }
 

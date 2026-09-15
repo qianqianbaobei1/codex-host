@@ -11,6 +11,7 @@ import {
   launcherInvocation,
   npmBuildInvocation,
   parseArguments,
+  resolveDevelopmentNodePath,
   runDevelopmentDesktop,
   runningDesktopCleanupInvocation,
   usage,
@@ -196,6 +197,7 @@ describe("development Desktop start", () => {
         root,
         platform: "win32",
         nodePath,
+        nodeVersion: "24.0.0",
         environment: {
           npm_execpath: path.join(root, "npm-cli.js"),
           PATH: piDirectory,
@@ -221,86 +223,70 @@ describe("development Desktop start", () => {
 
   it("rejects unsupported Node.js major versions before any cleanup", async () => {
     const root = temporaryDirectory();
-    const originalNode = process.versions.node;
-    Object.defineProperty(process.versions, "node", {
-      value: "20.19.0",
-      configurable: true,
-    });
-    try {
-      await expect(
-        runDevelopmentDesktop({
-          root,
-          platform: "win32",
-          nodePath: path.join(root, "node.exe"),
-          environment: {},
-          spawnImplementation: vi.fn(),
-        }),
-      ).rejects.toThrow("npm start requires Node.js 22 or 24; current version is 20.19.0");
-    } finally {
-      Object.defineProperty(process.versions, "node", {
-        value: originalNode,
-        configurable: true,
-      });
-    }
+    await expect(
+      runDevelopmentDesktop({
+        root,
+        platform: "win32",
+        nodePath: path.join(root, "node.exe"),
+        nodeVersion: "20.19.0",
+        environment: {},
+        spawnImplementation: vi.fn(),
+      }),
+    ).rejects.toThrow("npm start requires Node.js 22 or 24; current version is 20.19.0");
   });
 
   it("accepts Node.js 22 and 24", async () => {
     const root = temporaryDirectory();
     const nodePath = path.join(root, "node.exe");
     materializeArtifacts(root, "win32", nodePath);
-    const originalNode = process.versions.node;
     const spawnImplementation = vi.fn(() => exitingChild());
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    try {
-      for (const version of ["22.19.0", "24.0.0"]) {
-        Object.defineProperty(process.versions, "node", {
-          value: version,
-          configurable: true,
-        });
-        await expect(
-          runDevelopmentDesktop({
-            arguments_: ["--no-build"],
-            root,
-            platform: "win32",
-            nodePath,
-            environment: { PATH: path.join(root, "missing") },
-            spawnImplementation,
-          }),
-        ).resolves.toBe(0);
-      }
-    } finally {
-      Object.defineProperty(process.versions, "node", {
-        value: originalNode,
-        configurable: true,
-      });
+    for (const version of ["22.19.0", "24.0.0"]) {
+      await expect(
+        runDevelopmentDesktop({
+          arguments_: ["--no-build"],
+          root,
+          platform: "win32",
+          nodePath,
+          nodeVersion: version,
+          environment: { PATH: path.join(root, "missing") },
+          spawnImplementation,
+        }),
+      ).resolves.toBe(0);
     }
+  });
+
+  it("finds an installed supported Node runtime when npm itself runs on Node 25", () => {
+    const root = temporaryDirectory();
+    const candidate = path.join(root, "nvm", "versions", "node", "v24.14.1", "bin", "node");
+    mkdirSync(path.dirname(candidate), { recursive: true });
+    writeFileSync(candidate, "#!/bin/sh\nprintf '24.14.1\\n'\n");
+    chmodSync(candidate, 0o755);
+
+    expect(
+      resolveDevelopmentNodePath({
+        nodePath: process.execPath,
+        nodeVersion: "25.9.0",
+        environment: { HOME: root, NVM_DIR: path.join(root, "nvm") },
+        platform: "darwin",
+      }),
+    ).toBe(candidate);
   });
 
   it("rejects Node.js 23", async () => {
     const root = temporaryDirectory();
-    const originalNode = process.versions.node;
-    Object.defineProperty(process.versions, "node", {
-      value: "23.0.0",
-      configurable: true,
-    });
-    try {
-      await expect(
-        runDevelopmentDesktop({
-          root,
-          platform: "win32",
-          nodePath: path.join(root, "node.exe"),
-          environment: {},
-          spawnImplementation: vi.fn(),
-        }),
-      ).rejects.toThrow("npm start requires Node.js 22 or 24; current version is 23.0.0");
-    } finally {
-      Object.defineProperty(process.versions, "node", {
-        value: originalNode,
-        configurable: true,
-      });
-    }
+    await expect(
+      runDevelopmentDesktop({
+        root,
+        platform: "win32",
+        nodePath: path.join(root, "node.exe"),
+        nodeVersion: "23.0.0",
+        environment: {},
+        spawnImplementation: vi.fn(),
+      }),
+    ).rejects.toThrow("npm start requires Node.js 22 or 24; current version is 23.0.0");
   });
 
   it("does not build or launch when Desktop cleanup fails", async () => {
@@ -313,6 +299,7 @@ describe("development Desktop start", () => {
         root,
         platform: "win32",
         nodePath: path.join(root, "node.exe"),
+        nodeVersion: "24.0.0",
         environment: {},
         spawnImplementation,
       }),
@@ -339,6 +326,7 @@ describe("development Desktop start", () => {
         root,
         platform: "win32",
         nodePath,
+        nodeVersion: "24.0.0",
         environment: { PATH: path.join(root, "missing") },
         spawnImplementation,
       }),
@@ -379,6 +367,7 @@ describe("development Desktop start", () => {
         root,
         platform: "win32",
         nodePath,
+        nodeVersion: "24.0.0",
         environment: { PATH: path.join(root, "missing") },
         spawnImplementation,
       }),
@@ -408,6 +397,7 @@ describe("development Desktop start", () => {
         root,
         platform: "win32",
         nodePath,
+        nodeVersion: "24.0.0",
         environment: { PATH: path.join(root, "missing") },
         spawnImplementation,
       }),

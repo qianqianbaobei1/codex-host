@@ -67,6 +67,137 @@ export function resetCreditDetailLine(
     .replace("{time}", formatAccountCreditsReset(expiresAt, messages.locale, now));
 }
 
+type AccountCreditsWindow = "five_hour" | "weekly";
+type AccountCreditsGroup = "own" | "other";
+
+interface AccountCreditsMeter {
+  readonly label: string;
+  readonly usedPercent: number;
+  readonly resetsAt?: string;
+}
+
+interface AccountCreditsGroupMeter {
+  readonly group: AccountCreditsGroup;
+  readonly fiveHour?: AccountCreditsMeter;
+  readonly weekly?: AccountCreditsMeter;
+}
+
+function normalizedCreditProduct(product: string): string {
+  return product.trim().toLocaleLowerCase();
+}
+
+function creditProductGroup(product: string): AccountCreditsGroup | undefined {
+  const normalized = normalizedCreditProduct(product);
+  if (
+    /gemini|native|first[- ]party|自有/u.test(normalized) ||
+    /^(weekly|5[- ]?hour|7[- ]?day) (limit|window)/u.test(normalized)
+  ) {
+    return "own";
+  }
+  if (/\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(normalized)) return "other";
+  return undefined;
+}
+
+function creditProductWindow(product: string): AccountCreditsWindow | undefined {
+  const normalized = normalizedCreditProduct(product);
+  if (/5(?:[- ]?hour|h)|five[- ]?hour|5 小时/u.test(normalized)) return "five_hour";
+  if (/7(?:[- ]?day)|weekly|week|7 天/u.test(normalized)) return "weekly";
+  return undefined;
+}
+
+function isAntigravityCreditSet(products: readonly { product: string }[]): boolean {
+  return products.some((product) => {
+    const normalized = normalizedCreditProduct(product.product);
+    return /gemini|\b3p\b|claude.*gpt|gpt.*claude|first[- ]party|third[- ]party/u.test(normalized);
+  });
+}
+
+function compactAccountCredits(credits: AccountCreditsSnapshot): AccountCreditsGroupMeter[] | null {
+  const products = credits.productUsage ?? [];
+  if (!products.length || !isAntigravityCreditSet(products)) return null;
+
+  const groups = new Map<AccountCreditsGroup, AccountCreditsGroupMeter>();
+  for (const product of products) {
+    let group = creditProductGroup(product.product);
+    // The raw quota format calls the Gemini buckets simply "Weekly limit" and
+    // "5-hour limit" while naming the other group "3P". In that format the
+    // unnamed limit belongs to the native Gemini group.
+    if (
+      !group &&
+      /^(weekly|5[- ]?hour|7[- ]?day) (limit|window)/u.test(
+        normalizedCreditProduct(product.product),
+      )
+    ) {
+      group = "own";
+    }
+    const window = creditProductWindow(product.product);
+    if (!group || !window) continue;
+    const current = groups.get(group) ?? { group };
+    const existing = current[window === "five_hour" ? "fiveHour" : "weekly"];
+    const meter: AccountCreditsMeter = {
+      label: product.product,
+      usedPercent: product.usagePercent,
+      ...(product.resetsAt ? { resetsAt: product.resetsAt } : {}),
+    };
+    if (!existing || meter.usedPercent > existing.usedPercent) {
+      groups.set(group, {
+        ...current,
+        [window === "five_hour" ? "fiveHour" : "weekly"]: meter,
+      });
+    }
+  }
+
+  const result: AccountCreditsGroupMeter[] = [];
+  for (const group of ["own", "other"] as const) {
+    const meter = groups.get(group);
+    if (meter && (meter.fiveHour || meter.weekly)) result.push(meter);
+  }
+  return result.length ? result : null;
+}
+
+function accountCreditsGroupLabel(
+  group: AccountCreditsGroup,
+  messages: RendererSettingsMessages,
+): string {
+  return group === "own" ? messages.accountCreditsOwnModels : messages.accountCreditsOtherModels;
+}
+
+function renderCompactAccountCredits(
+  document: Document,
+  usage: HTMLElement,
+  groups: readonly AccountCreditsGroupMeter[],
+  messages: RendererSettingsMessages,
+  display: AccountUsageDisplay,
+): void {
+  for (const group of groups) {
+    const meter = document.createElement("div");
+    meter.className = "settings-account-usage__meter settings-account-usage__meter--group";
+    const label = document.createElement("span");
+    label.className = "settings-account-usage__title";
+    label.textContent = accountCreditsGroupLabel(group.group, messages);
+    label.title = label.textContent;
+    const values = document.createElement("div");
+    values.className = "settings-account-usage__group-values";
+    for (const [key, window] of [
+      ["5h", group.fiveHour],
+      [messages.accountCreditsPeriodSevenDay, group.weekly],
+    ] as const) {
+      if (!window) continue;
+      const value = display === "remaining" ? 100 - window.usedPercent : window.usedPercent;
+      const tone = rendererCreditsTone(window.usedPercent);
+      const item = document.createElement("span");
+      item.className = `settings-account-usage__group-value settings-account-usage__group-value--${tone}`;
+      item.textContent = `${key} ${formatRendererCreditsPercent(value)}`;
+      item.title = `${window.label} · ${
+        display === "remaining" ? messages.accountCreditsRemaining : messages.accountCreditsUsed
+      } ${formatRendererCreditsPercent(value)}`;
+      values.append(item);
+    }
+    meter.append(label, values);
+    usage.append(meter);
+  }
+}
+
 export function renderAccountUsage(
   document: Document,
   state: AccountUsageViewState | undefined,
@@ -99,6 +230,11 @@ export function renderAccountUsage(
     return usage;
   }
   const credits = state.credits;
+  const compactGroups = compactAccountCredits(credits);
+  if (compactGroups) {
+    renderCompactAccountCredits(document, usage, compactGroups, messages, display);
+    return usage;
+  }
   // Render only reported windows/products. Neither a plan name nor a missing
   // window is evidence of zero usage, unlimited access, or a synthetic 5h limit.
   const windows = [

@@ -35,6 +35,7 @@ import {
   type ExternalThreadRepository,
 } from "./external-thread-repository.js";
 import { DELEGATION_THREAD_ID_ENV } from "./delegation-types.js";
+import { withTimeout } from "./operation-timeout.js";
 import { SessionStateObserver } from "./session-state-observer.js";
 
 export interface TurnProjectionGate {
@@ -64,7 +65,7 @@ export interface ExternalThread {
   latestUsage: HostUsage | null;
   usageTurnId: HostTurnId | null;
   usageByTurn: Map<HostTurnId, HostUsage>;
-  projectedTurns: Map<HostTurnId, { projector: CodexTurnProjector }>;
+  projectedTurns: Map<HostTurnId, { projector: CodexTurnProjector; started: boolean }>;
   responseGates: Map<HostTurnId, TurnProjectionGate>;
   ephemeralTurnIds: Set<HostTurnId>;
   persistenceError: Error | null;
@@ -200,6 +201,7 @@ export class ExternalThreadRuntime {
   readonly #environment: NodeJS.ProcessEnv;
   readonly #onRegistered: ((thread: ExternalThread) => void) | undefined;
   readonly #repository: ExternalThreadRepository;
+  readonly #operationTimeoutMs: number;
   readonly #restores = new Map<string, Promise<ExternalThread>>();
   readonly #threads = new Map<string, ExternalThread>();
 
@@ -210,6 +212,7 @@ export class ExternalThreadRuntime {
     consumeOutputs(thread: ExternalThread): Promise<void>;
     diagnose(error: unknown): void;
     onRegistered?: (thread: ExternalThread) => void;
+    operationTimeoutMs?: number;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment ?? process.env;
@@ -217,6 +220,12 @@ export class ExternalThreadRuntime {
     this.#consumeOutputs = input.consumeOutputs;
     this.#diagnose = input.diagnose;
     this.#onRegistered = input.onRegistered;
+    this.#operationTimeoutMs =
+      input.operationTimeoutMs !== undefined &&
+      Number.isFinite(input.operationTimeoutMs) &&
+      input.operationTimeoutMs > 0
+        ? Math.max(1, Math.trunc(input.operationTimeoutMs))
+        : 30_000;
   }
 
   get(threadId: string): ExternalThread | undefined {
@@ -373,16 +382,29 @@ export class ExternalThreadRuntime {
     if (location.thread || !location.record.nativeSessionRef) return null;
     const adapter = this.#adapters.get(location.record.harnessId as ExternalHarnessId);
     if (!adapter?.readCachedSnapshot) return null;
-    const snapshot = await adapter.readCachedSnapshot({
-      kind: "resume",
-      cwd: location.record.cwd,
-      environment: {
-        ...this.#environment,
-        [DELEGATION_THREAD_ID_ENV]: location.record.hostThreadId,
-      },
-      nativeRef: location.record.nativeSessionRef as NativeSessionRef,
-      knownTurnRefs: location.record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
-    });
+    // Cache reads are local fast-paths. Keep a stalled cache from consuming the
+    // full native-restore budget before the caller can try live recovery.
+    const cacheTimeoutMs = Math.min(this.#operationTimeoutMs, 5_000);
+    let snapshot: HarnessResult<HostThreadSnapshot | null>;
+    try {
+      snapshot = await withTimeout(
+        adapter.readCachedSnapshot({
+          kind: "resume",
+          cwd: location.record.cwd,
+          environment: {
+            ...this.#environment,
+            [DELEGATION_THREAD_ID_ENV]: location.record.hostThreadId,
+          },
+          nativeRef: location.record.nativeSessionRef as NativeSessionRef,
+          knownTurnRefs: location.record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
+        }),
+        cacheTimeoutMs,
+        `External Thread '${location.record.hostThreadId}' cached history read`,
+      );
+    } catch (error) {
+      this.#diagnose(error);
+      return null;
+    }
     if (!snapshot.ok || !snapshot.value) return null;
     try {
       const aligned = await this.#repository.alignSnapshot(location.record, snapshot.value);
@@ -438,7 +460,17 @@ export class ExternalThreadRuntime {
   }
 
   async refresh(thread: ExternalThread): Promise<ExternalThreadRpcError | null> {
-    const snapshot = await thread.session.readSnapshot();
+    let snapshot: HarnessResult<HostThreadSnapshot>;
+    try {
+      snapshot = await withTimeout(
+        thread.session.readSnapshot(),
+        this.#operationTimeoutMs,
+        `External Thread '${thread.id}' history refresh`,
+      );
+    } catch (error) {
+      this.#diagnose(error);
+      return { code: -32076, message: "External Thread history refresh timed out" };
+    }
     if (!snapshot.ok) return mapExternalThreadHarnessError(snapshot.error, "read");
     try {
       const aligned = await this.#repository.alignSnapshot(
@@ -507,11 +539,15 @@ export class ExternalThreadRuntime {
       }
       const subagent = record.subagent;
       const parent = record.nativeSessionRef as NativeSessionRef;
-      const snapshot = await subagents.readSnapshot({
-        parent,
-        nativeSubagentId: subagent.nativeSubagentId,
-        cwd: record.cwd,
-      });
+      const snapshot = await withTimeout(
+        subagents.readSnapshot({
+          parent,
+          nativeSubagentId: subagent.nativeSubagentId,
+          cwd: record.cwd,
+        }),
+        this.#operationTimeoutMs,
+        `External Subagent Thread '${record.hostThreadId}' restore`,
+      );
       if (!snapshot.ok) {
         throw new ExternalThreadOpenError(mapExternalThreadHarnessError(snapshot.error, "read"));
       }
@@ -520,11 +556,15 @@ export class ExternalThreadRuntime {
         record.nativeSessionRef as NativeSessionRef,
         snapshot.value,
         () =>
-          subagents.readSnapshot({
-            parent,
-            nativeSubagentId: subagent.nativeSubagentId,
-            cwd: record.cwd,
-          }),
+          withTimeout(
+            subagents.readSnapshot({
+              parent,
+              nativeSubagentId: subagent.nativeSubagentId,
+              cwd: record.cwd,
+            }),
+            this.#operationTimeoutMs,
+            `External Subagent Thread '${record.hostThreadId}' history refresh`,
+          ),
       );
       const aligned = await this.#repository.alignSnapshot(record, snapshot.value);
       const sessionId = await this.#repository.sessionTreeId(aligned.record);
@@ -538,20 +578,24 @@ export class ExternalThreadRuntime {
       });
     }
     const restoredSelection = decodeExternalTransportSelection(harnessId, record.transportModelId);
-    const opened = await adapter.open({
-      kind: "resume",
-      cwd: record.cwd,
-      environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: record.hostThreadId },
-      nativeRef: record.nativeSessionRef as NativeSessionRef,
-      knownTurnRefs: record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
-      ...(restoredSelection?.model ? { model: restoredSelection.model } : {}),
-      ...(restoredSelection?.thinkingOptionId
-        ? { thinkingOptionId: restoredSelection.thinkingOptionId }
-        : {}),
-      ...(harnessId === "grok" && restoredSelection?.permissionModeId
-        ? { permissionModeId: restoredSelection.permissionModeId }
-        : {}),
-    });
+    const opened = await withTimeout(
+      adapter.open({
+        kind: "resume",
+        cwd: record.cwd,
+        environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: record.hostThreadId },
+        nativeRef: record.nativeSessionRef as NativeSessionRef,
+        knownTurnRefs: record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
+        ...(restoredSelection?.model ? { model: restoredSelection.model } : {}),
+        ...(restoredSelection?.thinkingOptionId
+          ? { thinkingOptionId: restoredSelection.thinkingOptionId }
+          : {}),
+        ...(harnessId === "grok" && restoredSelection?.permissionModeId
+          ? { permissionModeId: restoredSelection.permissionModeId }
+          : {}),
+      }),
+      this.#operationTimeoutMs,
+      `External Thread '${record.hostThreadId}' restore`,
+    );
     if (!opened.ok) {
       throw new ExternalThreadOpenError(mapExternalThreadHarnessError(opened.error, "resume"));
     }
@@ -568,17 +612,25 @@ export class ExternalThreadRuntime {
             message: "External Harness does not support restored Permission Mode selection",
           });
         }
-        const selected = await session.execute({
-          type: "permissionMode.select",
-          permissionModeId: restoredSelection.permissionModeId,
-        });
+        const selected = await withTimeout(
+          session.execute({
+            type: "permissionMode.select",
+            permissionModeId: restoredSelection.permissionModeId,
+          }),
+          this.#operationTimeoutMs,
+          `External Thread '${record.hostThreadId}' Permission Mode restore`,
+        );
         if (!selected.ok) {
           throw new ExternalThreadOpenError(
             mapExternalThreadHarnessError(selected.error, "resume"),
           );
         }
       }
-      const snapshot = await session.readSnapshot();
+      const snapshot = await withTimeout(
+        session.readSnapshot(),
+        this.#operationTimeoutMs,
+        `External Thread '${record.hostThreadId}' history restore`,
+      );
       if (!snapshot.ok) {
         throw new ExternalThreadOpenError(mapExternalThreadHarnessError(snapshot.error, "read"));
       }

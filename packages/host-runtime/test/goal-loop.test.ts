@@ -126,9 +126,7 @@ describe("goal markers / prompts", () => {
     });
     expect(parseGoalDecision('The JSON is {"version":1,"goal_event":"complete"}')).toBeNull();
     expect(
-      parseGoalDecision(
-        '{"version":1,"goal_event":"blocked","blocker_fingerprint":"network:npm"}',
-      ),
+      parseGoalDecision('{"version":1,"goal_event":"blocked","blocker_fingerprint":"network:npm"}'),
     ).toMatchObject({ kind: "blocked", blockerFingerprint: "network:npm" });
     expect(parseGoalDecision('{"version":1,"goal_event":"blocked"}')).toBeNull();
   });
@@ -154,9 +152,7 @@ describe("goal markers / prompts", () => {
   });
 
   it("recognizes concrete file, command, and tool work as progress", () => {
-    expect(
-      hasTurnProgress({ items: [{ type: "fileChange" }] }),
-    ).toBe(true);
+    expect(hasTurnProgress({ items: [{ type: "fileChange" }] })).toBe(true);
     expect(
       hasTurnProgress({ items: [{ type: "commandExecution", status: "completed", exitCode: 0 }] }),
     ).toBe(true);

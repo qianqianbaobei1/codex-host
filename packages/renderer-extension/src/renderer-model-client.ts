@@ -1,9 +1,21 @@
 import {
   harnessAccountListResultSchema,
   harnessAccountSelectParamsSchema,
+  harnessAccountLoginStartParamsSchema,
+  harnessAccountLoginStartResultSchema,
+  harnessAccountCreateParamsSchema,
+  harnessAccountDeleteParamsSchema,
   HARNESS_ACCOUNT_SELECT_METHOD,
+  HARNESS_ACCOUNT_REFRESH_METHOD,
+  HARNESS_ACCOUNT_LOGIN_START_METHOD,
+  HARNESS_ACCOUNT_CREATE_METHOD,
+  HARNESS_ACCOUNT_DELETE_METHOD,
   type HarnessAccountListResult,
   type HarnessAccountSelectParams,
+  type HarnessAccountLoginStartParams,
+  type HarnessAccountLoginStartResult,
+  type HarnessAccountCreateParams,
+  type HarnessAccountDeleteParams,
   codexAccountUsageParamsSchema,
   codexAccountUsageResultSchema,
   codexAccountResetCreditConsumeParamsSchema,
@@ -189,7 +201,17 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
     input: CodexAccountResetCreditConsumeParams,
   ): Promise<CodexAccountResetCreditConsumeResult>;
   listHarnessAccounts?(): Promise<HarnessAccountListResult>;
+  refreshHarnessAccounts?(): Promise<HarnessAccountListResult>;
   selectHarnessAccount?(input: HarnessAccountSelectParams): Promise<HarnessAccountListResult>;
+  startHarnessAccountLogin?(
+    input: HarnessAccountLoginStartParams,
+  ): Promise<HarnessAccountLoginStartResult>;
+  createHarnessAccount?(
+    input: HarnessAccountCreateParams,
+  ): Promise<HarnessAccountListResult>;
+  deleteHarnessAccount?(
+    input: HarnessAccountDeleteParams,
+  ): Promise<HarnessAccountListResult>;
   listCodexAccounts(): Promise<CodexAccountListResult>;
   refreshCodexAccounts(): Promise<CodexAccountListResult>;
   createCodexAccount(input: CodexAccountCreateParams): Promise<CodexAccountMutationResult>;
@@ -464,6 +486,11 @@ export function createRendererModelClient(
         await manager.sendRequest("codexhost/harness/accounts/list", {}),
       );
     },
+    async refreshHarnessAccounts(): Promise<HarnessAccountListResult> {
+      return harnessAccountListResultSchema.parse(
+        await manager.sendRequest(HARNESS_ACCOUNT_REFRESH_METHOD, {}),
+      );
+    },
     async selectHarnessAccount(
       input: HarnessAccountSelectParams,
     ): Promise<HarnessAccountListResult> {
@@ -471,6 +498,36 @@ export function createRendererModelClient(
         await manager.sendRequest(
           HARNESS_ACCOUNT_SELECT_METHOD,
           harnessAccountSelectParamsSchema.parse(input),
+        ),
+      );
+    },
+    async startHarnessAccountLogin(
+      input: HarnessAccountLoginStartParams,
+    ): Promise<HarnessAccountLoginStartResult> {
+      return harnessAccountLoginStartResultSchema.parse(
+        await manager.sendRequest(
+          HARNESS_ACCOUNT_LOGIN_START_METHOD,
+          harnessAccountLoginStartParamsSchema.parse(input),
+        ),
+      );
+    },
+    async createHarnessAccount(
+      input: HarnessAccountCreateParams,
+    ): Promise<HarnessAccountListResult> {
+      return harnessAccountListResultSchema.parse(
+        await manager.sendRequest(
+          HARNESS_ACCOUNT_CREATE_METHOD,
+          harnessAccountCreateParamsSchema.parse(input),
+        ),
+      );
+    },
+    async deleteHarnessAccount(
+      input: HarnessAccountDeleteParams,
+    ): Promise<HarnessAccountListResult> {
+      return harnessAccountListResultSchema.parse(
+        await manager.sendRequest(
+          HARNESS_ACCOUNT_DELETE_METHOD,
+          harnessAccountDeleteParamsSchema.parse(input),
         ),
       );
     },

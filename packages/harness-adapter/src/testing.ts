@@ -159,6 +159,8 @@ export class FakeHarnessSession implements HarnessSession {
   readonly initialUsage: HostUsage | null;
   commands?: HarnessCommandCapability;
   readonly interactionResponses: InteractionRespondCommand[] = [];
+  /** Text of every accepted `turn.start`, in order. */
+  readonly turnInputs: string[] = [];
   readonly outputs: AsyncIterable<HarnessOutput>;
   snapshotReads = 0;
   usageRefreshes = 0;
@@ -415,6 +417,7 @@ export class FakeHarnessSession implements HarnessSession {
       itemId: this.#nextItemId(),
       text: "",
     };
+    this.turnInputs.push(text);
     this.#active = {
       command,
       items: new Map([[item.itemId, item]]),
@@ -1022,8 +1025,9 @@ export class FakeHarnessAdapter implements HarnessAdapter {
   }
 
   async readCachedSnapshot(
-    _input: ResumeSessionInput,
+    input: ResumeSessionInput,
   ): Promise<HarnessResult<HostThreadSnapshot | null>> {
+    void input;
     return { ok: true, value: null };
   }
 

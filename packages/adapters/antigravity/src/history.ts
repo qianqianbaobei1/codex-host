@@ -16,10 +16,7 @@ import {
 
 import type { AntigravityLedgerData, AntigravityLedgerTurn } from "./ledger.js";
 import { encodeAntigravityModelRef } from "./model-catalog.js";
-import {
-  readAntigravityTranscript,
-  resolveAntigravityTranscriptPath,
-} from "./transcript.js";
+import { readAntigravityTranscript, resolveAntigravityTranscriptPath } from "./transcript.js";
 
 const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
 

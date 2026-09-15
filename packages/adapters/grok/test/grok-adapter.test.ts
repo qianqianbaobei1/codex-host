@@ -4,7 +4,9 @@ import type {
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
 import type { HarnessOutput } from "@codexhost/harness-adapter";
-import { resolve } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import { join, resolve } from "node:path";
 import {
   harnessModelRefSchema,
   harnessPermissionModeIdSchema,
@@ -335,7 +337,7 @@ describe("Grok Adapter ACP projection", () => {
           { id: "auto", label: "Auto" },
           { id: "always-approve", label: "Always approve", dangerous: true },
         ],
-        defaultModeId: "ask",
+        defaultModeId: "always-approve",
       },
       capabilities: {
         configuration: {
@@ -346,6 +348,189 @@ describe("Grok Adapter ACP projection", () => {
       },
     });
 
+    await adapter.close();
+  });
+
+  it("reads a Grok Thread snapshot from Native history without spawning ACP", async () => {
+    const grokHome = await mkdtemp(join(os.tmpdir(), "codexhost-grok-cached-history-"));
+    const createTransport = vi.fn(() => {
+      throw new Error("Grok cache read must not spawn ACP");
+    });
+    const adapter = new GrokAdapter(
+      { environment: { GROK_HOME: grokHome } },
+      {
+        randomUUID: () => "grok-id",
+        createTransport,
+        fetchCredits: async () => null,
+      },
+    );
+    try {
+      const cwd = "/synthetic";
+      const sessionId = "cached-session";
+      const sessionDir = join(grokHome, "sessions", encodeURIComponent(resolve(cwd)), sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "updates.jsonl"),
+        [
+          {
+            method: "session/update",
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text: "cached prompt" },
+                messageId: "user-1",
+              },
+              _meta: { eventId: "user-1" },
+            },
+          },
+          {
+            method: "session/update",
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "cached answer" },
+              },
+            },
+          },
+          {
+            method: "session/update",
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: "turn_completed",
+                prompt_id: "prompt-1",
+                stop_reason: "end_turn",
+              },
+            },
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join("\n"),
+      );
+
+      const snapshot = await adapter.readCachedSnapshot({
+        kind: "resume",
+        cwd,
+        nativeRef: {
+          harnessId: adapter.harnessId,
+          nativeSessionId: sessionId,
+          formatVersion: 1,
+        },
+      });
+      expect(createTransport).not.toHaveBeenCalled();
+      expect(snapshot).toMatchObject({
+        ok: true,
+        value: {
+          turns: [
+            {
+              input: [{ type: "text", text: "cached prompt" }],
+              outcome: { status: "succeeded" },
+            },
+          ],
+        },
+      });
+      expect(adapter.cachedThreadCapabilities.history).toEqual({
+        fork: true,
+        forkAcrossCwd: true,
+        rollbackLastTurn: true,
+      });
+
+      await expect(
+        adapter.readCachedSnapshot({
+          kind: "resume",
+          cwd,
+          nativeRef: {
+            harnessId: adapter.harnessId,
+            nativeSessionId: "missing-session",
+            formatVersion: 1,
+          },
+        }),
+      ).resolves.toEqual({ ok: true, value: null });
+    } finally {
+      await adapter.close();
+      await rm(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults create and resume to always-approve", async () => {
+    const alwaysApprove = harnessPermissionModeIdSchema.parse("always-approve");
+    const createdTransport = new FakeGrokTransport();
+    const createdAdapter = new GrokAdapter(
+      {},
+      {
+        randomUUID: () => "grok-id",
+        createTransport: () => createdTransport,
+        fetchCredits: async () => null,
+      },
+    );
+    const created = await createdAdapter.open({ kind: "create", cwd: "/synthetic" });
+    if (!created.ok) throw new Error(created.error.message);
+    expect(createdTransport.openCalls).toContainEqual({
+      kind: "create",
+      permissionModeId: alwaysApprove,
+    });
+    expect(created.value.initialState.effectivePermissionModeId).toBe(alwaysApprove);
+    await createdAdapter.close();
+
+    const resumedTransport = new FakeGrokTransport();
+    const resumedAdapter = new GrokAdapter(
+      {},
+      {
+        randomUUID: () => "grok-id",
+        createTransport: () => resumedTransport,
+        fetchCredits: async () => null,
+      },
+    );
+    const resumed = await resumedAdapter.open({
+      kind: "resume",
+      cwd: "/synthetic",
+      nativeRef: {
+        harnessId: resumedAdapter.harnessId,
+        nativeSessionId: resumedTransport.sessionId,
+        formatVersion: 1,
+      },
+    });
+    if (!resumed.ok) throw new Error(resumed.error.message);
+    expect(resumedTransport.openCalls).toContainEqual({
+      kind: "resume",
+      sessionId: resumedTransport.sessionId,
+      permissionModeId: alwaysApprove,
+    });
+    expect(resumed.value.initialState.effectivePermissionModeId).toBe(alwaysApprove);
+    await resumedAdapter.close();
+  });
+
+  it("migrates a resumed Ask Permission Mode to always-approve", async () => {
+    const transport = new FakeGrokTransport();
+    const adapter = new GrokAdapter(
+      {},
+      {
+        randomUUID: () => "grok-id",
+        createTransport: () => transport,
+        fetchCredits: async () => null,
+      },
+    );
+    const ask = harnessPermissionModeIdSchema.parse("ask");
+    const alwaysApprove = harnessPermissionModeIdSchema.parse("always-approve");
+    const opened = await adapter.open({
+      kind: "resume",
+      cwd: "/synthetic",
+      nativeRef: {
+        harnessId: adapter.harnessId,
+        nativeSessionId: transport.sessionId,
+        formatVersion: 1,
+      },
+      permissionModeId: ask,
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    expect(transport.openCalls).toContainEqual({
+      kind: "resume",
+      sessionId: transport.sessionId,
+      permissionModeId: alwaysApprove,
+    });
+    expect(opened.value.initialState.effectivePermissionModeId).toBe(alwaysApprove);
     await adapter.close();
   });
 

@@ -1,11 +1,19 @@
 /**
- * Normalizes thread titles according to the user standard:
- * - Format: [短标签] 核心词+动作结果
- * - Total length: 8~12 characters (max 14 characters)
- * - No redundant punctuation or conversational filler words
+ * Keeps Thread titles useful in the Desktop sidebar.
+ *
+ * The title generator is responsible for understanding the request. This
+ * module is deliberately a conservative second pass: it removes transport
+ * wrappers and conversational noise, preserves meaningful nouns and verbs,
+ * and adds a topic only when the topic is explicit or recognizable.
+ *
+ * Preferred shape: `[主题] 动作对象`.
+ * A generic category such as `[代码]` is never invented as a fallback.
  */
 
-const TAG_KEYWORDS: Array<{ tag: string; pattern: RegExp }> = [
+const MAX_TITLE_LENGTH = 32;
+const MAX_TOPIC_LENGTH = 16;
+
+const LEGACY_TAG_KEYWORDS: Array<{ tag: string; pattern: RegExp }> = [
   { tag: "Py", pattern: /python|py\b|pandas|numpy|django|flask|fastapi|pip|conda/i },
   { tag: "采购", pattern: /采购|比价|供应商|询价|招标|对账|发票|物料/ },
   { tag: "造价", pattern: /造价|算量|清单|定额|计价|概算|预算|决算/ },
@@ -18,122 +26,298 @@ const TAG_KEYWORDS: Array<{ tag: string; pattern: RegExp }> = [
   { tag: "工具", pattern: /工具|插件|skill|mcp|脚本|automation|daemon/i },
 ];
 
+/**
+ * Kept for compatibility with the earlier normalizer API. New formatting does
+ * not use these generic labels as a title prefix.
+ */
 export function inferTitleTag(text: string): string {
-  for (const { tag, pattern } of TAG_KEYWORDS) {
+  for (const { tag, pattern } of LEGACY_TAG_KEYWORDS) {
     if (pattern.test(text)) return tag;
   }
   return "代码";
+}
+
+const RECOGNIZABLE_TOPICS: Array<{ topic: string; pattern: RegExp }> = [
+  { topic: "Codex Host", pattern: /\bcodex\s*host\b/i },
+  { topic: "Claude Code", pattern: /\bclaude\s+code\b/i },
+  { topic: "ChatGPT", pattern: /\bchatgpt\b/i },
+  { topic: "OpenAI", pattern: /\bopenai\b/i },
+  { topic: "Python", pattern: /\bpython\b/i },
+  { topic: "React", pattern: /\breact\b/i },
+  { topic: "Electron", pattern: /\belectron\b/i },
+  { topic: "DWG", pattern: /\bdwg\b/i },
+  { topic: "Excel", pattern: /\bexcel\b/i },
+  { topic: "Word", pattern: /\bword\b/i },
+  { topic: "PDF", pattern: /\bpdf\b/i },
+  { topic: "API", pattern: /\bapi\b/i },
+  { topic: "MCP", pattern: /\bmcp\b/i },
+  { topic: "LoopX", pattern: /\bloopx\b/i },
+  { topic: "中国中铁", pattern: /中国中铁/ },
+  { topic: "平方网", pattern: /平方网/ },
+  { topic: "采购", pattern: /采购/ },
+  { topic: "造价", pattern: /造价/ },
+  { topic: "建工", pattern: /建工/ },
+];
+
+const OBJECT_SUFFIX =
+  "规则|策略|方案|报告|脚本|接口|页面|组件|图纸|清单|数据|问题|流程|配置|逻辑|标题|命名|文档|账号|额度|路径|文件";
+
+const ACTION_WORDS = [
+  "重新设计",
+  "重构",
+  "重写",
+  "改写",
+  "修复",
+  "排查",
+  "实现",
+  "编写",
+  "生成",
+  "整理",
+  "调研",
+  "核验",
+  "验证",
+  "审计",
+  "总结",
+  "对比",
+  "评估",
+  "解释",
+  "部署",
+  "配置",
+  "迁移",
+  "接入",
+  "开发",
+  "优化",
+  "替换",
+  "制作",
+  "分析",
+  "审视",
+  "梳理",
+  "检查",
+  "解决",
+  "设计",
+  "写",
+  "做",
+];
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function compactMixedSpacing(text: string): string {
+  return text
+    .replace(/([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])/g, "$1$2")
+    .replace(/([\u4e00-\u9fa5])\s+([a-zA-Z0-9])/g, "$1$2")
+    .replace(/([a-zA-Z0-9])\s+([\u4e00-\u9fa5])/g, "$1$2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function clipText(text: string, limit: number): string {
+  const characters = Array.from(text.trim());
+  if (characters.length <= limit) return text.trim();
+
+  let clipped = characters.slice(0, limit).join("").trim();
+  const lastSpace = clipped.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(limit * 0.6)) clipped = clipped.slice(0, lastSpace).trim();
+  return clipped.replace(/[，。！？、：；,.!?:;—\-_/\\\s]+$/g, "");
+}
+
+function cleanTopic(rawTopic: string): string {
+  return compactMixedSpacing(
+    rawTopic
+      .replace(/[\[\]【】（）()"“”'‘’`，。！？、：；,.!?:;|｜—]/g, " ")
+      .replace(/^(?:这个|这份|这篇|当前|关于)\s*/g, "")
+      .trim(),
+  );
+}
+
+function removeTopic(text: string, topic: string): string {
+  if (!topic) return text;
+  const topicPattern = new RegExp(escapeRegExp(topic).replace(/\\ /g, "\\s+"), "ig");
+  return text
+    .replace(topicPattern, " ")
+    .replace(/^\s*(?:的|：|:)\s*/, "")
+    .replace(/\s+的(?=[\u4e00-\u9fa5])/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function removeTitleNoise(rawText: string): string {
+  let text = rawText
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  text = text
+    .replace(/^\s*["“‘'`]+|["”’'`]+\s*$/g, "")
+    .replace(/(?:我希望你|希望你|我希望|请你|帮我|请帮我|麻烦你|我需要你|需要你|请问)/g, " ")
+    .replace(/(?:请开始推进(?:目标)?|请仔细思考|仔细思考|以高质量为第一优先级)/g, " ")
+    .replace(/(?:并给出|给出)(?:结论|答案)/g, " ")
+    .replace(/(?:太差了|太糟了|很差|不好|不合理|不行|有问题|存在问题|太乱了)[啊呀吧呢哦]?/g, " ")
+    .replace(/(?:这个|这次|本次)对话的/g, "对话")
+    .replace(/(?:这份|这篇)内容的/g, " ")
+    .replace(/你?看(?:一下|下)?(?:当前|现在)?(?:的)?(?:规则|方案|内容)?/g, " ")
+    .replace(/(?:重新(?:帮我|请你|请)?写)(?:一下)?/g, "重写")
+    .replace(/重新\s*写(?:一下)?/g, "重写")
+    .replace(/(?:重写|改写|修复|排查|实现|设计|分析|审视|检查)(?:一下|下)/g, "$1")
+    .replace(/(?:一下|下)[啊呀吧呢哦]+/g, "")
+    .replace(/(?:谢谢|感谢|辛苦了)[啊呀吧呢哦]?$/g, "");
+
+  // Remove leading request grammar but leave the requested action intact.
+  for (let i = 0; i < 3; i += 1) {
+    text = text.replace(
+      /^\s*(?:如何|怎样|怎么|能否|是否|请|帮我|我想(?:知道|了解)?|需要|继续|针对|关于|对|用|使用|看一下|看下)\s*/,
+      "",
+    );
+  }
+
+  return compactMixedSpacing(text);
+}
+
+function extractObject(text: string): string | null {
+  const matches = Array.from(
+    text.matchAll(new RegExp(`[\\u4e00-\\u9fa5A-Za-z0-9 _-]{2,20}(?:${OBJECT_SUFFIX})`, "g")),
+  )
+    .map((match) => match[0]?.trim() ?? "")
+    .filter(Boolean);
+  return matches.at(-1) ?? null;
+}
+
+function normalizeActionBody(rawBody: string): string {
+  let body = compactMixedSpacing(
+    rawBody
+      .replace(/[，。！？、：；,.!?:;—]/g, " ")
+      .replace(/[【】（）()]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+
+  const object = extractObject(body);
+  const trailingAction = ACTION_WORDS.find((action) =>
+    new RegExp(`${escapeRegExp(action)}$`, "i").test(body),
+  );
+  if (object && trailingAction) body = `${trailingAction}${object}`;
+
+  // A title should retain the first meaningful clause, not a second sentence
+  // asking the assistant to explain or conclude something.
+  body = body
+    .replace(/\s+(?:并|然后|同时)?\s*(?:请)?(?:告诉我|说明一下|给出答案|给出结论).*$/g, "")
+    .replace(/[并与和对在从向给与以及]+$/g, "")
+    .trim();
+
+  return compactMixedSpacing(body);
+}
+
+/**
+ * Finds a concrete product, project, file format, or business subject. This
+ * is intentionally not a generic category classifier: a topic is only added
+ * when it helps a person find the Thread again.
+ */
+export function inferTitleTopic(text: string): string | null {
+  for (const { topic, pattern } of RECOGNIZABLE_TOPICS) {
+    if (pattern.test(text)) return topic;
+  }
+
+  const explicitTopic = text.match(/^\s*(.{2,20}?)\s*[：:|｜]\s*(?:.+)$/);
+  if (explicitTopic?.[1]) {
+    const topic = cleanTopic(explicitTopic[1]);
+    if (topic && !/^(?:请|帮我|我想|如何|怎样|怎么|关于|针对|当前|这个)$/i.test(topic)) {
+      return topic;
+    }
+  }
+
+  const actionIndex = ACTION_WORDS.map((action) => text.indexOf(action))
+    .filter((index) => index > 0)
+    .sort((a, b) => a - b)[0];
+  if (actionIndex !== undefined) {
+    const prefix = cleanTopic(text.slice(0, actionIndex));
+    if (
+      prefix.length >= 2 &&
+      !/^(?:请|帮我|我想|需要|继续|再次|重新|如何|怎样|怎么|用|使用)$/i.test(prefix)
+    ) {
+      return clipText(prefix, MAX_TOPIC_LENGTH);
+    }
+  }
+
+  return null;
 }
 
 export function extractMeaningfulTitleText(rawTitle: string): string {
   if (!rawTitle || typeof rawTitle !== "string") return "";
   let text = rawTitle.trim();
 
-  // 1. Strip instructions header / system prompts / protocol wrappers
+  // These wrappers are injected by Desktop or the goal loop, not user intent.
   text = text.replace(/# AGENTS\.md instructions[\s\S]*?<\/INSTRUCTIONS>/gi, "");
   text = text.replace(/<USER_REQUEST>|<\/USER_REQUEST>/gi, "");
   text = text.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "");
   text = text.replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "");
   text = text.replace(/\[System Note:[\s\S]*?--- Prior Conversation History ---/gi, "");
-  text = text.replace(/--- Prior Conversation History ---[\s\S]*?--- End Prior Conversation History ---/gi, "");
+  text = text.replace(
+    /--- Prior Conversation History ---[\s\S]*?--- End Prior Conversation History ---/gi,
+    "",
+  );
 
-  // 2. Strip attachment banners inserted by desktop
-  text = text.replace(/# Files (?:pasted|mentioned) by the user:[\s\S]*?(?:## My request:|(?=\n[^\n#]))/gi, "");
+  text = text.replace(
+    /# Files (?:pasted|mentioned) by the user:[\s\S]*?(?:## My request:|(?=\n[^\n#]))/gi,
+    "",
+  );
   text = text.replace(/## My request:\s*/gi, "");
-
-  // 3. Strip markdown headings
   text = text.replace(/^#+\s+[^\n]*$/gm, "");
 
-  // 4. Strip Goal loop continuation and prefix prompts
   text = text.replace(/%%GOAL_CONTINUE%%[\s\S]*?请继续推进尚未完成的子任务[。\s]*/gi, "");
   text = text.replace(/^目标[：:]\s*/, "");
   text = text.replace(/请开始推进目标[\s\S]*$/gi, "");
 
-  // 5. Strip URLs
   text = text.replace(/https?:\/\/\S+|codex:\/\/\S+/gi, " ");
-
-  // 6. Strip file paths like /Users/... or /var/... or C:\... or ~/projects/...
-  text = text.replace(/(?:^|\s)(?:(?:\/[a-zA-Z0-9._-]+)+|[a-zA-Z]:\\[a-zA-Z0-9._\-\\]+|~(?:\/[a-zA-Z0-9._-]+)+)/g, " ");
-
-  // 7. Strip leading numbering like "1. ", "1、", "【1】"
+  text = text.replace(
+    /(?:^|\s)(?:(?:\/[a-zA-Z0-9._-]+)+|[a-zA-Z]:\\[a-zA-Z0-9._\-\\]+|~(?:\/[a-zA-Z0-9._-]+)+)/g,
+    " ",
+  );
   text = text.replace(/^(?:[0-9]+[、.\s]+|【[0-9]+】\s*)/, "");
 
-  // 8. If text is empty because raw input was purely a file/folder path:
   if (text.trim().length === 0) {
-    const pathMatch = rawTitle.match(/(?:(?:\/[a-zA-Z0-9._-]+)+|[a-zA-Z]:\\[a-zA-Z0-9._\-\\]+|~(?:\/[a-zA-Z0-9._-]+)+)/);
+    const pathMatch = rawTitle.match(
+      /(?:(?:\/[a-zA-Z0-9._-]+)+|[a-zA-Z]:\\[a-zA-Z0-9._\-\\]+|~(?:\/[a-zA-Z0-9._-]+)+)/,
+    );
     if (pathMatch) {
       const parts = pathMatch[0].split(/[/\\]+/).filter(Boolean);
-      text = parts[parts.length - 1] || "";
+      text = parts.at(-1) ?? "";
     }
   }
 
   return text.trim();
 }
 
+function formatTitle(topic: string | null, body: string): string {
+  const normalizedTopic = topic ? clipText(cleanTopic(topic), MAX_TOPIC_LENGTH) : "";
+  const normalizedBody = normalizeActionBody(body);
+  if (!normalizedBody) return normalizedTopic;
+  if (!normalizedTopic) return clipText(normalizedBody, MAX_TITLE_LENGTH);
+
+  const bodyWithoutTopic = normalizeActionBody(removeTopic(normalizedBody, normalizedTopic));
+  if (!bodyWithoutTopic) return normalizedTopic;
+
+  const prefix = `[${normalizedTopic}] `;
+  return `${prefix}${clipText(bodyWithoutTopic, MAX_TITLE_LENGTH - Array.from(prefix).length)}`;
+}
+
 export function normalizeThreadTitle(rawTitle: string): string {
   if (!rawTitle || typeof rawTitle !== "string") return rawTitle;
-  const trimmed = rawTitle.trim();
-  if (trimmed.length === 0) return trimmed;
 
-  // 1. If already tagged: [标签] 正文
-  const taggedMatch = trimmed.match(/^\[([^\]]+)\]\s*(.*)$/);
-  if (taggedMatch && taggedMatch[1] !== undefined && taggedMatch[2] !== undefined) {
-    const tag = taggedMatch[1].trim();
-    let body = taggedMatch[2].trim()
-      .replace(/[，。！？、：；,.!?:;—\-_"“”'‘’`]/g, "")
-      .replace(/(关于|进行|分析|的)/g, "")
-      .trim();
-    if (body.length > 9) body = body.slice(0, 9);
-    return `[${tag}] ${body}`;
+  const extracted = extractMeaningfulTitleText(rawTitle);
+  if (!extracted) return rawTitle.trim();
+
+  const taggedMatch = extracted.match(/^\[([^\]]+)\]\s*(.*)$/s);
+  if (taggedMatch?.[1] !== undefined && taggedMatch[2] !== undefined) {
+    return formatTitle(cleanTopic(taggedMatch[1]), removeTitleNoise(taggedMatch[2]));
   }
 
-  // 2. Clean and extract meaningful content from raw input
-  const extracted = extractMeaningfulTitleText(trimmed);
-  const subjectText = extracted.length > 0 ? extracted : trimmed;
-
-  // 3. Infer category tag
-  const tag = inferTitleTag(subjectText);
-
-  // 4. Clean raw title to extract core terms
-  let clean = subjectText
-    .replace(/[，。！？、：；,.!?:;—\-_"“”'‘’`\(\)（）[\]【】]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Strip leading conversational openings
-  clean = clean.replace(
-    /^(?:我想知道|我想了解|帮我|请帮我|请问|请|如何|怎样|怎么|关于|针对|进行|对|查一下|看下|审视一下|看一下|介绍下|介绍|用|做一个|写一个|编写|实现|开始|尝试|讨论)\s*/,
-    "",
-  );
-
-  // Strip demonstrative pronouns and modal particles
-  clean = clean.replace(/^(?:这个|这份|这篇|这些|当前)\s*/, "");
-  clean = clean.replace(/(?:一下|下)?[啊呀吧呢哦]+/g, "");
-
-  // Strip filler phrases
-  clean = clean.replace(/(关于|进行|分析|的的|一个|一下|并给出结论|给出结论|并给出答案|给出答案|按照|我们|之前的|为什么没有|为什么|为何)/g, "");
-
-  // Collapse spaces between Chinese characters, but preserve single spaces adjacent to Latin characters
-  clean = clean.replace(/([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])/g, "$1$2");
-  clean = clean.replace(/([\u4e00-\u9fa5])\s+([a-zA-Z0-9])/g, "$1$2");
-  clean = clean.replace(/([a-zA-Z0-9])\s+([\u4e00-\u9fa5])/g, "$1$2");
-  clean = clean.trim();
-
-  // Smart truncation: keep body within 8 Chinese characters (or equivalent weight)
-  let body = "";
-  let count = 0;
-  for (const ch of clean) {
-    const weight = /[\u4e00-\u9fa5]/.test(ch) ? 1 : 0.6;
-    if (count + weight > 8) break;
-    body += ch;
-    count += weight;
+  const delimiterMatch = extracted.match(/^(.{2,24}?)\s*[：:|｜]\s*(.+)$/s);
+  if (delimiterMatch?.[1] && delimiterMatch[2]) {
+    return formatTitle(cleanTopic(delimiterMatch[1]), removeTitleNoise(delimiterMatch[2]));
   }
 
-  body = body.trim().replace(/[并与和对在从向给与以及]+$/, "").trim();
-
-  if (body.length < 2) {
-    body = subjectText.replace(/[，。！？、：；,.!?:;—\-_/\\]/g, "").slice(0, 6);
-  }
-
-  return `[${tag}] ${body}`;
+  const cleaned = removeTitleNoise(extracted);
+  const topic = inferTitleTopic(cleaned);
+  return formatTitle(topic, cleaned);
 }

@@ -1,23 +1,26 @@
 /**
  * Optional Antigravity multi-account overlay.
  *
- * Antigravity CLI (agy) keeps its identity in `$HOME/.gemini`, so one isolated
- * HOME per account yields one isolated account. This module owns that layout:
+ * Antigravity CLI (agy) keeps settings, cache, and conversations in
+ * `$HOME/.gemini`, while OAuth identity is held by the operating-system
+ * keyring. This module owns a shadow HOME plus the serialized keychain lease
+ * needed to keep those two state sources aligned per account:
  *
  *   <realHome>/.agy-accounts/
  *   ├── accounts.json          metadata only; never credentials
  *   └── <accountId>/home/      shadow HOME (symlinks everything but .gemini)
  *       ├── Library/           real dir; children linked except Keychains
- *       │   └── Keychains      intentionally absent: agy then uses the file token
+ *       │   └── Keychains      dedicated per-account keychain on Darwin
  *       └── .gemini/
  *           ├── config  -> <realHome>/.gemini/config    (shared)
  *           ├── skills  -> <realHome>/.gemini/skills    (shared)
  *           └── antigravity-cli/                        (per account: token, sessions)
  *
- * On macOS agy reads its OAuth credential from `$HOME/Library/Keychains`, so a
- * shared keychain would make every account the same Google user. Excluding the
- * keychain makes agy fall back to `<account>/home/.gemini/antigravity-cli/
- * antigravity-oauth-token`, which is per account.
+ * On macOS agy reads OAuth credentials from the operating-system keyring. A
+ * shared keychain would make every account the same Google user, so Darwin
+ * callers must acquire the account's dedicated keychain lease before starting
+ * AGY. The shadow HOME still isolates AGY's settings, cache, and conversations;
+ * it is not treated as proof of OAuth isolation by itself.
  *
  * Compatibility contract: when `accounts.json` is absent the overlay is inert.
  * `loadAntigravityAccountsSync` reports `legacy`, the adapter never resolves an
@@ -182,6 +185,16 @@ export interface ShadowHomeReport {
 
 const execFileAsync = promisify(execFile);
 
+export type AntigravityKeychainRelease = () => Promise<void>;
+
+let keychainOperation: Promise<unknown> = Promise.resolve();
+let activeKeychainLease: {
+  file: string;
+  count: number;
+  previousDefault: string[];
+  previousList: string[];
+} | null = null;
+
 /**
  * macOS shows a blocking「找不到钥匙串」dialog when a process tries to store a
  * credential and no keychain exists at `$HOME/Library/Keychains`. Creating a
@@ -228,11 +241,90 @@ async function createDarwinKeychain(file: string): Promise<void> {
 }
 
 /**
+ * Keychain Services ignores HOME when resolving generic passwords. Keep only
+ * the account keychain in the user search list for the lifetime of each AGY
+ * process, and restore the user's list after the last same-account user goes
+ * away. Different account processes are rejected while a lease is active so a
+ * credential can never be selected from the wrong account.
+ */
+async function acquireDarwinKeychain(file: string): Promise<AntigravityKeychainRelease> {
+  if (process.platform !== "darwin") return async () => undefined;
+  const operation = keychainOperation.then(async () => {
+    if (activeKeychainLease) {
+      if (activeKeychainLease.file !== file) {
+        throw new Error("Antigravity account keychain isolation is busy for another account");
+      }
+      activeKeychainLease.count += 1;
+    } else {
+      const readSetting = async (arguments_: readonly string[]): Promise<string[]> => {
+        const { stdout } = await execFileAsync("security", [...arguments_]);
+        return stdout
+          .split("\n")
+          .map((line) => line.trim().replace(/^"|"$/gu, ""))
+          .filter(Boolean);
+      };
+      const previousDefault = await readSetting(["default-keychain", "-d", "user"]);
+      const previousList = await readSetting(["list-keychains", "-d", "user"]);
+      await execFileAsync("security", ["list-keychains", "-d", "user", "-s", file]);
+      await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file]);
+      activeKeychainLease = {
+        file,
+        count: 1,
+        previousDefault,
+        previousList,
+      };
+    }
+
+    let released = false;
+    return async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      const releaseOperation = keychainOperation.then(async () => {
+        const lease = activeKeychainLease;
+        if (!lease || lease.file !== file) return;
+        lease.count -= 1;
+        if (lease.count > 0) return;
+        try {
+          if (lease.previousList.length > 0) {
+            await execFileAsync("security", [
+              "list-keychains",
+              "-d",
+              "user",
+              "-s",
+              ...lease.previousList,
+            ]).catch(() => undefined);
+          }
+          const previous = lease.previousDefault[0];
+          if (previous) {
+            await execFileAsync("security", [
+              "default-keychain",
+              "-d",
+              "user",
+              "-s",
+              previous,
+            ]).catch(() => undefined);
+          }
+        } finally {
+          // A stale keychain path from a removed account must never poison the
+          // in-process lease state or turn a successful model probe into an
+          // inspection error.
+          activeKeychainLease = null;
+        }
+      });
+      keychainOperation = releaseOperation.catch(() => undefined);
+      await releaseOperation;
+    };
+  });
+  keychainOperation = operation.catch(() => undefined);
+  return operation;
+}
+
+/**
  * Build (or repair) a shadow HOME. Everything in the real HOME is symlinked so
  * shell tools keep the user's git/ssh/gh/npm credentials, except:
  *  - `.gemini`, which is rebuilt per account (config/skills shared by link),
- *  - `Library/Keychains`, which must stay per account or every account would
- *    resolve the same macOS keychain credential,
+ *  - `Library/Keychains`, which is created per account and selected through a
+ *    serialized Darwin keychain lease,
  *  - any entry that would place the shadow root inside its own link target.
  * Idempotent: existing entries are left untouched.
  */
@@ -327,15 +419,15 @@ export async function ensureAntigravityShadowHome(input: {
     "antigravity-cli",
   ]);
   // The macOS keychain is the credential agy actually reads, so it must stay
-  // per account; without it agy falls back to the per-account token file.
+  // per account. It is intentionally not linked from the real HOME.
   await linkChildren(path.join(realHome, "Library"), path.join(shadowHome, "Library"), "Library/", [
     "Keychains",
   ]);
 
   // macOS shows a blocking「找不到钥匙串」dialog when agy stores a credential and
   // no keychain exists at `$HOME/Library/Keychains`. A dedicated per-account
-  // keychain keeps agy working without a prompt and without reading the shared
-  // login keychain.
+  // keychain is prepared here; callers still need acquireKeychainIsolation()
+  // while AGY is running because Keychain Services is user-scoped, not HOME-scoped.
   const keychainFile = path.join(keychainDirectory, "login.keychain-db");
   if (
     !(await lstat(keychainFile).then(
@@ -589,6 +681,26 @@ export class AntigravityAccountStore {
     return account ? { ...account } : null;
   }
 
+  /** Whether a new Session may be assigned to this account right now. */
+  isUsable(account: AntigravityAccount, now = Date.now()): boolean {
+    if (!account.enabled || account.state === "disabled" || account.state === "needs_login") {
+      return false;
+    }
+    if (account.state !== "cooldown") return true;
+    const until = account.cooldownUntil ? Date.parse(account.cooldownUntil) : Number.NaN;
+    return Number.isFinite(until) && until <= now;
+  }
+
+  /** Pick a healthy account for a brand-new Thread without reusing an exhausted one. */
+  firstAvailableAccount(now = Date.now()): AntigravityAccount | null {
+    this.#reloadIfChanged();
+    const preferred = this.#accounts.get(this.#defaultAccountId);
+    const account =
+      (preferred && this.isUsable(preferred, now) ? preferred : undefined) ??
+      [...this.#accounts.values()].find((candidate) => this.isUsable(candidate, now));
+    return account ? { ...account } : null;
+  }
+
   defaultAccount(): AntigravityAccount | null {
     this.#reloadIfChanged();
     return this.get(this.#defaultAccountId);
@@ -614,7 +726,8 @@ export class AntigravityAccountStore {
 
   /**
    * Resolution order for an existing Thread: explicit binding, then the native
-   * Session it points at, then the configured default.
+   * Session it points at. New/unbound Threads prefer an available account so a
+   * stale default cannot trigger repeated authentication attempts.
    */
   resolveAccountForThread(threadId: string | undefined): AntigravityAccount {
     this.#reloadIfChanged();
@@ -629,7 +742,7 @@ export class AntigravityAccountStore {
         if (byNative) return byNative;
       }
     }
-    return this.defaultAccount() ?? this.#firstEnabledAccount();
+    return this.firstAvailableAccount() ?? this.defaultAccount() ?? this.#firstEnabledAccount();
   }
 
   accountForNativeSession(nativeSessionId: string): AntigravityAccount | null {
@@ -637,16 +750,35 @@ export class AntigravityAccountStore {
     return this.bindingForNativeSession(nativeSessionId);
   }
 
-  async ensureHome(account: AntigravityAccount): Promise<string> {
+  async ensureHome(
+    account: AntigravityAccount,
+    options: { manageDarwinKeychain?: boolean } = {},
+  ): Promise<string> {
     const home = this.homeFor(account);
     if (account.legacy === true || this.#shadowReady.has(account.id)) return home;
     await ensureAntigravityShadowHome({
       realHome: this.#realHome,
       shadowHome: home,
       shadowRoot: this.shadowRoot,
+      ...(options.manageDarwinKeychain === false ? { createKeychain: async () => undefined } : {}),
     });
     this.#shadowReady.add(account.id);
     return home;
+  }
+
+  async acquireKeychainIsolation(account: AntigravityAccount): Promise<AntigravityKeychainRelease> {
+    if (account.legacy === true || process.platform !== "darwin") return async () => undefined;
+    const home = await this.ensureHome(account);
+    const file = path.join(home, "Library", "Keychains", "login.keychain-db");
+    if (
+      !(await lstat(file).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      throw new Error(`Antigravity account '${account.name}' has no isolated keychain`);
+    }
+    return acquireDarwinKeychain(file);
   }
 
   async bindThread(input: {
@@ -753,6 +885,31 @@ export class AntigravityAccountStore {
     if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
     await this.#mutate(async () => {
       this.#accounts.set(accountId, { ...account, enabled });
+      await this.#persist();
+    });
+  }
+
+  async markCooldown(accountId: string, cooldownUntil: string): Promise<void> {
+    const account = this.#accounts.get(accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
+    await this.#mutate(async () => {
+      this.#accounts.set(accountId, {
+        ...account,
+        state: "cooldown",
+        cooldownUntil,
+      });
+      await this.#persist();
+    });
+  }
+
+  async markReady(accountId: string): Promise<void> {
+    const account = this.#accounts.get(accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${accountId}'`);
+    await this.#mutate(async () => {
+      const next = { ...account };
+      delete next.state;
+      delete next.cooldownUntil;
+      this.#accounts.set(accountId, next);
       await this.#persist();
     });
   }

@@ -19,7 +19,7 @@ describe("Renderer Agent picker presentation", () => {
         { width: 1_920, height: 1_440 },
         1.6,
       ),
-    ).toEqual({ left: 676, bottom: 86 });
+    ).toEqual({ left: 640, bottom: 86 });
   });
 
   it("falls back to unscaled positioning when the Codex window zoom is unavailable", () => {
@@ -29,7 +29,7 @@ describe("Renderer Agent picker presentation", () => {
         { width: 1_200, height: 900 },
         Number.NaN,
       ),
-    ).toEqual({ left: 676, bottom: 86 });
+    ).toEqual({ left: 640, bottom: 86 });
   });
 
   it("splits Codex Account email names from their muted domains", () => {
@@ -113,16 +113,16 @@ describe("Renderer Agent picker presentation", () => {
     });
   });
 
-  it("hides the native Model for an external Agent and locks submitted selection", () => {
+  it("hides the native Model but keeps an external Agent selectable once the Thread is locked", () => {
     expect(
       rendererAgentPickerView({ agent: "pi", phase: "locked" }, "ready", false, ["codex", "pi"], {
         pi: "ready",
       }),
     ).toEqual({
       label: "Pi",
-      triggerDisabled: true,
+      triggerDisabled: false,
       nativeModelHidden: true,
-      optionDisabled: { codex: true, pi: true },
+      optionDisabled: { codex: false, pi: false },
       downloadVisible: { pi: false },
       errorVisible: { pi: false },
     });

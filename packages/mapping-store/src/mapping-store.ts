@@ -657,7 +657,8 @@ export class MappingStore {
       // A newly created Harness Session may publish its native identity only
       // when its first turn starts. Never carry the previous Harness identity
       // across the handover; keep the record provisional until that event.
-      const { nativeSessionRef: _oldNativeSessionRef, ...withoutNativeSession } = current;
+      const withoutNativeSession = { ...current };
+      delete withoutNativeSession.nativeSessionRef;
       return {
         ...withoutNativeSession,
         harnessId: input.harnessId,

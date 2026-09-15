@@ -1,7 +1,5 @@
 import type { CodexAccountSummary } from "@codexhost/shared-contracts";
 
-import { createRendererAgentIcon } from "./renderer-agent-icon.js";
-
 export interface RendererCodexAccountOptionControl {
   readonly row: HTMLElement;
   readonly button: HTMLButtonElement;
@@ -11,14 +9,13 @@ export interface RendererCodexAccountOptionControl {
 
 export interface RendererCodexAccountGroupControl {
   readonly root: HTMLElement;
-  readonly badge: HTMLElement;
+  readonly manageButton: HTMLButtonElement;
   readonly options: Map<string, RendererCodexAccountOptionControl>;
   accounts: readonly CodexAccountSummary[];
   render(input: {
     readonly accounts: readonly CodexAccountSummary[];
     readonly selectedAccountId: string | null;
     readonly disabled: boolean;
-    readonly showBadge: boolean;
   }): void;
 }
 
@@ -62,12 +59,49 @@ function accountInitial(account: CodexAccountSummary): string {
   return display.match(/[\p{L}\p{N}]/u)?.[0]?.toUpperCase() ?? "?";
 }
 
+function createCheckmarkIcon(ownerDocument: Document): SVGSVGElement {
+  const svg = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.style.width = "14px";
+  svg.style.height = "14px";
+  svg.style.flex = "none";
+  svg.style.fill = "none";
+  svg.style.stroke = "currentColor";
+  svg.style.strokeWidth = "1.8";
+  svg.style.strokeLinecap = "round";
+  svg.style.strokeLinejoin = "round";
+  const path = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M3.5 8.5l3 3 6-6");
+  svg.append(path);
+  return svg;
+}
+
+function createMoreDotsIcon(ownerDocument: Document): SVGSVGElement {
+  const svg = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.style.width = "13px";
+  svg.style.height = "13px";
+  svg.style.flex = "none";
+  svg.style.fill = "currentColor";
+  for (const cx of [3.5, 8, 12.5]) {
+    const circle = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", String(cx));
+    circle.setAttribute("cy", "8");
+    circle.setAttribute("r", "1.25");
+    svg.append(circle);
+  }
+  return svg;
+}
+
 function setInteractiveHighlight(button: HTMLButtonElement): void {
   const update = (hovered: boolean): void => {
     const selected = button.getAttribute("aria-checked") === "true";
-    button.style.background =
-      selected || (hovered && !button.disabled)
-        ? `rgba(127, 127, 127, ${selected ? "0.16" : "0.1"})`
+    button.style.background = selected
+      ? "light-dark(#F7F7F7, rgba(255, 255, 255, 0.08))"
+      : hovered && !button.disabled
+        ? "light-dark(#F7F7F7, rgba(255, 255, 255, 0.05))"
         : "transparent";
   };
   button.addEventListener("pointerenter", () => update(true));
@@ -87,30 +121,21 @@ export function createRendererCodexAccountGroup(input: {
   const root = document.createElement("div");
   root.dataset.codexAccountOptions = "true";
   root.hidden = true;
+  root.style.margin = "1px 0 2px 0";
+  root.style.padding = "0";
+  root.style.border = "none";
+  root.style.borderLeft = "none";
 
   const accountSection = document.createElement("div");
   accountSection.setAttribute("role", "group");
   accountSection.setAttribute("aria-label", input.accountsLabel);
   accountSection.style.position = "relative";
 
-  const header = document.createElement("div");
-  header.style.display = "flex";
-  header.style.alignItems = "center";
-  header.style.gap = "7px";
-  header.style.height = "30px";
-  header.style.padding = "0 34px 0 8px";
-  header.style.color = "inherit";
-  header.style.font = "600 12px/1 system-ui, sans-serif";
-  header.style.opacity = "0.72";
-  header.append(createRendererAgentIcon("codex", 16, document), input.accountsLabel);
-
   const list = document.createElement("div");
   list.style.display = "flex";
   list.style.flexDirection = "column";
-  list.style.gap = "2px";
-  list.style.maxHeight = "132px";
-  list.style.marginBottom = "4px";
-  list.style.paddingLeft = "14px";
+  list.style.gap = "1px";
+  list.style.maxHeight = "120px";
   list.style.overflowY = "auto";
   list.style.scrollbarWidth = "thin";
 
@@ -119,47 +144,32 @@ export function createRendererCodexAccountGroup(input: {
   manage.setAttribute("role", "menuitem");
   manage.setAttribute("aria-label", input.manageAccountsLabel);
   manage.title = input.manageAccountsLabel;
-  manage.textContent = "…";
-  manage.style.position = "absolute";
-  manage.style.top = "3px";
-  manage.style.right = "4px";
   manage.style.display = "inline-flex";
   manage.style.alignItems = "center";
   manage.style.justifyContent = "center";
-  manage.style.width = "24px";
-  manage.style.height = "24px";
+  manage.style.width = "18px";
+  manage.style.height = "18px";
   manage.style.padding = "0";
-  manage.style.color = "inherit";
+  manage.style.color = "light-dark(#777777, #999999)";
   manage.style.background = "transparent";
   manage.style.border = "0";
-  manage.style.borderRadius = "5px";
-  manage.style.font = "600 16px/1 system-ui, sans-serif";
-  manage.style.opacity = "0.56";
+  manage.style.borderRadius = "4px";
   manage.style.cursor = "pointer";
+  manage.style.flex = "none";
+  manage.style.transition = "background 120ms ease-out, color 120ms ease-out";
+  manage.replaceChildren(createMoreDotsIcon(document));
   manage.addEventListener("pointerenter", () => {
-    manage.style.background = "rgba(127, 127, 127, 0.1)";
-    manage.style.opacity = "1";
+    manage.style.background = "light-dark(#EAEAEA, rgba(255, 255, 255, 0.12))";
+    manage.style.color = "light-dark(#171717, #ffffff)";
   });
   manage.addEventListener("pointerleave", () => {
     manage.style.background = "transparent";
-    manage.style.opacity = "0.56";
+    manage.style.color = "light-dark(#777777, #999999)";
   });
   manage.addEventListener("click", input.onManage);
 
-  accountSection.append(header, list, manage);
+  accountSection.append(list);
   root.append(accountSection);
-
-  const badge = document.createElement("span");
-  badge.setAttribute("aria-hidden", "true");
-  badge.style.display = "none";
-  badge.style.position = "absolute";
-  badge.style.right = "1px";
-  badge.style.bottom = "0";
-  badge.style.width = "9px";
-  badge.style.height = "9px";
-  badge.style.border = "1.5px solid Canvas";
-  badge.style.borderRadius = "50%";
-  badge.style.pointerEvents = "none";
 
   const options = new Map<string, RendererCodexAccountOptionControl>();
   let accounts: readonly CodexAccountSummary[] = [];
@@ -170,48 +180,56 @@ export function createRendererCodexAccountGroup(input: {
     options.clear();
     for (const account of nextAccounts) {
       const row = document.createElement("div");
+      row.style.position = "relative";
+      row.style.minHeight = "30px";
+      row.style.marginLeft = "24px";
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.codexAccountId = account.accountId;
       button.setAttribute("role", "menuitemradio");
-      button.style.display = "grid";
-      button.style.gridTemplateColumns = "20px minmax(0, 1fr) 16px";
+      button.style.display = "flex";
       button.style.alignItems = "center";
-      button.style.gap = "7px";
+      button.style.gap = "6px";
       button.style.width = "100%";
-      button.style.height = "32px";
-      button.style.padding = "0 7px";
+      button.style.height = "30px";
+      button.style.padding = "0 6px";
       button.style.color = "inherit";
       button.style.background = "transparent";
       button.style.border = "0";
       button.style.borderRadius = "5px";
       button.style.textAlign = "left";
       button.style.cursor = "pointer";
+      button.style.boxSizing = "border-box";
+      button.style.transition = "background 120ms ease-out";
       setInteractiveHighlight(button);
 
       const avatar = document.createElement("span");
       avatar.textContent = accountInitial(account);
+      avatar.setAttribute("aria-hidden", "true");
       avatar.style.display = "inline-flex";
       avatar.style.alignItems = "center";
       avatar.style.justifyContent = "center";
-      avatar.style.width = "20px";
-      avatar.style.height = "20px";
+      avatar.style.width = "18px";
+      avatar.style.height = "18px";
       avatar.style.color = "#fff";
       avatar.style.background = accountColor(account.accountId);
       avatar.style.borderRadius = "50%";
-      avatar.style.font = "700 10px/1 system-ui, sans-serif";
+      avatar.style.font = "600 10px/1 system-ui, sans-serif";
+      avatar.style.flex = "none";
 
       const displayName = codexAccountDisplayName(account);
       const name = document.createElement("span");
       name.style.display = "flex";
       name.style.alignItems = "baseline";
       name.style.minWidth = "0";
+      name.style.flex = "1 1 auto";
       name.style.gap = "4px";
       const local = document.createElement("strong");
       local.textContent = displayName.local;
       local.style.minWidth = "0";
       local.style.overflow = "hidden";
-      local.style.font = "600 13px/1 system-ui, sans-serif";
+      local.style.font = "500 12px/1.2 system-ui, sans-serif";
+      local.style.color = "light-dark(#202020, #e6e6e6)";
       local.style.textOverflow = "ellipsis";
       local.style.whiteSpace = "nowrap";
       name.append(local);
@@ -221,20 +239,24 @@ export function createRendererCodexAccountGroup(input: {
         domain.style.maxWidth = "48%";
         domain.style.overflow = "hidden";
         domain.style.flex = "none";
-        domain.style.font = "400 11px/1 system-ui, sans-serif";
-        domain.style.opacity = "0.58";
+        domain.style.font = "400 11px/1.2 system-ui, sans-serif";
+        domain.style.color = "light-dark(#777777, #999999)";
         domain.style.textOverflow = "ellipsis";
         domain.style.whiteSpace = "nowrap";
         name.append(domain);
       }
 
       const check = document.createElement("span");
-      check.textContent = "✓";
       check.setAttribute("aria-hidden", "true");
+      check.style.display = "inline-flex";
+      check.style.alignItems = "center";
+      check.style.justifyContent = "center";
       check.style.width = "16px";
-      check.style.textAlign = "center";
-      check.style.font = "600 14px/1 system-ui, sans-serif";
+      check.style.height = "16px";
+      check.style.flex = "none";
+      check.style.color = "light-dark(#171717, #f0f0f0)";
       check.style.visibility = "hidden";
+      check.append(createCheckmarkIcon(document));
 
       button.title = displayName.full;
       button.setAttribute("aria-label", `${input.accountsLabel}: ${displayName.full}`);
@@ -249,19 +271,15 @@ export function createRendererCodexAccountGroup(input: {
 
   const control: RendererCodexAccountGroupControl = {
     root,
-    badge,
+    manageButton: manage,
     options,
     accounts,
-    render({ accounts: nextAccounts, selectedAccountId, disabled, showBadge }) {
+    render({ accounts: nextAccounts, selectedAccountId, disabled }) {
       const nextSignature = codexAccountPresentationSignature(nextAccounts);
       if (nextSignature !== presentationSignature) rebuild(nextAccounts);
       accounts = [...nextAccounts];
       control.accounts = accounts;
       root.hidden = accounts.length === 0;
-
-      const selectedAccount = accounts.find(({ accountId }) => accountId === selectedAccountId);
-      badge.style.display = showBadge && selectedAccount ? "block" : "none";
-      if (selectedAccount) badge.style.background = accountColor(selectedAccount.accountId);
 
       for (const account of accounts) {
         const option = options.get(account.accountId);
@@ -270,7 +288,9 @@ export function createRendererCodexAccountGroup(input: {
         option.button.disabled = disabled;
         option.button.setAttribute("aria-checked", String(selected));
         option.button.setAttribute("aria-pressed", String(selected));
-        option.button.style.background = selected ? "rgba(127, 127, 127, 0.16)" : "transparent";
+        option.button.style.background = selected
+          ? "light-dark(#F7F7F7, rgba(255, 255, 255, 0.08))"
+          : "transparent";
         option.button.style.cursor = disabled ? "not-allowed" : "pointer";
         option.button.style.opacity = disabled && !selected ? "0.5" : "1";
         option.check.style.visibility = selected ? "visible" : "hidden";
