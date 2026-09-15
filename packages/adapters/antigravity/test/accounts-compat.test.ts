@@ -687,4 +687,29 @@ describe("Antigravity per-Thread account routing", () => {
       await adapter.close();
     }
   });
+
+  it("loads quota snapshot from disk for custom accounts when available", async () => {
+    const { store, realHome, environment } = await setup();
+    const snapshotFile = path.join(realHome, ".agy-accounts", "work", "quota-snapshot.json");
+    await mkdir(path.dirname(snapshotFile), { recursive: true });
+    await writeFile(
+      snapshotFile,
+      JSON.stringify({
+        usedPercent: 20,
+        periodType: "five_hour",
+      }),
+      "utf8",
+    );
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      { listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }) },
+    );
+    try {
+      const rows = await adapter.inspectAccounts();
+      const workRow = rows?.find((r) => r.accountId === "work");
+      expect(workRow?.credits?.usedPercent).toBe(20);
+    } finally {
+      await adapter.close();
+    }
+  });
 });

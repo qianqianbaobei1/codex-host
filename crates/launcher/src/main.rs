@@ -37,19 +37,20 @@ use codexhost_platform::{
     DesktopIdentity, DesktopInstallation, DesktopLaunchMode, SupervisedChild,
     canonical_existing_file, configure_background_command,
     desktop_root_process_ids_for_installation, discover_codex_desktop, node_entrypoint_path,
-    spawn_supervised,
+    process_exists, spawn_supervised,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use codexhost_platform::{DesktopSession, launch_desktop_session};
 #[cfg(target_os = "windows")]
 use codexhost_platform::{
-    RunningDesktopChoice, hide_console_window, process_executable_path, process_exists,
-    prompt_running_desktop, show_error_dialog, terminate_process_by_id,
+    RunningDesktopChoice, hide_console_window, process_executable_path, prompt_running_desktop,
+    show_error_dialog, terminate_process_by_id,
 };
 use compatibility::{MAX_CONTROLLER_READINESS_LINE_BYTES, parse_controller_readiness_line};
 use desktop_attachment::{
     LauncherOwnership, RuntimeControl, acquire_launcher_ownership, allocate_runtime_control,
-    endpoint_ready, publish_runtime_descriptor, stop_stale_launcher, wait_for_host_chain,
+    endpoint_ready, publish_runtime_descriptor, reap_orphaned_controller, stop_stale_launcher,
+    wait_for_host_chain,
 };
 use installation_layout::InstalledResources;
 use native_harness_broker::run_native_harness_broker_cli;
@@ -1003,10 +1004,14 @@ fn launch(
         let control_endpoint_ready = descriptor.as_ref().is_some_and(|descriptor| {
             endpoint_ready(descriptor.control_port, Duration::from_millis(300))
         });
+        let launcher_alive = descriptor
+            .as_ref()
+            .is_some_and(|descriptor| process_exists(descriptor.launcher_pid));
         let state = classify_startup(StartupObservation {
             desktop_running: !roots.is_empty(),
             descriptor_present,
             control_endpoint_ready,
+            launcher_alive,
         });
 
         match state {
@@ -1014,6 +1019,13 @@ fn launch(
                 if let Some(descriptor) = &descriptor {
                     stop_stale_launcher(descriptor)?;
                     let _ = remove_matching_descriptor(&descriptor_path, descriptor)?;
+                } else if descriptor_present {
+                    std::fs::remove_file(&descriptor_path)?;
+                }
+            }
+            StartupState::RecoverOrphanedController => {
+                if let Some(descriptor) = &descriptor {
+                    reap_orphaned_controller(&descriptor_path, descriptor)?;
                 } else if descriptor_present {
                     std::fs::remove_file(&descriptor_path)?;
                 }
@@ -1134,15 +1146,26 @@ fn launch(
     let control_endpoint_ready = descriptor.as_ref().is_some_and(|descriptor| {
         endpoint_ready(descriptor.control_port, Duration::from_millis(300))
     });
+    let launcher_alive = descriptor
+        .as_ref()
+        .is_some_and(|descriptor| process_exists(descriptor.launcher_pid));
     match classify_startup(StartupObservation {
         desktop_running: false,
         descriptor_present,
         control_endpoint_ready,
+        launcher_alive,
     }) {
         StartupState::RecoverStale => {
             if let Some(descriptor) = &descriptor {
                 stop_stale_launcher(descriptor)?;
                 let _ = remove_matching_descriptor(&descriptor_path, descriptor)?;
+            } else if descriptor_present {
+                return Err("codexhost runtime descriptor is invalid; remove it after checking its ownership".into());
+            }
+        }
+        StartupState::RecoverOrphanedController => {
+            if let Some(descriptor) = &descriptor {
+                reap_orphaned_controller(&descriptor_path, descriptor)?;
             } else if descriptor_present {
                 return Err("codexhost runtime descriptor is invalid; remove it after checking its ownership".into());
             }

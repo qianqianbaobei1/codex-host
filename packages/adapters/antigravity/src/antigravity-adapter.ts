@@ -5,6 +5,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -50,6 +51,7 @@ import {
   type ResumeSessionInput,
 } from "@codexhost/harness-adapter";
 import {
+  accountCreditsSnapshotSchema,
   harnessIdSchema,
   harnessInspectionSchema,
   harnessThinkingOptionIdSchema,
@@ -98,6 +100,7 @@ import { fetchAntigravityQuota } from "./quota.js";
 import {
   ANTIGRAVITY_ACCOUNT_ID_ENV,
   ANTIGRAVITY_THREAD_ID_ENV,
+  antigravityAccountsRoot,
   applyAntigravityAccountEnvironment,
   antigravityRealHome,
   type AntigravityAccount,
@@ -1877,6 +1880,36 @@ export class AntigravityAdapter implements HarnessAdapter {
     return this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
   }
 
+  #readAccountSnapshotSync(accountId: string): AccountCreditsSnapshot | null {
+    try {
+      const snapshotPath = path.join(
+        antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
+        accountId,
+        "quota-snapshot.json",
+      );
+      if (!existsSync(snapshotPath)) return null;
+      const text = readFileSync(snapshotPath, "utf8");
+      const parsed = JSON.parse(text);
+      const result = accountCreditsSnapshotSchema.safeParse(parsed);
+      return result.success ? result.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #writeAccountSnapshotSync(accountId: string, credits: AccountCreditsSnapshot): void {
+    try {
+      const snapshotPath = path.join(
+        antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
+        accountId,
+        "quota-snapshot.json",
+      );
+      writeFileSync(snapshotPath, JSON.stringify(credits, null, 2), "utf8");
+    } catch {
+      // Ignore write errors
+    }
+  }
+
   #creditsFor(key: string): AccountCreditsSnapshot | null {
     let credits = this.#creditsByAccount.get(key) ?? null;
     // The statusline fallback is produced by the host-level agy process, so it
@@ -1885,6 +1918,10 @@ export class AntigravityAdapter implements HarnessAdapter {
     const account = this.#accounts.mode === "multi" ? this.#accounts.store.get(key) : null;
     if (!credits && (key === LEGACY_ACCOUNT_KEY || account?.legacy === true)) {
       credits = readAntigravityCreditsSync();
+      if (credits) this.#creditsByAccount.set(key, credits);
+    }
+    if (!credits && account && !account.legacy) {
+      credits = this.#readAccountSnapshotSync(account.id);
       if (credits) this.#creditsByAccount.set(key, credits);
     }
     return credits;
@@ -1942,6 +1979,9 @@ export class AntigravityAdapter implements HarnessAdapter {
             : {}),
         };
         this.#creditsByAccount.set(key, credits);
+        if (key !== LEGACY_ACCOUNT_KEY) {
+          this.#writeAccountSnapshotSync(key, credits);
+        }
         return credits;
       }
     } catch {

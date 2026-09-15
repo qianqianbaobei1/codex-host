@@ -426,7 +426,8 @@ describe("Read-only Harness accounts", () => {
     await vi.waitFor(() => expect(startHarnessAccountLogin).toHaveBeenCalledOnce());
 
     const deleteBtn = descendants(content).find(
-      (node) => node.tagName === "button" && node.attributes.get("aria-label")?.includes("删除: 工作号"),
+      (node) =>
+        node.tagName === "button" && node.attributes.get("aria-label")?.includes("删除: 工作号"),
     );
     expect(deleteBtn).toBeDefined();
     deleteBtn?.dispatch("click", { target: deleteBtn });

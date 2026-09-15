@@ -961,9 +961,7 @@ export function modelSelectionForAgent(
                             ? harnessIdSchema.parse(agent)
                             : KIRO_CLI_HARNESS_ID,
                         ...(model ? { model } : {}),
-                        ...(thinkingOptionId && agent !== "cursor-cli"
-                          ? { thinkingOptionId }
-                          : {}),
+                        ...(thinkingOptionId && agent !== "cursor-cli" ? { thinkingOptionId } : {}),
                         ...(permissionModeId ? { permissionModeId } : {}),
                       })
                     : transportModelIdForAgent(agent);

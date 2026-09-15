@@ -198,3 +198,24 @@ pub(super) fn stop_stale_launcher(descriptor: &RuntimeDescriptor) -> Result<(), 
 pub(super) fn stop_stale_launcher(_descriptor: &RuntimeDescriptor) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
+
+/// Reaps a Controller that outlived its Launcher while still owning the Control
+/// endpoint, then drops the Descriptor that pointed at it.
+///
+/// Waiting for such an orphan to exit deadlocks every later launch: the endpoint
+/// never closes, so the Desktop could never be managed again and users only see a
+/// Desktop that refuses to start. Returns `Ok(())` even when nothing could be
+/// reaped, because a live endpoint must never block a fresh launch.
+pub(super) fn reap_orphaned_controller(
+    descriptor_path: &Path,
+    descriptor: &RuntimeDescriptor,
+) -> Result<(), Box<dyn Error>> {
+    match codexhost_platform::terminate_port_listener(descriptor.control_port, false) {
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "codexhost launcher: orphaned Desktop Controller could not be terminated: {error}"
+        ),
+    }
+    let _ = remove_matching_descriptor(descriptor_path, descriptor)?;
+    Ok(())
+}

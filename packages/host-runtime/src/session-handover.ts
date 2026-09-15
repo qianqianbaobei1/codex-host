@@ -90,4 +90,3 @@ export function formatHandoverContext(
 
   return `[System Note: The following is prior conversation history from this thread before switching models. Please continue the conversation seamlessly using this context.]\n\n--- Prior Conversation History ---\n${formattedHistory}\n--- End Prior Conversation History ---\n\n${nextUserPrompt}`;
 }
-

@@ -27,12 +27,8 @@ export interface RendererHarnessAccountClient {
   startHarnessAccountLogin?(
     input: HarnessAccountLoginStartParams,
   ): Promise<HarnessAccountLoginStartResult>;
-  createHarnessAccount?(
-    input: HarnessAccountCreateParams,
-  ): Promise<HarnessAccountListResult>;
-  deleteHarnessAccount?(
-    input: HarnessAccountDeleteParams,
-  ): Promise<HarnessAccountListResult>;
+  createHarnessAccount?(input: HarnessAccountCreateParams): Promise<HarnessAccountListResult>;
+  deleteHarnessAccount?(input: HarnessAccountDeleteParams): Promise<HarnessAccountListResult>;
 }
 
 /** Read-only telemetry, deliberately separate from Codex Account IDs and mutations. */
@@ -65,7 +61,8 @@ export function mountHarnessAccounts(
 
   const addAccountBtn = document.createElement("button");
   addAccountBtn.type = "button";
-  addAccountBtn.className = "settings-command-button settings-command-button--secondary settings-harness-accounts__add-btn";
+  addAccountBtn.className =
+    "settings-command-button settings-command-button--secondary settings-harness-accounts__add-btn";
   addAccountBtn.textContent = `+ ${messages.addGeminiAccount}`;
 
   header.append(titleGroup);
@@ -88,7 +85,13 @@ export function mountHarnessAccounts(
     accountId: string,
   ): Promise<void> => {
     const client = getClient();
-    if (!client?.selectHarnessAccount || selecting || deletingAccountId !== null || context.signal.aborted) return;
+    if (
+      !client?.selectHarnessAccount ||
+      selecting ||
+      deletingAccountId !== null ||
+      context.signal.aborted
+    )
+      return;
     selecting = true;
     render();
     onChange();
@@ -180,7 +183,9 @@ export function mountHarnessAccounts(
     nameInput.type = "text";
     nameInput.className = "settings-harness-create-form__input";
     nameInput.placeholder =
-      messages.locale === "zh-CN" ? "账号名称（如 倩倩账号、工作）" : "Account name (e.g. Work, Personal)";
+      messages.locale === "zh-CN"
+        ? "账号名称（如 倩倩账号、工作）"
+        : "Account name (e.g. Work, Personal)";
 
     const idInput = document.createElement("input");
     idInput.type = "text";
@@ -211,7 +216,10 @@ export function mountHarnessAccounts(
       if (!client?.createHarnessAccount || context.signal.aborted) return;
 
       const displayName = nameInput.value.trim() || idInput.value.trim() || "Gemini 账号";
-      let rawId = idInput.value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+      let rawId = idInput.value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "");
       if (!rawId) {
         const existingIds = new Set(
           accounts.filter((a) => a.harnessId === "antigravity").map((a) => a.accountId),
@@ -482,7 +490,9 @@ export function mountHarnessAccounts(
           reauth.type = "button";
           reauth.className = "settings-account-action";
           reauth.textContent =
-            loggingInAccountId === selectableId ? messages.accountSigningIn : messages.accountReauth;
+            loggingInAccountId === selectableId
+              ? messages.accountSigningIn
+              : messages.accountReauth;
           reauth.disabled = selecting || loggingInAccountId !== null || deletingAccountId !== null;
           reauth.addEventListener("click", () => void login(account.harnessId, selectableId));
           actions.append(reauth);
@@ -492,7 +502,6 @@ export function mountHarnessAccounts(
       if (
         account.harnessId === "antigravity" &&
         selectableId &&
-        !account.isDefault &&
         selectableId !== "default" &&
         getClient()?.deleteHarnessAccount
       ) {

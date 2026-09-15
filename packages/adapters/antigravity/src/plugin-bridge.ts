@@ -246,7 +246,9 @@ export function isRuleBridgeDisabled(
     return true;
   }
   if (configContent) {
-    const match = configContent.match(/\[(?:codexhost|codex-host)\][\s\S]*?bridge_rules\s*=\s*(false|true)/i);
+    const match = configContent.match(
+      /\[(?:codexhost|codex-host)\][\s\S]*?bridge_rules\s*=\s*(false|true)/i,
+    );
     if (match && match[1]?.toLowerCase() === "false") {
       return true;
     }

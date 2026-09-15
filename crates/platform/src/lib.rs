@@ -75,7 +75,9 @@ pub use process::{
     desktop_process_tree, desktop_root_snapshots_for_installation, process_snapshots,
 };
 pub use process_supervision::{ChildProcessGuard, SupervisedChild, spawn_supervised};
-pub use process_termination::{terminate_process_group_instance, terminate_process_instance};
+pub use process_termination::{
+    terminate_port_listener, terminate_process_group_instance, terminate_process_instance,
+};
 #[cfg(target_os = "windows")]
 pub use proxy_environment::desktop_helper_proxy_environment;
 pub use proxy_environment::proxy_environment;

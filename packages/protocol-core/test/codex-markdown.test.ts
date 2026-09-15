@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  normalizeCodexMarkdown,
-  StreamingMarkdownNormalizer,
-} from "../src/codex-markdown.js";
+import { normalizeCodexMarkdown, StreamingMarkdownNormalizer } from "../src/codex-markdown.js";
 
 describe("normalizeCodexMarkdown", () => {
   it("normalizes file:// URI links to [label](/abs/path:line)", () => {
@@ -42,7 +39,8 @@ describe("normalizeCodexMarkdown", () => {
   });
 
   it("does not touch remote HTTP/HTTPS links", () => {
-    const input = "Visit [Google](https://google.com#L10-L20) or [API](http://api.example.com/test).";
+    const input =
+      "Visit [Google](https://google.com#L10-L20) or [API](http://api.example.com/test).";
     const output = normalizeCodexMarkdown(input);
     expect(output).toBe(input);
   });
@@ -71,7 +69,8 @@ describe("normalizeCodexMarkdown", () => {
   });
 
   it("handles multiple links on a single line", () => {
-    const input = "Compare [a.ts](file:///workspace/a.ts:10) with [b.ts](file:///workspace/b.ts#L20-L30).";
+    const input =
+      "Compare [a.ts](file:///workspace/a.ts:10) with [b.ts](file:///workspace/b.ts#L20-L30).";
     const output = normalizeCodexMarkdown(input);
     expect(output).toBe("Compare [a.ts](/workspace/a.ts:10) with [b.ts](/workspace/b.ts:20).");
   });

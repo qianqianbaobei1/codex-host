@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_INTERVAL_MS = 1_000;
+const DEFAULT_INTERVAL_MS = 3_000;
 const RETRY_INTERVAL_MS = 10_000;
 
 export function parseProcessTable(stdout) {

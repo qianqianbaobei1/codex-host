@@ -325,7 +325,11 @@ function parseMarkdownLink(text: string, start: number): ParsedLink | null {
           break;
         }
         parenDepth -= 1;
-      } else if ((char === '"' || char === "'") && cursor > begin && (text[cursor - 1] === " " || text[cursor - 1] === "\t")) {
+      } else if (
+        (char === '"' || char === "'") &&
+        cursor > begin &&
+        (text[cursor - 1] === " " || text[cursor - 1] === "\t")
+      ) {
         // Start of title
         rawDestination = text.slice(begin, cursor - 1).trim();
         const quote = char;
@@ -431,7 +435,10 @@ function parseAndNormalizeDestination(
 
   // Check if remote URL (http:, https:, ftp:, mailto:)
   if (REMOTE_SCHEME_PATTERN.test(trimmed)) {
-    if (!trimmed.toLowerCase().startsWith("file://") && !trimmed.toLowerCase().startsWith("vscode://")) {
+    if (
+      !trimmed.toLowerCase().startsWith("file://") &&
+      !trimmed.toLowerCase().startsWith("vscode://")
+    ) {
       return { resolvedPath: null };
     }
   }
@@ -496,7 +503,10 @@ function parseAndNormalizeDestination(
   }
 
   // Relative path
-  if (cwd && (pathname.startsWith("./") || pathname.startsWith("../") || isLikelyFilePath(pathname))) {
+  if (
+    cwd &&
+    (pathname.startsWith("./") || pathname.startsWith("../") || isLikelyFilePath(pathname))
+  ) {
     const resolved = path.resolve(cwd, pathname);
     return { resolvedPath: normalizeSeparators(resolved), lineNumber };
   }

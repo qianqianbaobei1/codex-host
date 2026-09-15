@@ -92,6 +92,75 @@ pub fn terminate_process_group_instance(
     }
 }
 
+/// Terminates whatever listens on a loopback TCP port.
+///
+/// A Desktop Controller that outlives its Launcher keeps answering on the Control
+/// endpoint forever. The Launcher reaps it before starting, because waiting for a
+/// dead runtime to exit deadlocks every later launch.
+///
+/// Returns `Ok(false)` when no listener could be identified; callers treat that as
+/// "nothing to reap" rather than as a failure.
+pub fn terminate_port_listener(port: u16, force: bool) -> Result<bool, PlatformError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let lsof = if cfg!(target_os = "macos") {
+            "/usr/sbin/lsof"
+        } else {
+            "lsof"
+        };
+        let filter = format!("-iTCP:{port}");
+        let output = match std::process::Command::new(lsof)
+            .args(["-nP", filter.as_str(), "-sTCP:LISTEN", "-t"])
+            .output()
+        {
+            Ok(output) => output,
+            // Images without lsof simply skip reaping.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(PlatformError::Io(error)),
+        };
+        if !output.status.success() {
+            // lsof exits non-zero when the filter matches nothing.
+            return Ok(false);
+        }
+        let mut terminated = false;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(process_id) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            if process_id == std::process::id() {
+                continue;
+            }
+            let snapshot = match process_snapshot(process_id) {
+                Ok(snapshot) => snapshot,
+                Err(PlatformError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            terminate_process_instance(&snapshot, force)?;
+            terminated = true;
+        }
+        Ok(terminated)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (port, force);
+        // Windows reaps stale Launchers through `stop_stale_launcher`, keyed by the
+        // Descriptor PID; an unowned Controller port never blocks a new launch.
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminate_port_listener;
+
+    #[test]
+    fn reports_no_listener_for_a_port_nobody_owns() {
+        // Port 1 is privileged and never a codexhost Control endpoint, so the reap
+        // helper must answer "nothing to clean up" instead of failing.
+        assert!(!terminate_port_listener(1, false).expect("probe unowned port"));
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod windows_tests {
     use super::{process_snapshot, terminate_process_instance};

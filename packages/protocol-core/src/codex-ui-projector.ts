@@ -28,10 +28,7 @@ import {
   projectCodexApprovalRequest,
   type CodexApprovalRequestProjection,
 } from "./codex-approval.js";
-import {
-  StreamingMarkdownNormalizer,
-  normalizeCodexMarkdown,
-} from "./codex-markdown.js";
+import { StreamingMarkdownNormalizer, normalizeCodexMarkdown } from "./codex-markdown.js";
 import {
   projectCodexQuestionRequest,
   type CodexQuestionRequestProjection,

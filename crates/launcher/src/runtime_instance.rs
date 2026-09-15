@@ -27,6 +27,9 @@ const MAX_RUNTIME_DESCRIPTOR_BYTES: usize = 4 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupState {
     RecoverStale,
+    /// A Controller still answers on the Control endpoint although the Launcher
+    /// that published the Descriptor is gone.
+    RecoverOrphanedController,
     CleanLaunch,
     Attach,
 }
@@ -36,6 +39,9 @@ pub struct StartupObservation {
     pub desktop_running: bool,
     pub descriptor_present: bool,
     pub control_endpoint_ready: bool,
+    /// Whether the Descriptor's Launcher is still alive. Only meaningful when
+    /// `descriptor_present` is true.
+    pub launcher_alive: bool,
 }
 
 pub fn classify_startup(observation: StartupObservation) -> StartupState {
@@ -44,6 +50,15 @@ pub fn classify_startup(observation: StartupObservation) -> StartupState {
     }
     if observation.descriptor_present && !observation.control_endpoint_ready {
         return StartupState::RecoverStale;
+    }
+    // The Control endpoint answers but no Launcher owns it any more: the peer is
+    // an orphan. Waiting for it to exit deadlocks every later launch, so the
+    // Launcher must reap it instead.
+    if observation.descriptor_present
+        && observation.control_endpoint_ready
+        && !observation.launcher_alive
+    {
+        return StartupState::RecoverOrphanedController;
     }
     StartupState::CleanLaunch
 }
@@ -345,12 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_only_the_three_startup_states() {
+    fn classifies_the_startup_states() {
         assert_eq!(
             classify_startup(StartupObservation {
                 desktop_running: true,
                 descriptor_present: false,
                 control_endpoint_ready: false,
+                launcher_alive: false,
             }),
             StartupState::Attach
         );
@@ -359,6 +375,7 @@ mod tests {
                 desktop_running: false,
                 descriptor_present: true,
                 control_endpoint_ready: false,
+                launcher_alive: false,
             }),
             StartupState::RecoverStale
         );
@@ -367,7 +384,29 @@ mod tests {
                 desktop_running: false,
                 descriptor_present: false,
                 control_endpoint_ready: false,
+                launcher_alive: false,
             }),
+            StartupState::CleanLaunch
+        );
+    }
+
+    #[test]
+    fn reports_an_orphaned_controller_only_for_a_live_endpoint_without_its_launcher() {
+        let observation = |launcher_alive| StartupObservation {
+            desktop_running: false,
+            descriptor_present: true,
+            control_endpoint_ready: true,
+            launcher_alive,
+        };
+        // The Launcher is gone yet its Controller keeps answering: reap it, or
+        // every later launch fails with "control endpoint is still active".
+        assert_eq!(
+            classify_startup(observation(false)),
+            StartupState::RecoverOrphanedController
+        );
+        // A live Launcher still owns its Controller: launching must keep waiting.
+        assert_eq!(
+            classify_startup(observation(true)),
             StartupState::CleanLaunch
         );
     }

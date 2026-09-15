@@ -52,7 +52,9 @@
   border-radius: 12px;
   min-height: 88px;
   box-sizing: border-box;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .settings-harness-account--expanded {
@@ -251,7 +253,9 @@
   color: var(--settings-text);
   flex: 1 1 180px;
   outline: none;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .settings-harness-create-form__input:focus {
@@ -370,7 +374,9 @@
   border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
-  transition: color 0.15s ease, background-color 0.15s ease;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
 }
 .settings-account-help-button:hover {
   color: var(--settings-text);

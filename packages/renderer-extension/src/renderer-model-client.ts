@@ -206,12 +206,8 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
   startHarnessAccountLogin?(
     input: HarnessAccountLoginStartParams,
   ): Promise<HarnessAccountLoginStartResult>;
-  createHarnessAccount?(
-    input: HarnessAccountCreateParams,
-  ): Promise<HarnessAccountListResult>;
-  deleteHarnessAccount?(
-    input: HarnessAccountDeleteParams,
-  ): Promise<HarnessAccountListResult>;
+  createHarnessAccount?(input: HarnessAccountCreateParams): Promise<HarnessAccountListResult>;
+  deleteHarnessAccount?(input: HarnessAccountDeleteParams): Promise<HarnessAccountListResult>;
   listCodexAccounts(): Promise<CodexAccountListResult>;
   refreshCodexAccounts(): Promise<CodexAccountListResult>;
   createCodexAccount(input: CodexAccountCreateParams): Promise<CodexAccountMutationResult>;

@@ -40,11 +40,30 @@ describe("session handover context", () => {
       { id: "wrapped", turnId: "t-3", role: "user", text: encoded },
     ]);
     expect(roundTripped).toEqual([
-      { id: "handover-wrapped-prior-0", turnId: "handover-wrapped", role: "user", text: "initial goal: build app" },
-      { id: "handover-wrapped-prior-1", turnId: "handover-wrapped", role: "user", text: "recent prompt" },
-      { id: "handover-wrapped-prior-2", turnId: "handover-wrapped", role: "agent", text: "recent response" },
-      { id: "handover-wrapped-current", turnId: "handover-wrapped", role: "user", text: "next question" },
+      {
+        id: "handover-wrapped-prior-0",
+        turnId: "handover-wrapped",
+        role: "user",
+        text: "initial goal: build app",
+      },
+      {
+        id: "handover-wrapped-prior-1",
+        turnId: "handover-wrapped",
+        role: "user",
+        text: "recent prompt",
+      },
+      {
+        id: "handover-wrapped-prior-2",
+        turnId: "handover-wrapped",
+        role: "agent",
+        text: "recent response",
+      },
+      {
+        id: "handover-wrapped-current",
+        turnId: "handover-wrapped",
+        role: "user",
+        text: "next question",
+      },
     ]);
   });
 });
-

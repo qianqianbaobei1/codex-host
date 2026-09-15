@@ -538,4 +538,3 @@ test("renders full accounts management page with independent cards, Grok expand,
   await grokRow.scrollIntoViewIfNeeded();
   await page.screenshot({ path: "test-results/full-accounts-expanded.png" });
 });
-

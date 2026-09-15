@@ -342,7 +342,8 @@ export function mountRendererAgentPicker(
   menu.style.inset = "auto";
   menu.style.width = `${AGENT_MENU_WIDTH}px`;
   menu.style.padding = "5px";
-  menu.style.border = "1px solid light-dark(#E6E6E6, color-mix(in srgb, CanvasText 14%, transparent))";
+  menu.style.border =
+    "1px solid light-dark(#E6E6E6, color-mix(in srgb, CanvasText 14%, transparent))";
   menu.style.borderRadius = "10px";
   menu.style.background = "light-dark(#FFFFFF, Canvas)";
   menu.style.color = "light-dark(#171717, CanvasText)";
@@ -534,7 +535,8 @@ export function mountRendererAgentPicker(
             control.style.cursor = "pointer";
             control.style.transition = "background 120ms ease-out";
             control.addEventListener("pointerenter", () => {
-              if (!control.disabled) control.style.background = "light-dark(#EEEEEE, rgba(255, 255, 255, 0.12))";
+              if (!control.disabled)
+                control.style.background = "light-dark(#EEEEEE, rgba(255, 255, 255, 0.12))";
             });
             control.addEventListener("pointerleave", () => {
               control.style.background = "transparent";

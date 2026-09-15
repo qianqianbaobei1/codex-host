@@ -123,4 +123,3 @@ export const harnessAccountDeleteParamsSchema = z
   })
   .strict();
 export type HarnessAccountDeleteParams = z.infer<typeof harnessAccountDeleteParamsSchema>;
-

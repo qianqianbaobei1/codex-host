@@ -6464,6 +6464,18 @@ export class AppServerHost {
   }
 
   #diagnose(error: unknown): void {
-    this.#options.diagnosticOutput.write(`codexhost Host Runtime: ${errorMessage(error)}\n`);
+    const message = `codexhost Host Runtime: ${errorMessage(error)}\n`;
+    this.#options.diagnosticOutput.write(message);
+    try {
+      const logPath =
+        process.env.CODEXHOST_RUNTIME_LOG_PATH || path.join(tmpdir(), "codexhost-runtime.log");
+      appendFileSync(
+        logPath,
+        `[${new Date().toISOString()}] (pid:${process.pid}) ${message}`,
+        "utf8",
+      );
+    } catch {
+      // Diagnostic logging must not crash the host runtime.
+    }
   }
 }

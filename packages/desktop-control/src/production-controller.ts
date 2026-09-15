@@ -341,8 +341,16 @@ export async function runDesktopController(
       });
     }
   } finally {
-    await attachmentServer?.close();
-    await operation;
+    await attachmentServer?.close().catch(() => undefined);
+    let operationTimeout: NodeJS.Timeout | undefined;
+    await Promise.race([
+      operation,
+      new Promise<void>((resolve) => {
+        operationTimeout = setTimeout(resolve, 2_000);
+        operationTimeout.unref?.();
+      }),
+    ]).catch(() => undefined);
+    if (operationTimeout) clearTimeout(operationTimeout);
     resetSession();
   }
 }
