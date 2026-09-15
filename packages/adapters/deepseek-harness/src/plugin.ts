@@ -21,3 +21,11 @@ export function createHarnessAdapter(context: HarnessPluginContext): DeepSeekHar
       : {}),
   });
 }
+
+export async function warmup(adapter: Pick<DeepSeekHarnessAdapter, "inspect">): Promise<void> {
+  try {
+    await adapter.inspect();
+  } catch {
+    /* Optional prefetch cannot fail Host startup. */
+  }
+}

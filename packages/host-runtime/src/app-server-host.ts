@@ -3369,7 +3369,7 @@ export class AppServerHost {
       const refreshed = await inspectHarnessAccounts(
         this.#externalAdapters.values(),
         this.#pluginDescriptors,
-        undefined,
+        30_000,
         true,
       );
       const merged = new Map<string, HarnessAccountListResult["accounts"][number]>();

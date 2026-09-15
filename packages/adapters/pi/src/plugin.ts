@@ -11,3 +11,11 @@ export function createHarnessAdapter(context: HarnessPluginContext): PiAdapter {
     environment,
   });
 }
+
+export async function warmup(adapter: Pick<PiAdapter, "inspect">): Promise<void> {
+  try {
+    await adapter.inspect();
+  } catch {
+    /* Optional prefetch cannot fail Host startup. */
+  }
+}

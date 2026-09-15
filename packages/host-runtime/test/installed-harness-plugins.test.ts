@@ -3,7 +3,11 @@ import { pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 import type { HarnessInspection } from "@codexhost/harness-adapter";
+import { warmup as warmupAntigravity } from "@codexhost/adapter-antigravity/plugin";
 import { warmup as warmupClaude } from "@codexhost/adapter-claude-code/plugin";
+import { warmup as warmupDeepSeek } from "@codexhost/adapter-deepseek-harness/plugin";
+import { warmup as warmupGrok } from "@codexhost/adapter-grok/plugin";
+import { warmup as warmupPi } from "@codexhost/adapter-pi/plugin";
 
 import { installedHarnessPluginOptions, loadHarnessPlugins } from "../src/index.js";
 
@@ -39,20 +43,28 @@ function load(environment: NodeJS.ProcessEnv = {}) {
 }
 
 describe("installed Harness composition", () => {
-  it("preserves Claude Code best-effort asynchronous prefetch inside the plugin", async () => {
-    const deferred = Promise.withResolvers<HarnessInspection>();
-    const inspect = vi.fn(() => deferred.promise);
-    const prefetch = warmupClaude({ inspect });
-    expect(inspect).toHaveBeenCalledOnce();
-    deferred.resolve(unavailable);
-    await expect(prefetch).resolves.toBeUndefined();
-    await expect(
-      warmupClaude({
-        inspect: async () => {
-          throw new Error("synthetic");
-        },
-      }),
-    ).resolves.toBeUndefined();
+  it("preserves best-effort asynchronous prefetch inside plugin warmup exports", async () => {
+    for (const [name, warmupFn] of [
+      ["Claude Code", warmupClaude],
+      ["Antigravity", warmupAntigravity],
+      ["Pi", warmupPi],
+      ["DeepSeek", warmupDeepSeek],
+      ["Grok", warmupGrok],
+    ] as const) {
+      const deferred = Promise.withResolvers<HarnessInspection>();
+      const inspect = vi.fn(() => deferred.promise);
+      const prefetch = warmupFn({ inspect } as never);
+      expect(inspect, `${name} warmup should call inspect`).toHaveBeenCalledOnce();
+      deferred.resolve(unavailable);
+      await expect(prefetch).resolves.toBeUndefined();
+      await expect(
+        warmupFn({
+          inspect: async () => {
+            throw new Error("synthetic");
+          },
+        } as never),
+      ).resolves.toBeUndefined();
+    }
   });
 
   // Cold bundle imports can exceed Vitest's 5s default on CI; the loader retains its 10s budget.

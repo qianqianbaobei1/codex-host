@@ -11,3 +11,11 @@ export function createHarnessAdapter(context: HarnessPluginContext): GrokAdapter
     environment,
   });
 }
+
+export async function warmup(adapter: Pick<GrokAdapter, "inspect">): Promise<void> {
+  try {
+    await adapter.inspect();
+  } catch {
+    /* Optional prefetch cannot fail Host startup. */
+  }
+}

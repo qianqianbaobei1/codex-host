@@ -19,3 +19,11 @@ export function createHarnessAdapter(context: HarnessPluginContext): Antigravity
     manageDarwinKeychain: context.platform === "darwin",
   });
 }
+
+export async function warmup(adapter: Pick<AntigravityAdapter, "inspect">): Promise<void> {
+  try {
+    await adapter.inspect();
+  } catch {
+    /* Optional prefetch cannot fail Host startup. */
+  }
+}
