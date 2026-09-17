@@ -26,6 +26,23 @@ export type {
   RendererContractAuditInspection,
 } from "./contract-audit.js";
 export {
+  FUNCTIONAL_HEALTH_SCHEMA_VERSION,
+  DEFAULT_FUNCTIONAL_HEALTH_THRESHOLDS,
+  createFunctionalHealthTracker,
+  describeFunctionalHealth,
+  functionalHealthPath,
+  isFunctionalHealthUsable,
+  parseFunctionalHealthRecord,
+  projectFunctionalHealthState,
+  writeFunctionalHealthRecord,
+} from "./functional-health.js";
+export type {
+  FunctionalHealthRecord,
+  FunctionalHealthState,
+  FunctionalHealthThresholds,
+  FunctionalHealthTracker,
+} from "./functional-health.js";
+export {
   CODEXHOST_LOG_DIR_ENV,
   codexhostLogDirectory,
   codexhostLogPath,

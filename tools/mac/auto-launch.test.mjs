@@ -23,6 +23,7 @@ import {
   launchManagedCodex,
   openLaunchLog,
   parseProcessTable,
+  readFunctionalHealth,
   recoverUnmanagedDesktop,
   retryDelayForAttempt,
   run,
@@ -287,6 +288,77 @@ describe("codexhost macOS auto-launch watcher", () => {
       const content = readFileSync(logPath, "utf8");
       expect(content).toContain("auto-launch error: Renderer injection failed 2 times in a row");
       expect(statSync(logPath).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces a live controller that reports degraded functional health", async () => {
+    const options = {
+      desktopExecutable,
+      descriptorPath: "/tmp/runtime.json",
+      launcher: launcherExecutable,
+      healthPath: "/tmp/functional-health.json",
+    };
+    const dependencies = {
+      processTable: async () => [
+        { pid: 200, command: desktopExecutable },
+        { pid: 201, command: `${launcherExecutable} launch` },
+      ],
+      readDescriptor: async () => ({ launcher_pid: 201 }),
+      readState: async () => ({ consecutiveLaunchFailures: 0, degradedUntil: 0 }),
+      writeState: async () => undefined,
+      readHealth: async () => ({
+        state: "degraded",
+        lastProbeAt: Date.now(),
+        consecutiveFailures: 4,
+      }),
+    };
+    // A live launcher is not proof of a working integration.
+    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("managed-degraded");
+  });
+
+  it("treats a stale health record as no evidence", async () => {
+    const options = {
+      desktopExecutable,
+      descriptorPath: "/tmp/runtime.json",
+      launcher: launcherExecutable,
+      healthPath: "/tmp/functional-health.json",
+    };
+    const dependencies = {
+      processTable: async () => [
+        { pid: 200, command: desktopExecutable },
+        { pid: 201, command: `${launcherExecutable} launch` },
+      ],
+      readDescriptor: async () => ({ launcher_pid: 201 }),
+      readState: async () => ({ consecutiveLaunchFailures: 0, degradedUntil: 0 }),
+      writeState: async () => undefined,
+      // Written ten minutes ago: it says nothing about the process running now.
+      readHealth: async () => ({
+        state: "degraded",
+        lastProbeAt: Date.now() - 10 * 60_000,
+        consecutiveFailures: 4,
+      }),
+    };
+    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("already-managed");
+  });
+
+  it("reads a health record defensively", () => {
+    const directory = join(tmpdir(), `codexhost-health-read-${process.pid}-${Date.now()}`);
+    const file = join(directory, "functional-health.json");
+    try {
+      mkdirSync(directory, { recursive: true });
+      expect(readFunctionalHealth(file)).toBeNull();
+      writeFileSync(file, "not json");
+      expect(readFunctionalHealth(file)).toBeNull();
+      writeFileSync(file, JSON.stringify({ state: "healthy" }));
+      expect(readFunctionalHealth(file)).toBeNull();
+      writeFileSync(file, JSON.stringify({ state: "healthy", lastProbeAt: 12 }));
+      expect(readFunctionalHealth(file)).toEqual({
+        state: "healthy",
+        lastProbeAt: 12,
+        consecutiveFailures: 0,
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

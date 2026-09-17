@@ -1,5 +1,14 @@
+import { WORKSPACE_CONTRACT_VERSION } from "@codexhost/shared-contracts";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+
+import { codexhostLogDirectory } from "./diagnostic-log.js";
+import {
+  createFunctionalHealthTracker,
+  describeFunctionalHealth,
+  functionalHealthPath,
+  writeFunctionalHealthRecord,
+} from "./functional-health.js";
 
 import {
   startControllerAttachmentServer,
@@ -229,13 +238,39 @@ export async function runDesktopController(
   let session: RendererCdpControlSession | undefined;
   let nextRecoveryAt = 0;
   let recoveryDelayMs = RECOVERY_RETRY_INITIAL_MS;
+  // Functional health is published on a side channel: the cross-process readiness handshake can
+  // only ever report "compatible", so "process alive but no longer working" needs its own signal
+  // rather than being inferred from process liveness.
+  const healthStartedAt = now();
+  const healthTracker = createFunctionalHealthTracker({
+    controllerPid: process.pid,
+    controllerGeneration: `${process.pid}-${healthStartedAt}`,
+    sessionId: options.attachmentNonce,
+    startedAt: healthStartedAt,
+    codexhostVersion: `contract-${WORKSPACE_CONTRACT_VERSION}`,
+    now,
+  });
+  const healthFile = functionalHealthPath(codexhostLogDirectory());
+  const publishHealth = (next: () => ReturnType<typeof healthTracker.current>): void => {
+    try {
+      const record = next();
+      writeFunctionalHealthRecord(healthFile, record);
+      // Only announce the transition that matters; a healthy probe would be pure noise.
+      if (record.state === "degraded") console.error(describeFunctionalHealth(record));
+    } catch (error) {
+      // Health reporting must never take the Controller down.
+      startupTrace("functional health could not be published", error);
+    }
+  };
   const recordRecoveryFailure = (): void => {
     nextRecoveryAt = now() + recoveryDelayMs;
     recoveryDelayMs = Math.min(recoveryDelayMs * 2, RECOVERY_RETRY_MAX_MS);
+    publishHealth(() => healthTracker.recordFailure());
   };
   const recordRecoverySuccess = (): void => {
     nextRecoveryAt = 0;
     recoveryDelayMs = RECOVERY_RETRY_INITIAL_MS;
+    publishHealth(() => healthTracker.recordSuccess());
   };
   const createSession = async (): Promise<RendererCdpControlSession> => {
     startupTrace("reading Renderer bundle");

@@ -24,6 +24,9 @@ const MAX_RETRY_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_LOG_PATH = `${process.env.HOME ?? ""}/Library/Logs/codexhost/launcher.log`;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const DEFAULT_STATE_PATH = `${process.env.HOME ?? ""}/Library/Application Support/codexhost/auto-launch-state.json`;
+const DEFAULT_HEALTH_PATH = `${process.env.HOME ?? ""}/Library/Logs/codexhost/functional-health.json`;
+/** How stale a health record may be before it stops being evidence about the current run. */
+const FUNCTIONAL_HEALTH_MAX_AGE_MS = 5 * 60_000;
 // A managed launch is only confirmed once the runtime descriptor names a live launcher. Two
 // unconfirmed attempts in a row mean injection is broken, not slow.
 const MAX_UNCONFIRMED_LAUNCHES = 2;
@@ -71,6 +74,31 @@ export function readAutoLaunchState(statePath) {
 export function writeAutoLaunchState(statePath, state) {
   mkdirSync(dirname(statePath), { recursive: true });
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+}
+
+/**
+ * Read the Controller's functional-health record.
+ *
+ * Process liveness cannot distinguish "the Controller is running" from "the Controller is running
+ * but its renderer integration died hours ago". The Controller publishes that separately, because
+ * the cross-process readiness handshake can only ever say "compatible".
+ */
+export function readFunctionalHealth(healthPath) {
+  try {
+    const parsed = JSON.parse(readFileSync(healthPath, "utf8"));
+    if (typeof parsed?.state !== "string") return null;
+    if (!Number.isSafeInteger(parsed?.lastProbeAt)) return null;
+    return {
+      state: parsed.state,
+      lastProbeAt: parsed.lastProbeAt,
+      consecutiveFailures: Number.isSafeInteger(parsed?.consecutiveFailures)
+        ? parsed.consecutiveFailures
+        : 0,
+    };
+  } catch {
+    // No record yet, or an unreadable one, is not itself a failure signal.
+    return null;
+  }
 }
 
 /**
@@ -252,6 +280,15 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
     if (state.consecutiveLaunchFailures !== 0 || state.degradedUntil !== 0) {
       await writeState(statePath, { consecutiveLaunchFailures: 0, degradedUntil: 0 });
     }
+    // A live launcher is not proof of a working integration. Report the Controller's own
+    // functional verdict so "alive but broken" is visible instead of looking like all-clear.
+    const health = await (dependencies.readHealth ?? readFunctionalHealth)(options.healthPath);
+    if (
+      health?.state === "degraded" &&
+      Date.now() - health.lastProbeAt <= FUNCTIONAL_HEALTH_MAX_AGE_MS
+    ) {
+      return "managed-degraded";
+    }
     return "already-managed";
   }
   if (anyLauncherRunning(entries, options.launcher)) return "already-launching";
@@ -301,6 +338,7 @@ export function parseOptions(arguments_) {
     descriptorPath: `${process.env.HOME ?? ""}/Library/Application Support/codexhost/desktop-runtime-v1.json`,
     logPath: DEFAULT_LOG_PATH,
     statePath: DEFAULT_STATE_PATH,
+    healthPath: DEFAULT_HEALTH_PATH,
     root: process.cwd(),
     path: process.env.PATH ?? "/usr/bin:/bin",
   };
@@ -347,6 +385,7 @@ export function parseOptions(arguments_) {
         "root",
         "path",
         "statePath",
+        "healthPath",
       ].includes(name)
     )
       continue;
@@ -376,16 +415,27 @@ export async function run(options, dependencies = {}) {
   let inFlight = null;
   let nextAttemptAt = 0;
   let consecutiveFailures = 0;
+  let lastReportedResult = null;
   const tick = async () => {
     if (inFlight || Date.now() < nextAttemptAt) return;
+    let result;
     try {
-      const result = await checkAndMaybeLaunch(options, dependencies);
+      result = await checkAndMaybeLaunch(options, dependencies);
       if (result === "launched") {
         consecutiveFailures = 0;
         nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
         logger("detected an unmanaged Codex Desktop; started codexhost");
       } else if (result === "would-launch") {
         logger("dry run: an unmanaged Codex Desktop would start codexhost");
+      } else if (result === "managed-degraded") {
+        // A live Controller whose integration is broken. Announce the transition once rather than
+        // every tick, and do not relaunch: health is published by the Controller itself, so
+        // launching another one cannot be inferred to help.
+        if (lastReportedResult !== "managed-degraded") {
+          errorLogger(
+            "Codex Host controller is running but reports degraded functional health; external models may be unavailable in this window",
+          );
+        }
       } else if (result === "degraded") {
         consecutiveFailures = 0;
         // The retry window lives in the persisted state, not here: an in-memory backoff would
@@ -402,6 +452,7 @@ export async function run(options, dependencies = {}) {
         );
       }
     } catch (error) {
+      result = "check-failed";
       consecutiveFailures += 1;
       const delay = retryDelayForAttempt(consecutiveFailures);
       nextAttemptAt = Date.now() + delay;
@@ -409,6 +460,7 @@ export async function run(options, dependencies = {}) {
         `${error instanceof Error ? error.message : String(error)} (attempt ${consecutiveFailures}, retrying in ${Math.round(delay / 1000)}s)`,
       );
     }
+    lastReportedResult = result;
   };
   inFlight = tick().finally(() => {
     inFlight = null;
