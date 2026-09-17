@@ -131,6 +131,26 @@ const INSTALL_RENDERER_POLICY_FUNCTION = `function(requestClient, hostId, prewar
 }`;
 const REQUEST_MANAGER_WAIT_TIMEOUT_MS = 60_000;
 const REQUEST_MANAGER_POLL_INTERVAL_MS = 25;
+/**
+ * Upper bound for the backoff below. The wait window is unchanged — this is CPU relief, not a fix
+ * for `ambiguous`: if two composers are still present 60 seconds in, scanning 2400 times at 25 ms
+ * and 240 times at 250 ms both fail. Backing off only stops a failing install from re-walking the
+ * whole fiber neighbourhood thousands of times.
+ */
+const REQUEST_MANAGER_MAX_POLL_INTERVAL_MS = 250;
+
+/**
+ * 25 → 50 → 100 → 250 ms, capped. Readiness is a *persistent* state (the composer stays unique and
+ * the manager keeps existing once created), so spacing the probes out cannot miss it; the worst
+ * case is discovering readiness 225 ms later, inside a window the user is already waiting on.
+ */
+export function requestManagerPollInterval(attempt: number): number {
+  const exponent = Math.max(0, Math.floor(attempt) - 1);
+  return Math.min(
+    REQUEST_MANAGER_POLL_INTERVAL_MS * 2 ** exponent,
+    REQUEST_MANAGER_MAX_POLL_INTERVAL_MS,
+  );
+}
 
 function directRendererInstaller(): string {
   return `(async () => {
@@ -177,6 +197,7 @@ async function waitForDraftPrewarmPolicy(
   expression: string,
 ): Promise<RendererDraftPrewarmPolicyStatus> {
   const deadline = Date.now() + REQUEST_MANAGER_WAIT_TIMEOUT_MS;
+  let attempt = 0;
   while (true) {
     try {
       const value = await evaluate(expression);
@@ -188,8 +209,9 @@ async function waitForDraftPrewarmPolicy(
       const message = error instanceof Error ? error.message : String(error);
       const remaining = deadline - Date.now();
       if (!message.includes("Renderer request manager is ambiguous") || remaining <= 0) throw error;
+      attempt += 1;
       await new Promise<void>((resolve) => {
-        setTimeout(resolve, Math.min(REQUEST_MANAGER_POLL_INTERVAL_MS, remaining));
+        setTimeout(resolve, Math.min(requestManagerPollInterval(attempt), remaining));
       });
     }
   }
