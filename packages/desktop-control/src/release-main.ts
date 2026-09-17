@@ -1,3 +1,4 @@
+import { timestampedLogLine } from "./diagnostic-log.js";
 import { parseDesktopControllerArguments, runDesktopController } from "./production-controller.js";
 
 const abort = new AbortController();
@@ -42,7 +43,9 @@ try {
 } catch (error) {
   if (forceExitTimer) clearTimeout(forceExitTimer);
   console.error(
-    `codexhost Desktop Controller: ${error instanceof Error ? error.message : String(error)}`,
+    timestampedLogLine(
+      `codexhost Desktop Controller: ${error instanceof Error ? error.message : String(error)}`,
+    ),
   );
   process.exit(1);
 } finally {

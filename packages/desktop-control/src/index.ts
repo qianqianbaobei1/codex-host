@@ -25,6 +25,13 @@ export type {
   InspectDesktopContractsOptions,
   RendererContractAuditInspection,
 } from "./contract-audit.js";
+export {
+  CODEXHOST_LOG_DIR_ENV,
+  codexhostLogDirectory,
+  codexhostLogPath,
+  timestampedLogLine,
+} from "./diagnostic-log.js";
+export type { CodexhostLogComponent } from "./diagnostic-log.js";
 export { inspectRendererDom, validateRendererDomInspection } from "./renderer-dom.js";
 export {
   createRendererCdpControlSession,

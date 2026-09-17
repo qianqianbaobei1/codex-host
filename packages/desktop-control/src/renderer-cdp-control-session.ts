@@ -1,3 +1,4 @@
+import { timestampedLogLine } from "./diagnostic-log.js";
 import {
   CdpClient,
   listCdpTargets,
@@ -190,13 +191,17 @@ function reportRendererDiagnostics(renderer: RendererCdpClient): void {
     )?.exceptionDetails;
     const description = details?.exception?.description ?? details?.text ?? "unknown exception";
     // Only the first line: V8 stacks are multi-line and would flood the log.
-    console.error(`codexhost renderer exception: ${description.split("\n")[0]}`);
+    console.error(
+      timestampedLogLine(`codexhost renderer exception: ${description.split("\n")[0]}`),
+    );
   });
   renderer.on("Log.entryAdded", (params) => {
     const entry = (params as { entry?: { level?: string; source?: string; text?: string } })?.entry;
     if (entry?.level !== "error") return;
     const text = (entry.text ?? "").slice(0, 500);
-    console.error(`codexhost renderer log [${entry.source ?? "unknown"}]: ${text}`);
+    console.error(
+      timestampedLogLine(`codexhost renderer log [${entry.source ?? "unknown"}]: ${text}`),
+    );
   });
 }
 
@@ -268,7 +273,9 @@ async function installTarget(
     // Without this the failure only surfaced as an exit code, so a Desktop that never became
     // controllable left the user staring at a blank window with nothing to diagnose.
     console.error(
-      `codexhost renderer install failed for ${target.url}: ${error instanceof Error ? error.message : String(error)}`,
+      timestampedLogLine(
+        `codexhost renderer install failed for ${target.url}: ${error instanceof Error ? error.message : String(error)}`,
+      ),
     );
     await uninstallRendererIntegration(renderer);
     renderer.close();

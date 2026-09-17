@@ -1,4 +1,5 @@
 import { CdpClient, listCdpTargets, type CdpFetch, type CdpTarget } from "./cdp-client.js";
+import { timestampedLogLine } from "./diagnostic-log.js";
 import {
   installMainProcessTitlePolicy,
   markRendererTitlePolicyReady,
@@ -501,7 +502,9 @@ const startupTraceStartedAt = Date.now();
 function startupTrace(stage: string): void {
   if (process.env.CODEXHOST_STARTUP_TRACE !== "1") return;
   console.error(
-    `[codexhost startup +${Date.now() - startupTraceStartedAt}ms] renderer-session: ${stage}`,
+    timestampedLogLine(
+      `[codexhost startup +${Date.now() - startupTraceStartedAt}ms] renderer-session: ${stage}`,
+    ),
   );
 }
 

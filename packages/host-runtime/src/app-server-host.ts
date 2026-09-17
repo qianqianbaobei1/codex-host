@@ -4,7 +4,7 @@ import type { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { codexhostLogPath } from "@codexhost/desktop-control";
 import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -1939,8 +1939,7 @@ export class AppServerHost {
   async #requestOfficial(method: string, params: JsonObject): Promise<JsonObject> {
     const rawThreadId = typeof params.threadId === "string" ? params.threadId : null;
     const threadId = rawThreadId ? this.#threadAliases.resolve(rawThreadId) : null;
-    const effectiveParams =
-      threadId && threadId !== rawThreadId ? { ...params, threadId } : params;
+    const effectiveParams = threadId && threadId !== rawThreadId ? { ...params, threadId } : params;
     return typeof effectiveParams.threadId === "string"
       ? this.#codexRuntimePool.requestForThread(effectiveParams.threadId, method, effectiveParams)
       : this.#codexRuntimePool.requestActive(method, effectiveParams);
@@ -3829,7 +3828,11 @@ export class AppServerHost {
 
     if (!harnessId && rawModel && rawModel.startsWith("codexhost/")) {
       try {
-        const route = decodeCreateRoute({ id: request.id, method: "thread/start", params: { model: rawModel } });
+        const route = decodeCreateRoute({
+          id: request.id,
+          method: "thread/start",
+          params: { model: rawModel },
+        });
         if (route && route.harnessId !== "codex") {
           harnessId = route.harnessId;
           model = route.model;
@@ -3844,7 +3847,9 @@ export class AppServerHost {
     }
 
     if (!harnessId || !cwd) {
-      await this.#writer.json(rpcError(request, -32602, "Draft prepare requires harnessId and cwd"));
+      await this.#writer.json(
+        rpcError(request, -32602, "Draft prepare requires harnessId and cwd"),
+      );
       return;
     }
     const adapter = this.#externalAdapters.get(harnessId as ExternalHarnessId);
@@ -3854,15 +3859,17 @@ export class AppServerHost {
     }
 
     if (typeof (adapter as unknown as { reserveDraft?: unknown }).reserveDraft === "function") {
-      void (adapter as unknown as {
-        reserveDraft(input: {
-          cwd: string;
-          model?: HarnessModelRef;
-          thinkingOptionId?: HarnessThinkingOptionId;
-          permissionModeId?: HarnessPermissionModeId;
-          accountId?: string;
-        }): Promise<void>;
-      })
+      void (
+        adapter as unknown as {
+          reserveDraft(input: {
+            cwd: string;
+            model?: HarnessModelRef;
+            thinkingOptionId?: HarnessThinkingOptionId;
+            permissionModeId?: HarnessPermissionModeId;
+            accountId?: string;
+          }): Promise<void>;
+        }
+      )
         .reserveDraft({
           cwd,
           ...(model ? { model } : {}),
@@ -3893,7 +3900,11 @@ export class AppServerHost {
 
     if (!harnessId && rawModel && rawModel.startsWith("codexhost/")) {
       try {
-        const route = decodeCreateRoute({ id: request.id, method: "thread/start", params: { model: rawModel } });
+        const route = decodeCreateRoute({
+          id: request.id,
+          method: "thread/start",
+          params: { model: rawModel },
+        });
         if (route && route.harnessId !== "codex") {
           harnessId = route.harnessId;
           model = route.model;
@@ -3910,15 +3921,17 @@ export class AppServerHost {
     if (harnessId && cwd) {
       const adapter = this.#externalAdapters.get(harnessId as ExternalHarnessId);
       if (typeof (adapter as unknown as { releaseDraft?: unknown })?.releaseDraft === "function") {
-        (adapter as unknown as {
-          releaseDraft(input: {
-            cwd: string;
-            model?: HarnessModelRef;
-            thinkingOptionId?: HarnessThinkingOptionId;
-            permissionModeId?: HarnessPermissionModeId;
-            accountId?: string;
-          }): void;
-        }).releaseDraft({
+        (
+          adapter as unknown as {
+            releaseDraft(input: {
+              cwd: string;
+              model?: HarnessModelRef;
+              thinkingOptionId?: HarnessThinkingOptionId;
+              permissionModeId?: HarnessPermissionModeId;
+              accountId?: string;
+            }): void;
+          }
+        ).releaseDraft({
           cwd,
           ...(model ? { model } : {}),
           ...(thinkingOptionId ? { thinkingOptionId } : {}),
@@ -3929,7 +3942,6 @@ export class AppServerHost {
     }
     await this.#writer.json(rpcEnvelope(request, { result: { status: "released" } }));
   }
-
 
   async #selectThreadModel(request: JsonRpcRequest): Promise<void> {
     const params = threadModelSelectParamsSchema.safeParse(request.params);
@@ -4443,9 +4455,9 @@ export class AppServerHost {
             activePermissionProfile: null,
             runtimeWorkspaceRoots:
               Array.isArray(params.runtimeWorkspaceRoots) && params.runtimeWorkspaceRoots.length > 0
-                ? (params.runtimeWorkspaceRoots.includes(cwd)
-                    ? params.runtimeWorkspaceRoots
-                    : [cwd, ...params.runtimeWorkspaceRoots])
+                ? params.runtimeWorkspaceRoots.includes(cwd)
+                  ? params.runtimeWorkspaceRoots
+                  : [cwd, ...params.runtimeWorkspaceRoots]
                 : [cwd],
             instructionSources: [],
           },
@@ -4739,11 +4751,7 @@ export class AppServerHost {
         } catch (error) {
           this.#diagnose(error);
           await this.#writer.json(
-            rpcError(
-              request,
-              -32078,
-              `External Thread adoption failed: ${errorMessage(error)}`,
-            ),
+            rpcError(request, -32078, `External Thread adoption failed: ${errorMessage(error)}`),
           );
           return;
         }
@@ -6672,13 +6680,13 @@ export class AppServerHost {
   #lastTurnFailed(lastTurn: unknown): boolean {
     return isRecord(lastTurn) && lastTurn.status === "failed";
   }
-  /** Trace how a desktop thread/goal RPC was routed (stderr + a stable temp file). */
+  /** Trace how a desktop thread/goal RPC was routed (stderr + the shared host-runtime log). */
   #traceGoal(action: string, method: string, threadId: string | null | undefined): void {
     const line = `codexhost goal-${action} §threads ${method} threadId=${JSON.stringify(threadId ?? null)} pid=${process.pid}`;
     void this.#options.diagnosticOutput.write(`${line}\n`);
     try {
       appendFileSync(
-        `${tmpdir()}/codexhost-goal-diag.log`,
+        process.env.CODEXHOST_RUNTIME_LOG_PATH || codexhostLogPath("host-runtime"),
         `${new Date().toISOString()} ${line}\n`,
         "utf8",
       );
@@ -6888,8 +6896,7 @@ export class AppServerHost {
     const message = `codexhost Host Runtime: ${errorMessage(error)}\n`;
     this.#options.diagnosticOutput.write(message);
     try {
-      const logPath =
-        process.env.CODEXHOST_RUNTIME_LOG_PATH || path.join(tmpdir(), "codexhost-runtime.log");
+      const logPath = process.env.CODEXHOST_RUNTIME_LOG_PATH || codexhostLogPath("host-runtime");
       appendFileSync(
         logPath,
         `[${new Date().toISOString()}] (pid:${process.pid}) ${message}`,

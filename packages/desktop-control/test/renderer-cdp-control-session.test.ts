@@ -102,9 +102,15 @@ describe("Renderer CDP Control Session", () => {
         entry: { level: "warning", source: "deprecation", text: "noisy" },
       });
 
-      expect(errorSpy).toHaveBeenCalledWith("codexhost renderer exception: TypeError: boom");
-      expect(errorSpy).toHaveBeenCalledWith("codexhost renderer log [security]: CSP");
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("codexhost renderer exception: TypeError: boom"),
+      );
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("codexhost renderer log [security]: CSP"),
+      );
       expect(errorSpy).toHaveBeenCalledTimes(2);
+      // Every diagnostic line carries a timestamp so a failure can be placed in time.
+      expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(/^\[\d{4}-\d{2}-\d{2}T/);
     } finally {
       errorSpy.mockRestore();
       session.close();

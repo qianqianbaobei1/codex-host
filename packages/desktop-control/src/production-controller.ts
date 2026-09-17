@@ -47,6 +47,8 @@ const RENDERER_CSP_BOOTSTRAP =
   "globalThis.__zod_globalConfig ??= {}; globalThis.__zod_globalConfig.jitless = true;";
 const DESKTOP_CONTROLLER_READINESS_MAX_BYTES = 512;
 const TRANSIENT_INSTALL_ATTEMPTS = 3;
+import { timestampedLogLine } from "./diagnostic-log.js";
+
 const TRANSIENT_INSTALL_RETRY_MS = 250;
 const RECOVERY_RETRY_INITIAL_MS = 30_000;
 const RECOVERY_RETRY_MAX_MS = 300_000;
@@ -57,7 +59,9 @@ function startupTrace(stage: string, detail?: unknown): void {
   const suffix =
     detail === undefined ? "" : `: ${detail instanceof Error ? detail.message : String(detail)}`;
   console.error(
-    `[codexhost startup +${Date.now() - startupTraceStartedAt}ms] controller: ${stage}${suffix}`,
+    timestampedLogLine(
+      `[codexhost startup +${Date.now() - startupTraceStartedAt}ms] controller: ${stage}${suffix}`,
+    ),
   );
 }
 
