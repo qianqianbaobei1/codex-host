@@ -110,7 +110,7 @@ describe("functional health tracker", () => {
   });
 
   it("recovers from degraded when a later probe succeeds", () => {
-    const { health, advance } = tracker();
+    const { health } = tracker();
     health.recordSuccess();
     for (let i = 0; i < 3; i += 1) health.recordFailure();
     expect(health.current().state).toBe("degraded");
