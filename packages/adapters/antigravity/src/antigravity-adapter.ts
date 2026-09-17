@@ -139,11 +139,7 @@ import {
   AntigravityDraftReservationPool,
   type DraftReservationKeyParams,
 } from "./draft-reservation.js";
-import {
-  sharedSessionStoreRoot,
-  accountSessionStoreDirectory,
-} from "./session-store.js";
-
+import { sharedSessionStoreRoot, accountSessionStoreDirectory } from "./session-store.js";
 
 export interface AntigravityAdapterOptions {
   command?: string;
@@ -200,9 +196,48 @@ export interface AntigravityCliTransportLike {
 
 const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
 const execFileAsync = promisify(execFile);
+
+/**
+ * Reject a local IO promise that never settles. Kept local to the adapter so it does not depend on
+ * host-runtime (which depends on this package, not the other way around).
+ */
+export function withBoundedIo<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  operation: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${operation} exceeded ${milliseconds}ms`));
+    }, milliseconds);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
 const DEFAULT_MODELS_TIMEOUT_MS = 30_000;
 const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Bound for the local IO a Turn performs around the native call (reading the plugin skill prompt,
+ * appending the ledger turn). These are small, local file operations, so a generous ceiling still
+ * never trips on a healthy machine.
+ *
+ * The reason it must exist at all: `#active` is only cleared after `#runTurn` settles. An IO await
+ * that hangs instead of failing therefore keeps the Turn active forever — the Session never arms
+ * its idle timer (so the native process is never reclaimed) and every later Stop is rejected with
+ * "must reference the active Turn". The transport already bounds the native turn itself; this
+ * bounds everything wrapped around it.
+ */
+const TURN_LOCAL_IO_TIMEOUT_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
 // Quota is telemetry; it must not compete with Session startup or every open.
 const CREDITS_REFRESH_COOLDOWN_MS = 60_000;
@@ -776,14 +811,29 @@ class AntigravityHarnessSession implements HarnessSession {
     };
     this.#active = active;
     this.#event({ type: "turn.started", turnId: command.turnId });
-    void this.#runTurn(active);
+    void this.#runTurn(active).catch((error) => {
+      // A Turn that throws out of its own error handling must still reach a terminal state.
+      // If #active stayed set, the Session would never arm its idle timer (so the native process
+      // is never reclaimed) and every later Stop would be rejected with "must reference the
+      // active Turn". #completeTurn is idempotent, so a Turn that already completed normally is
+      // unaffected and the success path is unchanged.
+      if (this.#active !== active) return;
+      this.#completeTurn(active, {
+        status: "failed",
+        error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
+      });
+    });
     return { ok: true, value: { turnId: command.turnId } };
   }
 
   async #runTurn(active: ActiveTurn): Promise<void> {
     let result: AntigravityResultEvent | null = null;
     try {
-      const prompt = await readSelectedPluginSkillPrompt(active.text, this.#environment, this.#cwd);
+      const prompt = await withBoundedIo(
+        readSelectedPluginSkillPrompt(active.text, this.#environment, this.#cwd),
+        TURN_LOCAL_IO_TIMEOUT_MS,
+        "Antigravity plugin skill prompt read",
+      );
       result = await this.#transport.runTurn(prompt, (step) => this.#handleStep(active, step));
       if (result.conversationId !== this.#conversationId()) {
         throw new AntigravityTransportError(
@@ -900,7 +950,12 @@ class AntigravityHarnessSession implements HarnessSession {
       ...(outcome.status === "failed" ? { error: outcome.error.message } : {}),
       ...(this.#modelSlug() ? { modelSlug: this.#modelSlug() as string } : {}),
     };
-    await this.#ledger.append(ledgerTurn);
+    // Bounded so a stuck ledger write cannot hold the Turn (and therefore #active) open forever.
+    await withBoundedIo(
+      this.#ledger.append(ledgerTurn),
+      TURN_LOCAL_IO_TIMEOUT_MS,
+      "Antigravity ledger append",
+    );
   }
 
   #completeTurn(active: ActiveTurn, outcome: TurnOutcome, result?: AntigravityResultEvent): void {
@@ -1614,7 +1669,8 @@ export class AntigravityAdapter implements HarnessAdapter {
           ...(params.permissionModeId ? { permissionModeId: params.permissionModeId } : {}),
         };
         const skipPermissions = params.permissionModeId
-          ? decodeAntigravityPermissionModeId(params.permissionModeId) === "dangerously-skip-permissions"
+          ? decodeAntigravityPermissionModeId(params.permissionModeId) ===
+            "dangerously-skip-permissions"
           : true;
         return this.#transportOptions(
           dummyInput,
@@ -3011,7 +3067,6 @@ export class AntigravityAdapter implements HarnessAdapter {
       permissionModeId: input.permissionModeId,
     });
   }
-
 
   #environment(explicit?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const base = resolveAntigravityProxyEnvironment({

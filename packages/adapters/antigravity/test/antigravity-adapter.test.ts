@@ -544,6 +544,72 @@ describe("AntigravityAdapter", () => {
     }
   });
 
+  it("returns to an idle-reclaimable state after a failed Turn", async () => {
+    // Locks the contract that a failed Turn still clears the active Turn, so idle reclamation can
+    // run and Stop keeps working. Note this covers the *throwing* failure path; the *hanging* IO
+    // path is covered by withBoundedIo (see local-io-timeout.test.ts), because a ledger that never
+    // settles is not injectable from here.
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-failed-turn-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    const transportFactory = fakeTransportFactory("conv-failed-turn");
+    const listModels = async (): Promise<AntigravityModelsResult> => ({
+      stdout: `${MODEL}\t${MODEL_LABEL}\n`,
+      stderr: "",
+    });
+    const adapter = new AntigravityAdapter(
+      {
+        command: path.join(os.homedir(), ".local/bin/agy"),
+        environment,
+        sessionIdleTimeoutMs: 100,
+      },
+      {
+        createTransport: () => ({
+          ...transportFactory.create(),
+          async runTurn(): Promise<AntigravityResultEvent> {
+            throw new Error("synthetic turn failure");
+          },
+        }),
+        listModels,
+      },
+    );
+    try {
+      const opened = await adapter.open({ kind: "create", cwd: root, environment });
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const outputIterator = session.outputs[Symbol.asyncIterator]();
+      const failedTurn = waitForTurnIterator(outputIterator);
+      await session.execute({
+        type: "turn.start",
+        turnId: hostTurnIdSchema.parse("failed-turn-1"),
+        input: [{ type: "text", text: "boom" }],
+      });
+      const outputs = await failedTurn;
+      const completed = outputs.find(
+        (output) =>
+          typeof output === "object" &&
+          output !== null &&
+          "kind" in output &&
+          output.kind === "event" &&
+          "event" in output &&
+          typeof output.event === "object" &&
+          output.event !== null &&
+          "type" in output.event &&
+          output.event.type === "turn.completed",
+      );
+      expect(completed).toBeTruthy();
+
+      // The decisive assertion: the active Turn was cleared, so idle reclamation can run.
+      expect(transportFactory.hibernateCalls()).toBe(0);
+      await vi.advanceTimersByTimeAsync(101);
+      expect(transportFactory.hibernateCalls()).toBe(1);
+    } finally {
+      await adapter.close();
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not start a Turn when Session startup fails", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-start-fail-"));
     const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
@@ -1301,4 +1367,3 @@ describe("AntigravityAdapter", () => {
     }
   });
 });
-
