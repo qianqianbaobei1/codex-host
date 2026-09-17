@@ -93,6 +93,7 @@ export {
   isOwnershipSubmissionBlocked,
   permissionModeSelectionLocked,
   restoredThreadOwnership,
+  selectedThreadHarnessAccountId,
   shouldRefreshCodexAccountsForAdapterState,
   shouldTransferComposerState,
 } from "./renderer-binding-probe.js";

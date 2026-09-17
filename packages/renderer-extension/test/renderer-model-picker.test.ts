@@ -14,9 +14,14 @@ import {
 import {
   isRendererModelPickerDisabled,
   compactRendererModelLabel,
+  localizedThinkingLabel,
   rendererModelPickerPresentation,
   shouldCloseRendererModelPicker,
   syncRendererLabelText,
+  isUltraOption,
+  createParticlesElement,
+  applySliderTheme,
+  thinkingOptionsForModel,
 } from "../src/renderer-model-picker.js";
 
 const model = harnessModelRefSchema.parse({ id: "pi-model-v1.synthetic" });
@@ -291,6 +296,27 @@ describe("Renderer combined Model and Thinking picker presentation", () => {
     );
   });
 
+  it("keeps a Catalog on screen usable while it refreshes (stale-while-revalidate)", () => {
+    const readyCatalog = catalog(["off", "low"]);
+    const refreshing = { status: "loading" as const, catalog: readyCatalog, selected: model };
+    // Switching the Account refreshes the Catalog in the background: the visible
+    // Model stays and the control must not blank out or lock.
+    expect(isRendererModelPickerDisabled(refreshing)).toBe(false);
+    expect(shouldCloseRendererModelPicker(refreshing)).toBe(false);
+    expect(rendererModelPickerPresentation(refreshing).modelLabel).toBe("provider / model");
+    // A pending user selection still locks the control, and an empty Catalog is
+    // still unusable.
+    expect(isRendererModelPickerDisabled({ ...refreshing, status: "selecting" as const })).toBe(
+      true,
+    );
+    expect(
+      isRendererModelPickerDisabled({
+        status: "loading",
+        catalog: { models: [], thinkingOptions: [] },
+      }),
+    ).toBe(true);
+  });
+
   it("uses stable loading and unsupported presentation without inventing options", () => {
     for (const status of ["waitingForAdapter", "loading"] as const) {
       expect(isRendererModelPickerDisabled({ status })).toBe(true);
@@ -313,5 +339,138 @@ describe("Renderer combined Model and Thinking picker presentation", () => {
       showThinkingSection: false,
       thinkingSelectionEnabled: false,
     });
+  });
+
+  /** Thinking option ids are branded; build them through the schema like the Host does. */
+  const thinkingOption = (id: string, label: string) => ({
+    id: harnessThinkingOptionIdSchema.parse(id),
+    label,
+  });
+
+  it("returns appropriate labels for thinking options across locales", () => {
+    expect(localizedThinkingLabel(thinkingOption("low", "Low"))).toBeDefined();
+    expect(localizedThinkingLabel(thinkingOption("medium", "Medium"))).toBeDefined();
+    expect(localizedThinkingLabel(thinkingOption("high", "High"))).toBeDefined();
+    expect(localizedThinkingLabel(thinkingOption("custom-lvl", "Custom Label"))).toBe(
+      "Custom Label",
+    );
+  });
+
+  it("correctly identifies ultra / max thinking options for theme styling", () => {
+    expect(isUltraOption(thinkingOption("ultra", "Ultra"))).toBe(true);
+    expect(isUltraOption(thinkingOption("max", "Max"))).toBe(true);
+    expect(isUltraOption(thinkingOption("xhigh", "Extra High"))).toBe(true);
+    expect(isUltraOption(thinkingOption("high", "High"))).toBe(false);
+    expect(isUltraOption(thinkingOption("medium", "Medium"))).toBe(false);
+    expect(isUltraOption(thinkingOption("low", "Low"))).toBe(false);
+    expect(isUltraOption(undefined)).toBe(false);
+  });
+
+  it("generates 14 streaming particle elements with random distribution", () => {
+    const mockDoc = {
+      createElement: (tag: string) => {
+        type MockNode = { className: string; children: unknown[] };
+        const attributes: Record<string, string> = {};
+        const children: MockNode[] = [];
+        return {
+          tagName: tag,
+          className: "",
+          style: {} as Record<string, string>,
+          setAttribute: (name: string, val: string) => {
+            attributes[name] = val;
+          },
+          getAttribute: (name: string) => attributes[name],
+          append: (...args: MockNode[]) => children.push(...args),
+          querySelectorAll: (sel: string) =>
+            children.filter((c) => c.className === sel.replace(".", "")),
+          querySelector: (sel: string) =>
+            children.find((c) => c.className === sel.replace(".", "")) ?? null,
+          children,
+        } as unknown as HTMLElement;
+      },
+    } as unknown as Document;
+
+    const el = createParticlesElement(mockDoc);
+    expect(el).not.toBeNull();
+    expect(el?.getAttribute("data-codexhost-particles")).toBe("true");
+    const paths = (el as unknown as { children: Array<{ children: unknown[] }> }).children;
+    expect(paths.length).toBe(14);
+    for (const path of paths) {
+      expect(path.children.length).toBe(1);
+    }
+  });
+
+  it("switches theme styles between standard orange and cosmic ultra purple", () => {
+    const iconBox = { style: { color: "", background: "" } };
+    const effortText = { style: { color: "" } };
+    const effortChevron = { style: { color: "" } };
+    const sliderRange = { dataset: {} as { theme?: string } };
+    const sliderThumb = { dataset: {} as { theme?: string } };
+
+    applySliderTheme(true, iconBox, effortText, effortChevron, sliderRange, sliderThumb);
+    expect(iconBox.style.color).toBe("#8b5cf6");
+    expect(effortText.style.color).toBe("#8b5cf6");
+    expect(sliderRange.dataset.theme).toBe("ultra");
+    expect(sliderThumb.dataset.theme).toBe("ultra");
+
+    applySliderTheme(false, iconBox, effortText, effortChevron, sliderRange, sliderThumb);
+    expect(iconBox.style.color).toBe("#f97316");
+    expect(effortText.style.color).toBe("#f97316");
+    expect(sliderRange.dataset.theme).toBe("standard");
+    expect(sliderThumb.dataset.theme).toBe("standard");
+  });
+
+  it("sorts thinking options in ascending effort order even when catalog provides inverted options (e.g. Grok)", () => {
+    const grokModel = harnessModelRefSchema.parse({ id: "grok-4.6" });
+    const grokCatalog = harnessModelCatalogSchema.parse({
+      models: [
+        {
+          ref: grokModel,
+          label: "Grok 4.6",
+          supportedThinkingOptionIds: ["high", "low"],
+        },
+      ],
+      defaultModel: grokModel,
+      thinkingOptions: [
+        { id: "high", label: "High" },
+        { id: "low", label: "Low" },
+      ],
+      defaultThinkingOptionId: "high",
+    });
+
+    const sorted = thinkingOptionsForModel(grokCatalog, grokModel);
+    expect(sorted.map(({ id }) => id)).toEqual(["low", "high"]);
+
+    const presentation = rendererModelPickerPresentation({
+      status: "ready",
+      catalog: grokCatalog,
+      selected: grokModel,
+      selectedThinkingOptionId: harnessThinkingOptionIdSchema.parse("high"),
+    });
+    expect(presentation.thinkingOptions.map(({ id }) => id)).toEqual(["low", "high"]);
+  });
+
+  it("sorts multi-tier thinking options correctly from off/low to max/ultra", () => {
+    const customModel = harnessModelRefSchema.parse({ id: "custom-model" });
+    const customCatalog = harnessModelCatalogSchema.parse({
+      models: [
+        {
+          ref: customModel,
+          label: "Custom Model",
+          supportedThinkingOptionIds: ["ultra", "low", "high", "off", "medium"],
+        },
+      ],
+      defaultModel: customModel,
+      thinkingOptions: [
+        { id: "ultra", label: "Ultra" },
+        { id: "low", label: "Low" },
+        { id: "high", label: "High" },
+        { id: "off", label: "Off" },
+        { id: "medium", label: "Medium" },
+      ],
+    });
+
+    const sorted = thinkingOptionsForModel(customCatalog, customModel);
+    expect(sorted.map(({ id }) => id)).toEqual(["off", "low", "medium", "high", "ultra"]);
   });
 });

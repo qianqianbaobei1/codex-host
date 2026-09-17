@@ -9,6 +9,7 @@ import {
   harnessModelCatalogSchema,
   harnessModelRefSchema,
   harnessThinkingOptionSchema,
+  sortThinkingOptionsByEffort,
 } from "@codexhost/shared-contracts";
 
 export interface KiroModelState {
@@ -45,7 +46,7 @@ function thinkingOptions(values: unknown): HarnessThinkingOption[] {
     });
     if (parsed.success) options.set(parsed.data.id, parsed.data);
   }
-  return [...options.values()];
+  return sortThinkingOptionsByEffort([...options.values()]);
 }
 
 export function kiroThinkingState(
@@ -138,7 +139,7 @@ export function parseKiroModelCatalog(
   const catalogCandidate = {
     models,
     ...(defaultModel ? { defaultModel } : {}),
-    thinkingOptions: [...efforts.values()],
+    thinkingOptions: sortThinkingOptionsByEffort([...efforts.values()]),
     ...(typeof defaultEffort === "string" && efforts.has(defaultEffort)
       ? { defaultThinkingOptionId: defaultEffort }
       : {}),

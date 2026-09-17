@@ -34,6 +34,7 @@ import {
   shouldReloadExternalCatalogAfterAvailabilityRefresh,
   shouldRetryExternalThreadUsage,
   shouldTransferComposerState,
+  selectedThreadHarnessAccountId,
   rendererAntigravityGeminiRemainingPercent,
   rendererAntigravityQuotaAvailableForModel,
 } from "../src/renderer-binding-probe.js";
@@ -116,6 +117,51 @@ describe("Renderer connection diagnostics", () => {
         productUsage: [{ product: "Claude and GPT models · Weekly window", usagePercent: 99 }],
       }),
     ).toBeNull();
+  });
+
+  it("ignores quota windows that already reset instead of showing them as current", () => {
+    const now = Date.parse("2026-09-16T12:00:00.000Z");
+    const rolledOverFiveHour = {
+      usedPercent: 100,
+      resetsAt: "2026-09-15T05:01:10.000Z",
+      productUsage: [
+        {
+          product: "Gemini Models · Weekly window",
+          usagePercent: 27.07,
+          resetsAt: "2026-09-21T13:44:41.000Z",
+        },
+        {
+          product: "Gemini Models · 5-hour window",
+          usagePercent: 100,
+          resetsAt: "2026-09-15T05:01:10.000Z",
+        },
+      ],
+    };
+    // The 5-hour window rolled over: the live weekly window is what remains.
+    expect(rendererAntigravityGeminiRemainingPercent(rolledOverFiveHour, now)).toBeCloseTo(
+      72.93,
+      2,
+    );
+    expect(
+      rendererAntigravityQuotaAvailableForModel(rolledOverFiveHour, "Gemini 3.8 Flash", now),
+    ).toBe(true);
+
+    const everyWindowRolledOver = {
+      usedPercent: 100,
+      resetsAt: "2026-09-15T05:01:10.000Z",
+      productUsage: [
+        {
+          product: "Gemini Models · 5-hour window",
+          usagePercent: 100,
+          resetsAt: "2026-09-15T05:01:10.000Z",
+        },
+      ],
+    };
+    // Unknown, not "0% left": the Account must stay usable and unlabeled.
+    expect(rendererAntigravityGeminiRemainingPercent(everyWindowRolledOver, now)).toBeNull();
+    expect(
+      rendererAntigravityQuotaAvailableForModel(everyWindowRolledOver, "Gemini 3.8 Flash", now),
+    ).toBe(true);
   });
 
   it("round trips Kiro effort without reviving a choice cleared by the native model", () => {
@@ -1293,6 +1339,27 @@ describe("Renderer Composer DOM behavior", () => {
   it("persists explicit configuration selections only for a new-Thread draft", () => {
     expect(shouldPersistNewThreadConfigurationSelection("draft")).toBe(true);
     expect(shouldPersistNewThreadConfigurationSelection("locked")).toBe(false);
+  });
+
+  it("reports the Thread's own Harness Account instead of the Harness-wide default", () => {
+    const thread = {
+      phase: "locked" as const,
+      agent: "antigravity" as const,
+      threadOwnerAgent: "antigravity" as const,
+      threadOwnerHarnessAccountId: "gemini-2",
+      defaultAccountId: "default",
+    };
+    // An existing Thread keeps its native Account; selecting a new default never moves it.
+    expect(selectedThreadHarnessAccountId(thread)).toBe("gemini-2");
+    // Only a draft Thread follows the Harness-wide default.
+    expect(selectedThreadHarnessAccountId({ ...thread, phase: "draft" })).toBe("default");
+    // A single-account (or not-yet-inspected) Thread falls back to the default.
+    expect(
+      selectedThreadHarnessAccountId({ ...thread, threadOwnerHarnessAccountId: undefined }),
+    ).toBe("default");
+    // The Account group belongs to Antigravity; another Agent must not borrow it.
+    expect(selectedThreadHarnessAccountId({ ...thread, agent: "grok" })).toBe("default");
+    expect(selectedThreadHarnessAccountId({ ...thread, agent: "codex" })).toBe("default");
   });
 
   it("does not bind readable Thinking when current options are unavailable", () => {

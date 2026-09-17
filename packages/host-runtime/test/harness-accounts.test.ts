@@ -78,6 +78,25 @@ describe("read-only Harness accounts", () => {
     expect(inspectAccount).not.toHaveBeenCalled();
   });
 
+  it("only probes quota when asked and keeps background refreshes unforced", async () => {
+    const calls: Array<{ force?: boolean } | undefined> = [];
+    const multi = Object.assign(adapter("multi-agent"), {
+      inspectAccounts: vi.fn(async () => [
+        { ...snapshot, accountId: "default", label: "本机", isDefault: true, selectable: true },
+      ]),
+      refreshAccountCredits: vi.fn(async (options?: { force?: boolean }) => {
+        calls.push(options);
+      }),
+    });
+
+    await inspectHarnessAccounts([multi], []);
+    expect(calls).toHaveLength(0);
+    await inspectHarnessAccounts([multi], [], 12_000, "stale");
+    expect(calls).toEqual([{ force: false }]);
+    await inspectHarnessAccounts([multi], [], 12_000, "force");
+    expect(calls).toEqual([{ force: false }, { force: true }]);
+  });
+
   it("drops malformed rows from a multi-account list and treats null as no rows", async () => {
     const multi = Object.assign(adapter("multi-agent"), {
       inspectAccounts: vi.fn(async () => [snapshot, { ...snapshot, accountId: "bad/id" }]),

@@ -947,12 +947,16 @@ export function renderRendererAgentPicker(
   control.codexAccountGroup.render({
     accounts: codexAccounts,
     selectedAccountId: state.agent === "codex" ? (activeAccount?.accountId ?? null) : null,
-    disabled: switching || state.phase === "locked",
+    disabled: switching || (state.agent === "codex" && state.phase === "locked"),
   });
+  // A locked Thread may still change which Account runs it: that is an execution
+  // identity, not a new Thread. The Host refuses it while a Turn is running (the
+  // renderer has no reliable turn-in-flight signal), so only a switch in progress
+  // disables the rows here.
   control.harnessAccountGroup.render({
     entries: harnessAccounts,
     selectedId: harnessAccountId,
-    disabled: switching || state.phase === "locked",
+    disabled: switching,
     // Like the Codex group: the rows belong to their Agent entry, so they stay
     // visible whether or not that Agent is the current one.
     visible: true,

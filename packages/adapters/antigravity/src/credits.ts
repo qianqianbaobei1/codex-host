@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   accountCreditsSnapshotSchema,
+  accountCreditsWindowHasReset,
   type AccountCreditsSnapshot,
 } from "@codexhost/shared-contracts";
 
@@ -52,18 +53,27 @@ function quotaProductMatchesModel(product: string, modelId: string | undefined):
  * group. The top-level summary can describe another group (for example a
  * Claude/GPT weekly bucket while the user is selecting Gemini), so callers
  * must prefer the product-level bucket when it is available.
+ *
+ * Buckets whose window already reset are ignored: a snapshot taken before the
+ * reset still shows the old window as fully consumed, and trusting it would
+ * keep a healthy account blocked until the next probe.
  */
 export function antigravityQuotaAvailableForModel(
   credits: AccountCreditsSnapshot | null | undefined,
   modelId?: string,
+  now: number = Date.now(),
 ): boolean {
   if (!credits) return true;
   const products = credits.productUsage ?? [];
   const scoped = modelId
     ? products.filter((product) => quotaProductMatchesModel(product.product, modelId))
     : products;
-  if (scoped.length > 0) return scoped.some((product) => product.usagePercent < 100);
-  return credits.usedPercent < 100;
+  const current = scoped.filter((product) => !accountCreditsWindowHasReset(product.resetsAt, now));
+  if (current.length > 0) return current.some((product) => product.usagePercent < 100);
+  // Every scoped bucket rolled over: the quota is unknown but almost certainly
+  // replenished, so the account stays selectable.
+  if (scoped.length > 0) return true;
+  return accountCreditsWindowHasReset(credits.resetsAt, now) ? true : credits.usedPercent < 100;
 }
 
 function normalizeIsoReset(resetTime: unknown, resetInSeconds?: unknown): string | undefined {

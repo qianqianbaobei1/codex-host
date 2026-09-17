@@ -106,6 +106,22 @@ export const accountCreditsSnapshotSchema = z
 export type AccountResetCredits = z.infer<typeof accountResetCreditsSchema>;
 export type AccountCreditsSnapshot = z.infer<typeof accountCreditsSnapshotSchema>;
 
+/**
+ * Whether a quota window described by `resetsAt` has already rolled over.
+ *
+ * A snapshot taken before a reset still carries the previous window's usage
+ * (typically 100%), so it must not decide availability or be shown as the
+ * current remaining quota: the window has reset, the number is meaningless.
+ */
+export function accountCreditsWindowHasReset(
+  resetsAt: string | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!resetsAt) return false;
+  const parsed = Date.parse(resetsAt);
+  return Number.isFinite(parsed) && parsed <= now;
+}
+
 export const accountBalanceInfoSchema = z
   .object({
     currency: z.string().min(1),

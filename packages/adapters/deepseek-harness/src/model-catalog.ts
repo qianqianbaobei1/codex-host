@@ -5,6 +5,7 @@ import {
   harnessModelCatalogSchema,
   harnessModelRefSchema,
   harnessThinkingOptionIdSchema,
+  sortThinkingOptionsByEffort,
   type HarnessModelCatalog,
   type HarnessModelRef,
   type HarnessThinkingOption,
@@ -105,10 +106,11 @@ export function normalizeDeepSeekThinkingOptions(
 ): HarnessThinkingOption[] {
   const group = models.groups.find((candidate) => candidate.id === models.current.provider);
   const model = group?.models.find((candidate) => candidate.id === models.current.model);
-  return (model?.reasoning?.efforts ?? []).flatMap((effort) => {
+  const options = (model?.reasoning?.efforts ?? []).flatMap((effort) => {
     const parsedId = harnessThinkingOptionIdSchema.safeParse(effort.id);
     return parsedId.success ? [{ id: parsedId.data, label: effort.name }] : [];
   });
+  return sortThinkingOptionsByEffort(options);
 }
 
 export function normalizeDeepSeekModelCatalog(
@@ -152,7 +154,7 @@ export function normalizeDeepSeekModelCatalog(
   return harnessModelCatalogSchema.parse({
     models,
     ...(defaultModel ? { defaultModel } : {}),
-    thinkingOptions,
+    thinkingOptions: sortThinkingOptionsByEffort(thinkingOptions),
     ...(defaultThinkingOptionId &&
     defaultReasoning?.efforts.some((effort) => effort.id === defaultThinkingOptionId)
       ? { defaultThinkingOptionId }

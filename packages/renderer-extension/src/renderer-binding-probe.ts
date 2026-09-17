@@ -1,4 +1,5 @@
 import {
+  accountCreditsWindowHasReset,
   decodeHarnessPluginRoute,
   harnessIdSchema,
   permissionModeFixedAtCreate,
@@ -37,6 +38,7 @@ import {
   isComposerSubmissionKey,
   mountComposerAgentControl,
   reconcileComposerNativeControls,
+  reconcileTurnErrorBannersAndCopy,
   renderComposerAgentControl,
   sendButtonWithin,
   type ComposerAgentControl,
@@ -119,24 +121,31 @@ type HarnessWebUiAvailability = Record<ExternalRendererAgent, boolean>;
  * Return the effective remaining quota for Antigravity's Gemini model group.
  * The top-level `usedPercent` is a backwards-compatible summary across every
  * product group, so it must not be used for the Gemini account row.
+ *
+ * Buckets whose window already reset are skipped: showing the previous
+ * window's 100% as "0% left" made a replenished account look exhausted.
  */
 export function rendererAntigravityGeminiRemainingPercent(
-  credits: Pick<AccountCreditsSnapshot, "label" | "usedPercent" | "productUsage">,
+  credits: Pick<AccountCreditsSnapshot, "label" | "usedPercent" | "productUsage" | "resetsAt">,
+  now: number = Date.now(),
 ): number | null {
   const products = credits.productUsage ?? [];
   const labelIdentifiesGemini = /\bgemini\b/i.test(credits.label ?? "");
   const geminiUsage = products
     .filter((product) => {
       const normalized = product.product.trim();
-      if (/\bgemini\b/i.test(normalized)) return true;
-      if (!labelIdentifiesGemini) return false;
-      return !/\b3p\b|claude|gpt|third[- ]party|other|其他/i.test(normalized);
+      const matchesGemini =
+        /\bgemini\b/i.test(normalized) ||
+        (labelIdentifiesGemini && !/\b3p\b|claude|gpt|third[- ]party|other|其他/i.test(normalized));
+      if (!matchesGemini) return false;
+      return !accountCreditsWindowHasReset(product.resetsAt, now);
     })
     .map((product) => product.usagePercent)
     .filter((usage): usage is number => Number.isFinite(usage));
 
   if (geminiUsage.length === 0) {
     if (!labelIdentifiesGemini || !Number.isFinite(credits.usedPercent)) return null;
+    if (accountCreditsWindowHasReset(credits.resetsAt, now)) return null;
     geminiUsage.push(credits.usedPercent);
   }
 
@@ -145,8 +154,10 @@ export function rendererAntigravityGeminiRemainingPercent(
 }
 
 export function rendererAntigravityQuotaAvailableForModel(
-  credits: Pick<AccountCreditsSnapshot, "usedPercent" | "productUsage"> | null | undefined,
+  credits:
+    Pick<AccountCreditsSnapshot, "usedPercent" | "productUsage" | "resetsAt"> | null | undefined,
   modelLabel?: string,
+  now: number = Date.now(),
 ): boolean {
   if (!credits) return true;
   const products = credits.productUsage ?? [];
@@ -157,8 +168,10 @@ export function rendererAntigravityQuotaAvailableForModel(
       ? /\b3p\b|claude|gpt|third[- ]party|other|其他/u.test(normalized)
       : /gemini|native|first[- ]party|自有/u.test(normalized);
   });
-  if (scoped.length > 0) return scoped.some((product) => product.usagePercent < 100);
-  return credits.usedPercent < 100;
+  const current = scoped.filter((product) => !accountCreditsWindowHasReset(product.resetsAt, now));
+  if (current.length > 0) return current.some((product) => product.usagePercent < 100);
+  if (scoped.length > 0) return true;
+  return accountCreditsWindowHasReset(credits.resetsAt, now) ? true : credits.usedPercent < 100;
 }
 
 function isRetryableHarnessAvailability(
@@ -408,6 +421,29 @@ export function shouldPersistNewThreadConfigurationSelection(phase: ComposerAgen
   return phase === "draft";
 }
 
+/**
+ * Which Harness Account row a Composer reports as selected. A locked Thread keeps
+ * the native Account it was created with, so the Harness-wide default (which only
+ * governs new Threads) must not be shown as this conversation's Account.
+ */
+export function selectedThreadHarnessAccountId(input: {
+  phase: ComposerAgentPhase;
+  agent: RendererAgent;
+  threadOwnerAgent?: RendererAgent | undefined;
+  threadOwnerHarnessAccountId?: string | undefined;
+  defaultAccountId: string | null;
+}): string | null {
+  if (
+    input.phase === "locked" &&
+    input.agent === "antigravity" &&
+    input.threadOwnerAgent === "antigravity" &&
+    input.threadOwnerHarnessAccountId
+  ) {
+    return input.threadOwnerHarnessAccountId;
+  }
+  return input.defaultAccountId;
+}
+
 export function restoredThreadOwnership(inspection: ThreadInspection): RestoredThreadOwnership {
   if (inspection.owner === "codex") return { agent: "codex" };
   if (inspection.harnessId === "pi") {
@@ -577,6 +613,8 @@ interface MountedComposer {
   accountCredits: AccountCreditsSnapshot | null;
   accountCreditsAgent?: RendererAgent | undefined;
   threadOwnerAgent?: RendererAgent | undefined;
+  /** Native Account bound to the Thread; absent when unknown or single-account. */
+  threadOwnerHarnessAccountId?: string | undefined;
   hostId: string | null;
   usageRequestGeneration: number;
   commandRequestGeneration: number;
@@ -938,9 +976,20 @@ export function installRendererBindingProbe(
           ...(secondary ? { secondary } : {}),
         };
       });
-    const selectedHarnessAccountId =
-      harnessRows.find((account) => account.harnessId === "antigravity" && account.isDefault)
-        ?.accountId ?? null;
+    // A locked Thread keeps the native Account it was created with; the Harness
+    // default only governs new Threads. Showing the default as the selected row
+    // would misreport which Account this conversation actually spends.
+    const selectedHarnessAccountId = selectedThreadHarnessAccountId({
+      phase: state.phase,
+      agent: currentAgent,
+      ...(mounted.threadOwnerAgent ? { threadOwnerAgent: mounted.threadOwnerAgent } : {}),
+      ...(mounted.threadOwnerHarnessAccountId
+        ? { threadOwnerHarnessAccountId: mounted.threadOwnerHarnessAccountId }
+        : {}),
+      defaultAccountId:
+        harnessRows.find((account) => account.harnessId === "antigravity" && account.isDefault)
+          ?.accountId ?? null,
+    });
     const selectedCodexAccountId =
       state.phase === "locked" ||
       (controller.isSubmissionPending(mounted.composer) && state.codexAccountId)
@@ -1240,6 +1289,7 @@ export function installRendererBindingProbe(
     const threadId = threadIdFromComposerModelTarget(mounted.modelTarget);
     if (!threadId) {
       mounted.ownershipStatus = "not-required";
+      delete mounted.threadOwnerHarnessAccountId;
       return;
     }
     const requestModelControl = modelControl;
@@ -1266,6 +1316,8 @@ export function installRendererBindingProbe(
       const { agent, model, thinkingOptionId, permissionModeId } =
         restoredThreadOwnership(inspection);
       mounted.threadOwnerAgent = agent;
+      mounted.threadOwnerHarnessAccountId =
+        inspection.owner === "external" ? inspection.harnessAccountId : undefined;
       if (mounted.accountCredits) mounted.accountCreditsAgent = agent;
       if (mounted.usageRequestGeneration === usageGeneration) {
         mounted.usage = inspection.owner === "external" ? (inspection.usage ?? null) : null;
@@ -1364,6 +1416,7 @@ export function installRendererBindingProbe(
       mounted.modelView = { status: "idle" };
       mounted.permissionModeView = { status: "idle" };
       mounted.threadConfiguration = undefined;
+      mounted.threadOwnerHarnessAccountId = undefined;
       mounted.ownershipStatus = "loading";
       mounted.usage = null;
       mounted.accountCredits = null;
@@ -2088,7 +2141,20 @@ export function installRendererBindingProbe(
         // carrier, otherwise a failed handover leaves the Composer routing to
         // a non-existent official Thread.
         await client.handoverThread({ threadId });
-      } catch {
+      } catch (error) {
+        mounted.ownershipStatus = "error";
+        if (mounted.control?.picker) {
+          const message = error instanceof Error ? error.message : String(error);
+          mounted.control.picker.trigger.title = `Switch to Codex failed: ${message}`;
+        }
+        renderMounted(mounted);
+        console.error("[codexhost] Failed to handover thread to Codex:", error);
+        setTimeout(() => {
+          if (mounted.ownershipStatus === "error") {
+            mounted.ownershipStatus = "ready";
+            renderMounted(mounted);
+          }
+        }, 5000);
         return false;
       }
     }
@@ -2189,10 +2255,11 @@ export function installRendererBindingProbe(
   const selectCodexAccount = async (mounted: MountedComposer, accountId: string): Promise<void> => {
     const hostId = mounted.hostId;
     const accounts = composerCodexAccounts(mounted.composer);
+    const agentState = controller.get(mounted.composer);
     if (
       !accounts ||
       accounts.switching ||
-      controller.get(mounted.composer).phase === "locked" ||
+      (agentState.agent === "codex" && agentState.phase === "locked") ||
       !accounts.accounts.some((account) => account.accountId === accountId)
     )
       return;
@@ -2200,7 +2267,8 @@ export function installRendererBindingProbe(
       !disposed &&
       mounted.composer.isConnected &&
       mountedByComposer.get(mounted.composer) === mounted &&
-      controller.get(mounted.composer).phase !== "locked" &&
+      (controller.get(mounted.composer).agent !== "codex" ||
+        controller.get(mounted.composer).phase !== "locked") &&
       accounts.accounts.some((account) => account.accountId === accountId) &&
       mounted.hostId === hostId &&
       activeModelHostId() === hostId &&
@@ -2259,17 +2327,40 @@ export function installRendererBindingProbe(
       !state?.client.selectHarnessAccount ||
       state.switching ||
       !entry?.harnessId ||
-      entry.selectable === false ||
-      controller.get(mounted.composer).phase === "locked"
+      entry.selectable === false
     ) {
       return;
     }
     const harnessId = entry.harnessId;
+    const composerState = controller.get(mounted.composer);
+    const threadId =
+      composerState.phase === "locked"
+        ? threadIdFromComposerModelTarget(mounted.modelTarget)
+        : null;
+    // A locked Thread is bound to a native conversation: switching its Account
+    // changes who runs *that* conversation, which is a Thread-scoped transaction
+    // rather than a new default for future Threads. Without a Thread identity the
+    // only meaningful action is choosing the Harness-wide default.
+    const switchThread = threadId && state.client.selectThreadAccount ? { threadId } : null;
     state.switching = true;
     for (const candidate of mountedByComposer.values()) {
       if (candidate.hostId === hostId) renderMounted(candidate);
     }
     try {
+      if (switchThread) {
+        // Thread-scoped only: this must never rewrite the Harness-wide default, so
+        // other Threads and future Threads keep the Account they had.
+        await state.client.selectThreadAccount?.({ threadId: switchThread.threadId, accountId });
+        if (!disposed && harnessAccountsForHost(hostId) === state) {
+          mounted.threadOwnerHarnessAccountId = accountId;
+          // The new Account may expose a different Catalog; the visible Model and
+          // Effort stay until that Catalog proves otherwise.
+          controller.invalidateModelRequests(mounted.composer);
+          void loadExternalCatalog(mounted);
+          void loadHarnessAccounts();
+        }
+        return;
+      }
       const result = await state.client.selectHarnessAccount({ harnessId, accountId });
       if (!disposed && harnessAccountsForHost(hostId) === state) {
         state.accounts = result.accounts;
@@ -2283,21 +2374,21 @@ export function installRendererBindingProbe(
           ) {
             continue;
           }
-          // Account selection changes the native configuration namespace. Drop
-          // the old model/effort/permission carrier, invalidate any in-flight
-          // catalog request, and reload the selected account's catalog before
-          // the next submission can use stale values.
+          // Switching the Account only swaps the credential: a Model Ref encodes
+          // the model slug, not the Account, so the visible Model/Effort stays
+          // until the new Account's Catalog proves otherwise
+          // (stale-while-revalidate). Blanking it here made an Account switch look
+          // like an Agent restart.
           controller.invalidateModelRequests(candidate.composer);
-          controller.clearExternalConfiguration(candidate.composer, candidateState.agent);
-          candidate.threadConfiguration = undefined;
-          candidate.modelView = { status: "loading", thinkingSelectionSupported: false };
-          candidate.permissionModeView = { status: "idle" };
           renderMounted(candidate);
           void loadExternalCatalog(candidate);
         }
       }
     } catch {
-      // Unsupported or failed selection keeps the previous rows.
+      // Unsupported or failed selection keeps the previous rows. The Host is
+      // authoritative: it refuses a switch while a Turn is running, or when the
+      // target Account cannot reach the conversation yet, and changes nothing.
+      // (No user-visible error slot exists for the Account group yet.)
     } finally {
       state.switching = false;
       if (!disposed && harnessAccountsForHost(hostId) === state) {
@@ -2502,6 +2593,7 @@ export function installRendererBindingProbe(
       mounted.modelView = { status: "idle" };
       mounted.permissionModeView = { status: "idle" };
       mounted.threadConfiguration = undefined;
+      mounted.threadOwnerHarnessAccountId = undefined;
       mounted.ownershipStatus = "loading";
       mounted.usage = null;
       mounted.accountCredits = null;
@@ -2800,6 +2892,9 @@ export function installRendererBindingProbe(
       void refreshHarnessAvailability();
     }
     pendingReplacements.clear();
+    if (typeof document !== "undefined") {
+      reconcileTurnErrorBannersAndCopy(document);
+    }
   };
 
   const scheduleScan = (refreshTargets = false): void => {
@@ -3049,6 +3144,9 @@ export function installRendererBindingProbe(
   const onHostRouteChange = (): void => {
     sidebarAgentIcons.refresh();
     reconcileHarnessAvailabilityHost();
+    if (typeof document !== "undefined") {
+      reconcileTurnErrorBannersAndCopy(document);
+    }
     void loadCodexAccounts();
     void loadHarnessAccounts();
     void refreshHarnessAvailability();

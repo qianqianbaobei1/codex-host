@@ -1,6 +1,28 @@
 export { AntigravityAdapter } from "./antigravity-adapter.js";
 export { ANTIGRAVITY_COMMAND_ENV, resolveAntigravityExecutable } from "./command.js";
 export {
+  ANTIGRAVITY_ACCOUNT_LOCAL_ENTRIES,
+  ANTIGRAVITY_SHARED_SESSION_ENTRIES,
+  SESSION_STORE_MIGRATION_FORMAT_VERSION,
+  accountSessionStoreDirectory,
+  applySessionStoreMigration,
+  ensureSharedSessionStoreLayout,
+  inspectSessionStoreLayout,
+  planSessionStoreMigration,
+  rollbackSessionStoreMigration,
+  sharedSessionStoreRoot,
+} from "./session-store.js";
+export type {
+  AntigravitySessionStoreLocation,
+  AntigravitySharedSessionEntry,
+  SessionStoreEntryKind,
+  SessionStoreEntryState,
+  SessionStoreLayoutReport,
+  SessionStoreMigrationAction,
+  SessionStoreMigrationJournal,
+  SessionStoreMigrationPlan,
+} from "./session-store.js";
+export {
   ANTIGRAVITY_ACCOUNT_ID_ENV,
   ANTIGRAVITY_ACCOUNTS_DIR,
   ANTIGRAVITY_THREAD_ID_ENV,

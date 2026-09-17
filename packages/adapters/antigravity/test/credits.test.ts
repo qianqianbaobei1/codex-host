@@ -37,6 +37,41 @@ describe("Antigravity credits", () => {
     ).toBe(false);
   });
 
+  it("does not treat a quota window that already reset as exhausted", () => {
+    const now = Date.parse("2026-09-16T12:00:00.000Z");
+    const rolledOver = {
+      usedPercent: 100,
+      periodType: "five_hour" as const,
+      resetsAt: "2026-09-15T05:01:10.000Z",
+      productUsage: [
+        {
+          product: "Gemini Models · 5-hour window",
+          usagePercent: 100,
+          resetsAt: "2026-09-15T05:01:10.000Z",
+        },
+      ],
+    };
+    // The snapshot predates the reset, so its 100% describes a window that is gone.
+    expect(antigravityQuotaAvailableForModel(rolledOver, "gemini-3.8-flash", now)).toBe(true);
+    expect(
+      antigravityQuotaAvailableForModel(
+        {
+          ...rolledOver,
+          resetsAt: "2026-09-16T17:00:00.000Z",
+          productUsage: [
+            {
+              product: "Gemini Models · 5-hour window",
+              usagePercent: 100,
+              resetsAt: "2026-09-16T17:00:00.000Z",
+            },
+          ],
+        },
+        "gemini-3.8-flash",
+        now,
+      ),
+    ).toBe(false);
+  });
+
   it("projects quota from raw statusline json correctly", () => {
     const rawPayload = {
       quota: {

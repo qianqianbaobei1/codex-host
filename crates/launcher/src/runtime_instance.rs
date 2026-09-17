@@ -6,6 +6,8 @@ use std::fs::{self, File};
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::io::{self, Write};
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -246,6 +248,11 @@ pub fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> io::Resu
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "runtime path has no parent"))?;
     #[cfg(not(target_os = "linux"))]
     fs::create_dir_all(parent)?;
+    // Linux hardens the runtime directory through `runtime_directory`; the non-Linux path must
+    // match it, or the descriptor (control port + attachment nonce) lands in an umask-derived
+    // 0755 directory holding a 0644 file that any other local account can read.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let temporary = parent.join(format!(
         ".{RUNTIME_DESCRIPTOR_FILE}.{}.{}.tmp",
         std::process::id(),
@@ -262,7 +269,13 @@ pub fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> io::Resu
         }
         #[cfg(target_os = "linux")]
         let mut file = open_secure_file(&temporary, SecureFileOpen::WriteNew)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        #[cfg(all(not(unix), not(target_os = "linux")))]
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -474,6 +487,32 @@ mod tests {
         }
         assert!(!path.exists());
         fs::remove_dir_all(path.parent().expect("fixture parent")).expect("remove fixture");
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_runtime_files_stay_private() {
+        let path = fixture_path("runtime-private-unix");
+        let parent = path.parent().expect("fixture parent");
+        fs::create_dir_all(parent).expect("create fixture parent");
+        // A permissive parent directory is the common case; the descriptor still has to end up
+        // private because it carries the attachment nonce that authenticates the control channel.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+            .expect("loosen fixture parent");
+        write_descriptor(&path, &descriptor(51)).expect("write private descriptor");
+        let directory_mode = fs::metadata(parent)
+            .expect("runtime directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(&path)
+            .expect("descriptor metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        fs::remove_dir_all(parent).expect("remove fixture");
     }
 
     #[cfg(target_os = "linux")]

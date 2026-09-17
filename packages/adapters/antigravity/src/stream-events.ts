@@ -137,7 +137,7 @@ export function isAntigravityPermissionDenial(message: string): boolean {
  * direct connection (e.g. connection resets, premature EOFs, timeout/deadline exceeded).
  */
 export const TRANSIENT_NETWORK_PATTERN =
-  /API error \(attempt \d+\)|connection reset by peer|broken pipe|connection refused|unexpected EOF|streamGenerateContent.*?(?:EOF|reset|refused|timeout|deadline)|(?:Post|Get|Put)\s+"https?:\/\/[^"]+":.*?(?:EOF|reset|broken|refused|timeout|deadline)|context deadline exceeded|Client\.Timeout exceeded|handshake timeout|tls: (?:handshake|first record)|no route to host|network is unreachable|i\/o timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Timeout)|Service Unavailable|Bad Gateway/iu;
+  /API error \(attempt \d+\)|connection reset by peer|broken pipe|connection refused|unexpected EOF|streamGenerateContent.*?(?:EOF|reset|refused|timeout|deadline)|(?:Post|Get|Put)\s+"https?:\/\/[^"]+":.*?(?:EOF|reset|broken|refused|timeout|deadline)|context deadline exceeded|Client\.Timeout exceeded|handshake timeout|tls: (?:handshake|first record)|no route to host|network is unreachable|i\/o timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Timeout)|Service Unavailable|Bad Gateway|FAILED_PRECONDITION|User location is not supported|location is not supported/iu;
 
 export function isTransientNetworkErrorMessage(message: string): boolean {
   return TRANSIENT_NETWORK_PATTERN.test(message);

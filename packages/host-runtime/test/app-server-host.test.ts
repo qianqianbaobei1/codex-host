@@ -213,6 +213,27 @@ function rollbackCapableAdapter(): FakeHarnessAdapter {
   );
 }
 
+class AccountReportingAdapter extends FakeHarnessAdapter {
+  account: string | null = null;
+  nativeSessionId: string | undefined;
+  readonly switched: { threadId: string; accountId: string; nativeSessionId?: string }[] = [];
+  switchFailure: string | null = null;
+
+  threadAccountId(_threadId: string, nativeSessionId?: string): string | null {
+    this.nativeSessionId = nativeSessionId;
+    return this.account;
+  }
+
+  async selectThreadAccount(input: {
+    threadId: string;
+    accountId: string;
+    nativeSessionId?: string;
+  }): Promise<void> {
+    if (this.switchFailure) throw new Error(this.switchFailure);
+    this.switched.push(input);
+  }
+}
+
 class CachedThreadInspectionAdapter extends FakeHarnessAdapter {
   readonly cachedThreadCapabilities: HarnessSessionCapabilities = {
     configuration: {
@@ -866,6 +887,102 @@ describe("AppServerHost installed Harness plugins", () => {
       expect(await fixture.collector.waitFor((message) => requestId(message, 925))).toMatchObject({
         error: { code: -32077 },
       });
+    } finally {
+      await stopFixture(fixture);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("answers an Account switch from cache and refreshes quota afterwards", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "codexhost-plugin-switch-"));
+    const location = path.join(directory, "multi-agent");
+    mkdirSync(location);
+    const gate = path.join(location, "credit-gate");
+    const refreshLog = path.join(location, "credits-refresh.jsonl");
+    writeFileSync(
+      path.join(directory, "enabled.json"),
+      JSON.stringify({ version: 1, enabled: ["multi-agent"] }),
+    );
+    writeFileSync(
+      path.join(location, "manifest.json"),
+      JSON.stringify({
+        manifestVersion: 1,
+        id: "multi-agent",
+        name: "Multi Agent",
+        version: "1.0.0",
+        adapterApiVersion: 1,
+        entry: "index.mjs",
+      }),
+    );
+    // Quota probes block on a file the test creates, so the switch response can
+    // only arrive before the refresh if it never awaited it. The 2s collector
+    // timeout turns a regression into a fast, explicit failure.
+    writeFileSync(
+      path.join(location, "index.mjs"),
+      `
+      import { appendFileSync, existsSync } from "node:fs";
+      import { FakeHarnessAdapter } from ${JSON.stringify(pathToFileURL(path.resolve("packages/harness-adapter/dist/testing.js")).href)};
+      export function createHarnessAdapter() {
+        const adapter = new FakeHarnessAdapter("multi-agent");
+        let selected = "default";
+        let refreshed = false;
+        adapter.inspectAccounts = async () => [
+          { accountId: "default", label: "本机", isDefault: selected === "default", selectable: true, ...(refreshed ? { credits: { usedPercent: 25, periodType: "weekly" } } : {}) },
+          { accountId: "work", label: "工作", isDefault: selected === "work", selectable: true, ...(refreshed ? { credits: { usedPercent: 80, periodType: "weekly" } } : {}) },
+        ];
+        adapter.refreshAccountCredits = async (options) => {
+          appendFileSync(${JSON.stringify(refreshLog)}, JSON.stringify({ force: options?.force === true }) + "\\n");
+          const deadline = Date.now() + 30_000;
+          while (!existsSync(${JSON.stringify(gate)}) && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          refreshed = true;
+        };
+        adapter.selectAccount = async (accountId) => { selected = accountId; };
+        return adapter;
+      }
+    `,
+    );
+    const fixture = createFixture({ pluginDirectory: directory, externalAdapters: new Map() });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 931,
+        method: "codexhost/harness/accounts/select",
+        params: { harnessId: "multi-agent", accountId: "work" },
+      });
+      expect(await fixture.collector.waitFor((message) => requestId(message, 931))).toMatchObject({
+        result: {
+          accounts: [
+            { accountId: "default", isDefault: false },
+            { accountId: "work", isDefault: true },
+          ],
+        },
+      });
+
+      // Release the probe and let the background refresh publish its numbers.
+      writeFileSync(gate, "open");
+      let refreshedRows: JsonObject | null = null;
+      for (let attempt = 0; attempt < 100 && refreshedRows === null; attempt += 1) {
+        const id = 940 + attempt;
+        writeRequest(fixture.desktopInput, {
+          id,
+          method: "codexhost/harness/accounts/list",
+          params: {},
+        });
+        const message = await fixture.collector.waitFor((candidate) => requestId(candidate, id));
+        if (JSON.stringify(message).includes("credits")) refreshedRows = message;
+        else await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(refreshedRows).toMatchObject({
+        result: {
+          accounts: [
+            { accountId: "default", credits: { usedPercent: 25 } },
+            { accountId: "work", credits: { usedPercent: 80 } },
+          ],
+        },
+      });
+      // A background refresh must respect each Account's freshness window.
+      expect(readFileSync(refreshLog, "utf8").trim().split("\n")).toEqual(['{"force":false}']);
     } finally {
       await stopFixture(fixture);
       rmSync(directory, { recursive: true, force: true });
@@ -3786,6 +3903,117 @@ describe("AppServerHost HarnessAdapter projection", () => {
 
     // An unavailable bound Account must never query the default runtime quota.
     expect(officialWrite).not.toHaveBeenCalled();
+    await stopFixture(fixture);
+  });
+
+  it("switches a Thread's Account as one transaction: quiesce, then rebind", async () => {
+    const adapter = new AccountReportingAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    try {
+      const threadId = await startPiThread(fixture);
+      writeRequest(fixture.desktopInput, {
+        id: 60,
+        method: "codexhost/thread/account/select",
+        params: { threadId, accountId: "gemini-2" },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 60)),
+      ).resolves.toMatchObject({
+        id: 60,
+        result: { threadId, harnessId: "pi", accountId: "gemini-2" },
+      });
+      // The Session is quiesced before the rebind, and the native identity travels
+      // with it so the target Account continues the same conversation.
+      expect(adapter.switched).toEqual([
+        { threadId, accountId: "gemini-2", nativeSessionId: expect.any(String) },
+      ]);
+      // Quiesced: the live Session was closed, so its write lease is released and
+      // the next Turn reopens the conversation under the new Account.
+      expect(adapter.sessions).toHaveLength(1);
+      expect(adapter.sessions[0]?.outputs).toBeDefined();
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("keeps the previous Account when the target cannot run the conversation", async () => {
+    const adapter = new AccountReportingAdapter(harnessIdSchema.parse("pi"));
+    adapter.switchFailure = "Account 'gemini-2' cannot see this conversation yet";
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    try {
+      const threadId = await startPiThread(fixture);
+      writeRequest(fixture.desktopInput, {
+        id: 61,
+        method: "codexhost/thread/account/select",
+        params: { threadId, accountId: "gemini-2" },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 61)),
+      ).resolves.toMatchObject({
+        id: 61,
+        error: { code: -32078, message: expect.stringContaining("cannot see this conversation") },
+      });
+      // No binding was changed: the Thread still belongs to its previous Account.
+      expect(adapter.switched).toEqual([]);
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("refuses an Account switch for an official Thread or a Harness without the capability", async () => {
+    const adapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    try {
+      writeRequest(fixture.desktopInput, {
+        id: 62,
+        method: "codexhost/thread/account/select",
+        params: { threadId: "official-thread", accountId: "gemini-2" },
+      });
+      await expect(
+        fixture.collector.waitFor((message) => requestId(message, 62)),
+      ).resolves.toMatchObject({ id: 62, error: { code: -32078 } });
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
+
+  it("reports the native Account a Thread is bound to, and omits it when unknown", async () => {
+    const adapter = new AccountReportingAdapter(harnessIdSchema.parse("pi"));
+    const fixture = createFixture({
+      externalAdapters: new Map<ExternalHarnessId, FakeHarnessAdapter>([["pi", adapter]]),
+    });
+    const threadId = await startPiThread(fixture);
+
+    writeRequest(fixture.desktopInput, {
+      id: 50,
+      method: "codexhost/thread/inspect",
+      params: { threadId },
+    });
+    const unbound = await fixture.collector.waitFor((message) => requestId(message, 50));
+    // Single-account Harnesses and unknown Threads must not guess an Account.
+    expect(unbound.result).not.toHaveProperty("harnessAccountId");
+
+    adapter.account = "gemini-2";
+    writeRequest(fixture.desktopInput, {
+      id: 51,
+      method: "codexhost/thread/inspect",
+      params: { threadId },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 51)),
+    ).resolves.toMatchObject({
+      id: 51,
+      result: { owner: "external", harnessId: "pi", harnessAccountId: "gemini-2" },
+    });
+    // The Host forwards the stored Native Session so an unbound legacy Thread can
+    // still be attributed to the Account that owns its conversation.
+    expect(adapter.nativeSessionId).toBeTruthy();
     await stopFixture(fixture);
   });
 
@@ -8296,7 +8524,7 @@ describe("AppServerHost HarnessAdapter projection", () => {
     await stopFixture(fixture);
   });
 
-  it("preserves a directly-created External Thread when Official Codex has no identity", async () => {
+  it("preserves a directly-created External Thread when Official Codex has no identity and adoption fails", async () => {
     const fixture = createFixture();
     const threadId = await startPiThread(fixture, "codexhost/pi-native");
     writeRequest(fixture.desktopInput, {
@@ -8315,16 +8543,145 @@ describe("AppServerHost HarnessAdapter projection", () => {
         error: { code: -32000, message: "Thread not found" },
       })}\n`,
     );
+    const officialStart = await readJsonLine(fixture.official.stdin);
+    expect(officialStart).toMatchObject({
+      method: "thread/start",
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialStart.id,
+        error: { code: -32000, message: "Thread creation failed" },
+      })}\n`,
+    );
     await expect(
       fixture.collector.waitFor((message) => requestId(message, 62)),
     ).resolves.toMatchObject({
       error: {
         code: -32078,
-        message:
-          "External Thread cannot be handed over to Official Codex because the official Thread does not exist",
       },
     });
     expect(await fixture.mappingStore.getThread(hostThreadIdSchema.parse(threadId))).not.toBeNull();
+    await stopFixture(fixture);
+  });
+
+  it("adopts a directly-created External Thread into Official Codex via thread/start and inject_items", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture, "codexhost/pi-native");
+    const piSession = fixture.adapter.sessions[0];
+    if (!piSession) throw new Error("Fake Pi Session was not opened");
+    writeRequest(fixture.desktopInput, {
+      id: 51,
+      method: "turn/start",
+      params: { threadId, input: [{ type: "text", text: "Hello external user" }] },
+    });
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 51)),
+    ).resolves.toMatchObject({ result: { turn: { status: "inProgress" } } });
+    piSession.appendText("Pi message from external thread");
+    piSession.succeedTurn();
+    await fixture.collector.waitFor(
+      (message) =>
+        method(message, "turn/completed") &&
+        messageParams(message).threadId === threadId,
+    );
+
+    writeRequest(fixture.desktopInput, {
+      id: 63,
+      method: "codexhost/thread/handover",
+      params: { threadId, target: "codex" },
+    });
+    const officialRead = await readJsonLine(fixture.official.stdin);
+    expect(officialRead).toMatchObject({
+      method: "thread/read",
+      params: { threadId, includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialRead.id,
+        error: { code: -32000, message: "Thread not found" },
+      })}\n`,
+    );
+
+    const officialStart = await readJsonLine(fixture.official.stdin);
+    expect(officialStart).toMatchObject({
+      method: "thread/start",
+    });
+    const officialGeneratedId = "01a0a979-official-uuidv7";
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialStart.id,
+        result: {
+          thread: {
+            id: officialGeneratedId,
+            cwd: "/synthetic",
+            turns: [],
+          },
+        },
+      })}\n`,
+    );
+
+    const inject = await readJsonLine(fixture.official.stdin);
+    expect(inject).toMatchObject({
+      method: "thread/inject_items",
+      params: {
+        threadId: officialGeneratedId,
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Pi message from external thread" }],
+          }),
+        ]),
+      },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: inject.id,
+        result: {},
+      })}\n`,
+    );
+
+    await expect(
+      fixture.collector.waitFor((message) => requestId(message, 63)),
+    ).resolves.toMatchObject({
+      result: { ok: true },
+    });
+
+    expect(await fixture.mappingStore.getThread(hostThreadIdSchema.parse(threadId))).toBeNull();
+
+    // Verify ID translation on subsequent request
+    writeRequest(fixture.desktopInput, {
+      id: 64,
+      method: "thread/read",
+      params: { threadId, includeTurns: true },
+    });
+    const officialReadSubsequent = await readJsonLine(fixture.official.stdin);
+    expect(officialReadSubsequent).toMatchObject({
+      method: "thread/read",
+      params: { threadId: officialGeneratedId, includeTurns: true },
+    });
+
+    // Verify reverse translation on response
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: officialReadSubsequent.id,
+        result: {
+          thread: {
+            id: officialGeneratedId,
+            turns: [],
+          },
+        },
+      })}\n`,
+    );
+    const readResponse = await fixture.collector.waitFor((message) => requestId(message, 64));
+    expect(readResponse).toMatchObject({
+      result: {
+        thread: {
+          id: threadId,
+        },
+      },
+    });
+
     await stopFixture(fixture);
   });
 
@@ -8565,4 +8922,82 @@ describe("AppServerHost HarnessAdapter projection", () => {
     expect(fixture.adapter.sessions).toHaveLength(0);
     await stopFixture(fixture);
   });
+
+  it("dispatches draft prepare and release to supporting adapter", async () => {
+    const fixture = createFixture();
+    const reserveDraft = vi.fn(async () => undefined);
+    const releaseDraft = vi.fn();
+    Object.assign(fixture.adapter, { reserveDraft, releaseDraft });
+
+    writeRequest(fixture.desktopInput, {
+      id: 991,
+      method: "codexhost/draft/prepare",
+      params: {
+        harnessId: "pi",
+        cwd: "/test/cwd",
+        model: "fake-model",
+      },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 991))).resolves.toEqual({
+      id: 991,
+      result: { status: "preparing" },
+    });
+    expect(reserveDraft).toHaveBeenCalledWith({
+      cwd: "/test/cwd",
+      model: { id: "fake-model" },
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 992,
+      method: "codexhost/draft/release",
+      params: {
+        harnessId: "pi",
+        cwd: "/test/cwd",
+        model: "fake-model",
+      },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 992))).resolves.toEqual({
+      id: 992,
+      result: { status: "released" },
+    });
+    expect(releaseDraft).toHaveBeenCalledWith({
+      cwd: "/test/cwd",
+      model: { id: "fake-model" },
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 993,
+      method: "codexhost/draft/prepare",
+      params: {
+        model: "codexhost/pi-native",
+        cwd: "/test/carrier-cwd",
+      },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 993))).resolves.toEqual({
+      id: 993,
+      result: { status: "preparing" },
+    });
+    expect(reserveDraft).toHaveBeenCalledWith({
+      cwd: "/test/carrier-cwd",
+    });
+
+    writeRequest(fixture.desktopInput, {
+      id: 994,
+      method: "codexhost/draft/release",
+      params: {
+        model: "codexhost/pi-native",
+        cwd: "/test/carrier-cwd",
+      },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 994))).resolves.toEqual({
+      id: 994,
+      result: { status: "released" },
+    });
+    expect(releaseDraft).toHaveBeenCalledWith({
+      cwd: "/test/carrier-cwd",
+    });
+
+    await stopFixture(fixture);
+  });
 });
+

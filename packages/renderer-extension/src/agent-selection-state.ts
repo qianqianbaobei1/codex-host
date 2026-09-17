@@ -331,50 +331,6 @@ export class DraftAgentController<Composer extends object> {
     return state;
   }
 
-  clearExternalConfiguration(composer: Composer, agent: ExternalRendererAgent): void {
-    const state = this.#state(composer);
-    switch (agent) {
-      case "pi":
-        delete state.piModel;
-        break;
-      case "claude-code":
-        delete state.claudeModel;
-        break;
-      case "deepseek-harness":
-        delete state.deepSeekHarnessModel;
-        break;
-      case "opencode":
-        delete state.openCodeModel;
-        break;
-      case "grok":
-        delete state.grokModel;
-        break;
-      case "omp":
-        delete state.ompModel;
-        break;
-      case "antigravity":
-        delete state.antigravityModel;
-        break;
-      case "kiro-cli":
-        delete state.kiroCliModel;
-        break;
-      case "cursor-cli":
-        delete state.cursorCliModel;
-        break;
-    }
-    this.setExternalThinkingOption(composer, agent);
-    if (state.permissionModeByAgent) {
-      const permissionModeByAgent = Object.fromEntries(
-        Object.entries(state.permissionModeByAgent).filter(([key]) => key !== agent),
-      ) as NonNullable<DraftComposerState["permissionModeByAgent"]>;
-      if (Object.keys(permissionModeByAgent).length > 0) {
-        state.permissionModeByAgent = permissionModeByAgent;
-      } else {
-        delete state.permissionModeByAgent;
-      }
-    }
-  }
-
   setPiConfiguration(
     composer: Composer,
     model: HarnessModelRef,

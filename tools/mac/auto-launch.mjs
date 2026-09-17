@@ -1,13 +1,34 @@
 #!/usr/bin/env node
 
 import { execFile, spawn } from "node:child_process";
+import {
+  appendFileSync,
+  closeSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_INTERVAL_MS = 3_000;
 const RETRY_INTERVAL_MS = 10_000;
+const MAX_RETRY_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_LOG_PATH = `${process.env.HOME ?? ""}/Library/Logs/codexhost/launcher.log`;
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const DEFAULT_STATE_PATH = `${process.env.HOME ?? ""}/Library/Application Support/codexhost/auto-launch-state.json`;
+// A managed launch is only confirmed once the runtime descriptor names a live launcher. Two
+// unconfirmed attempts in a row mean injection is broken, not slow.
+const MAX_UNCONFIRMED_LAUNCHES = 2;
+// While degraded the Desktop stays usable as a plain app; retry injection only occasionally.
+const DEGRADED_RETRY_MS = 15 * 60_000;
 
 export function parseProcessTable(stdout) {
   return stdout.split(/\r?\n/u).flatMap((line) => {
@@ -18,6 +39,74 @@ export function parseProcessTable(stdout) {
 
 function commandMatches(entry, executable) {
   return entry.command === executable || entry.command.startsWith(`${executable} `);
+}
+
+/**
+ * `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT` -> `/Applications/ChatGPT.app`.
+ * The plain-app fallback needs a bundle path for LaunchServices, not the executable.
+ */
+export function desktopAppFromExecutable(executable) {
+  const marker = ".app/Contents/MacOS/";
+  const index = executable.indexOf(marker);
+  return index < 0 ? null : executable.slice(0, index + ".app".length);
+}
+
+export function readAutoLaunchState(statePath) {
+  try {
+    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    return {
+      consecutiveLaunchFailures:
+        Number.isSafeInteger(parsed?.consecutiveLaunchFailures) &&
+        parsed.consecutiveLaunchFailures >= 0
+          ? parsed.consecutiveLaunchFailures
+          : 0,
+      degradedUntil: Number.isSafeInteger(parsed?.degradedUntil) ? parsed.degradedUntil : 0,
+    };
+  } catch {
+    // A missing or corrupt state file must never block launching.
+    return { consecutiveLaunchFailures: 0, degradedUntil: 0 };
+  }
+}
+
+export function writeAutoLaunchState(statePath, state) {
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+}
+
+/**
+ * Last-resort recovery: a failed injection can leave a Desktop whose renderer is wedged, so
+ * hand the user a clean plain app instead of a white window. Sessions live server-side, so
+ * restarting the Desktop loses nothing.
+ */
+export async function recoverUnmanagedDesktop(options, entries, dependencies = {}) {
+  const killProcess = dependencies.killProcess ?? ((pid) => process.kill(pid, "SIGTERM"));
+  for (const entry of entries) {
+    if (!commandMatches(entry, options.desktopExecutable)) continue;
+    try {
+      killProcess(entry.pid);
+    } catch {
+      // Already gone; nothing to recover.
+    }
+  }
+  await (dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(2_000);
+  const app = options.desktopApp ?? desktopAppFromExecutable(options.desktopExecutable);
+  if (!app) return false;
+  const openDesktop =
+    dependencies.openDesktop ??
+    ((bundlePath) =>
+      new Promise((resolve, reject) => {
+        const child = spawn("/usr/bin/open", ["-a", bundlePath], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.once("error", reject);
+        child.once("spawn", () => {
+          child.unref?.();
+          resolve();
+        });
+      }));
+  await openDesktop(app);
+  return true;
 }
 
 export function desktopRootRunning(entries, desktopExecutable) {
@@ -72,25 +161,75 @@ export function launcherArguments(options) {
   ];
 }
 
+export function createAutoLaunchLogWriter(logPath) {
+  // The watcher runs under launchd, whose stdio nobody reads, so its own notices (including the
+  // circuit-breaker warning) have to reach the same file the Launcher's stderr goes to.
+  let fd;
+  return (level, message) => {
+    try {
+      fd ??= openLaunchLog(logPath);
+      appendFileSync(fd, `[${new Date().toISOString()}] auto-launch ${level}: ${message}\n`);
+    } catch {
+      // Logging must never break launching.
+    }
+  };
+}
+
+export function retryDelayForAttempt(attempt) {
+  // Retrying a broken launch every few seconds burns CPU and hides the failure. Back off
+  // exponentially and cap it so a permanently broken setup settles into a slow retry.
+  const exponent = Math.max(0, attempt - 1);
+  return Math.min(RETRY_INTERVAL_MS * 2 ** exponent, MAX_RETRY_INTERVAL_MS);
+}
+
+export function openLaunchLog(logPath) {
+  mkdirSync(dirname(logPath), { recursive: true });
+  try {
+    if (statSync(logPath).size >= MAX_LOG_BYTES) renameSync(logPath, `${logPath}.1`);
+  } catch {
+    // A missing log file is the normal first-run case.
+  }
+  const fd = openSync(logPath, "a", 0o600);
+  // The mode argument only applies at creation, so tighten a pre-existing file too: renderer
+  // exception text can quote conversation content.
+  fchmodSync(fd, 0o600);
+  return fd;
+}
+
 export async function launchManagedCodex(options, dependencies = {}) {
   const spawnImplementation = dependencies.spawn ?? spawn;
-  const child = spawnImplementation(options.launcher, launcherArguments(options), {
-    cwd: options.root,
-    env: {
-      ...process.env,
-      PATH: options.path,
-    },
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false,
-  });
+  const openLog = dependencies.openLog ?? openLaunchLog;
+  // Synchronous on purpose: spawning must stay on this tick so callers that await the child's
+  // "spawn" event cannot race the listener registration below.
+  const logFd = openLog(options.logPath ?? DEFAULT_LOG_PATH);
+  let child;
+  try {
+    child = spawnImplementation(options.launcher, launcherArguments(options), {
+      cwd: options.root,
+      env: {
+        ...process.env,
+        PATH: options.path,
+      },
+      detached: true,
+      // The Launcher's stderr is inherited by the Desktop Controller, so discarding stdio here
+      // silently drops every diagnostic line both of them emit — including renderer failures.
+      stdio: ["ignore", logFd, logFd],
+      windowsHide: false,
+    });
+  } finally {
+    // The child owns its duplicated descriptors; release ours so repeated launches cannot leak.
+    closeSync(logFd);
+  }
   child.unref?.();
   await new Promise((resolve, reject) => {
     const onSpawn = () => {
+      child.removeListener?.("error", onError);
+      child.on?.("error", () => {});
       resolve();
     };
     const onError = (error) => {
       child.removeListener?.("spawn", onSpawn);
+      child.on?.("error", () => {});
       reject(error);
     };
     child.once?.("spawn", onSpawn);
@@ -104,10 +243,46 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
   const entries = await readProcesses();
   if (!desktopRootRunning(entries, options.desktopExecutable)) return "desktop-not-running";
   const descriptor = await (dependencies.readDescriptor ?? readDescriptor)(options.descriptorPath);
-  if (managedLauncherRunning(entries, descriptor, options.launcher)) return "already-managed";
+  const statePath = options.statePath ?? DEFAULT_STATE_PATH;
+  const readState = dependencies.readState ?? readAutoLaunchState;
+  const writeState = dependencies.writeState ?? writeAutoLaunchState;
+  if (managedLauncherRunning(entries, descriptor, options.launcher)) {
+    // Injection is confirmed. Forget earlier failures so the next one starts from scratch.
+    const state = await readState(statePath);
+    if (state.consecutiveLaunchFailures !== 0 || state.degradedUntil !== 0) {
+      await writeState(statePath, { consecutiveLaunchFailures: 0, degradedUntil: 0 });
+    }
+    return "already-managed";
+  }
   if (anyLauncherRunning(entries, options.launcher)) return "already-launching";
   if (options.dryRun) return "would-launch";
+
+  const state = await readState(statePath);
+  const now = Date.now();
+  // Degraded: the Desktop is already running as a plain app, which is the whole point. Stay
+  // quiet until the retry window opens, so a broken bundle cannot restart the wedge loop.
+  if (state.degradedUntil > now) return "degraded-idle";
+
+  if (state.consecutiveLaunchFailures >= MAX_UNCONFIRMED_LAUNCHES) {
+    // Circuit break. Repeated injection failures used to leave the Desktop wedged in a white
+    // window while every tick relaunched codexhost into it. Give the user a working plain app.
+    const recovered = await (dependencies.recoverDesktop ?? recoverUnmanagedDesktop)(
+      options,
+      entries,
+      dependencies,
+    );
+    await writeState(statePath, {
+      consecutiveLaunchFailures: state.consecutiveLaunchFailures + 1,
+      degradedUntil: now + DEGRADED_RETRY_MS,
+    });
+    return recovered ? "degraded" : "degraded-without-recovery";
+  }
+
   await (dependencies.launch ?? launchManagedCodex)(options, dependencies);
+  await writeState(statePath, {
+    consecutiveLaunchFailures: state.consecutiveLaunchFailures + 1,
+    degradedUntil: 0,
+  });
   return "launched";
 }
 
@@ -124,6 +299,8 @@ export function parseOptions(arguments_) {
     renderer: null,
     desktopExecutable: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
     descriptorPath: `${process.env.HOME ?? ""}/Library/Application Support/codexhost/desktop-runtime-v1.json`,
+    logPath: DEFAULT_LOG_PATH,
+    statePath: DEFAULT_STATE_PATH,
     root: process.cwd(),
     path: process.env.PATH ?? "/usr/bin:/bin",
   };
@@ -146,6 +323,7 @@ export function parseOptions(arguments_) {
     else if (argument === "--desktop-executable")
       options.desktopExecutable = value(index++, argument);
     else if (argument === "--descriptor") options.descriptorPath = value(index++, argument);
+    else if (argument === "--log") options.logPath = value(index++, argument);
     else if (argument === "--root") options.root = value(index++, argument);
     else if (argument === "--path") options.path = value(index++, argument);
     else if (argument === "--interval-ms") {
@@ -168,6 +346,7 @@ export function parseOptions(arguments_) {
         "descriptorPath",
         "root",
         "path",
+        "statePath",
       ].includes(name)
     )
       continue;
@@ -180,25 +359,55 @@ export function parseOptions(arguments_) {
 }
 
 export async function run(options, dependencies = {}) {
+  const logPath = options.logPath ?? DEFAULT_LOG_PATH;
+  const writeLog = dependencies.writeLog ?? createAutoLaunchLogWriter(logPath);
   const logger =
-    dependencies.log ?? ((message) => console.log(`[codexhost auto-launch] ${message}`));
+    dependencies.log ??
+    ((message) => {
+      console.log(`[codexhost auto-launch] ${message}`);
+      writeLog("info", message);
+    });
   const errorLogger =
-    dependencies.error ?? ((message) => console.error(`[codexhost auto-launch] ${message}`));
+    dependencies.error ??
+    ((message) => {
+      console.error(`[codexhost auto-launch] ${message}`);
+      writeLog("error", message);
+    });
   let inFlight = null;
   let nextAttemptAt = 0;
+  let consecutiveFailures = 0;
   const tick = async () => {
     if (inFlight || Date.now() < nextAttemptAt) return;
     try {
       const result = await checkAndMaybeLaunch(options, dependencies);
       if (result === "launched") {
+        consecutiveFailures = 0;
         nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
         logger("detected an unmanaged Codex Desktop; started codexhost");
       } else if (result === "would-launch") {
         logger("dry run: an unmanaged Codex Desktop would start codexhost");
+      } else if (result === "degraded") {
+        consecutiveFailures = 0;
+        // The retry window lives in the persisted state, not here: an in-memory backoff would
+        // also block recovery after an operator clears that state.
+        nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
+        errorLogger(
+          `Renderer injection failed ${MAX_UNCONFIRMED_LAUNCHES} times in a row; restarted Codex Desktop without codexhost and will retry injection in ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes`,
+        );
+      } else if (result === "degraded-without-recovery") {
+        consecutiveFailures = 0;
+        nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
+        errorLogger(
+          `Renderer injection failed ${MAX_UNCONFIRMED_LAUNCHES} times in a row and no .app bundle could be derived from '${options.desktopExecutable}'; pausing codexhost for ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes. Restart Codex Desktop manually if it is wedged.`,
+        );
       }
     } catch (error) {
-      nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
-      errorLogger(error instanceof Error ? error.message : String(error));
+      consecutiveFailures += 1;
+      const delay = retryDelayForAttempt(consecutiveFailures);
+      nextAttemptAt = Date.now() + delay;
+      errorLogger(
+        `${error instanceof Error ? error.message : String(error)} (attempt ${consecutiveFailures}, retrying in ${Math.round(delay / 1000)}s)`,
+      );
     }
   };
   inFlight = tick().finally(() => {

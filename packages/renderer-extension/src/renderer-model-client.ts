@@ -11,7 +11,12 @@ import {
   HARNESS_ACCOUNT_CREATE_METHOD,
   HARNESS_ACCOUNT_DELETE_METHOD,
   type HarnessAccountListResult,
+  THREAD_ACCOUNT_SELECT_METHOD,
+  threadAccountSelectParamsSchema,
+  threadAccountSelectResultSchema,
   type HarnessAccountSelectParams,
+  type ThreadAccountSelectParams,
+  type ThreadAccountSelectResult,
   type HarnessAccountLoginStartParams,
   type HarnessAccountLoginStartResult,
   type HarnessAccountCreateParams,
@@ -203,6 +208,8 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
   listHarnessAccounts?(): Promise<HarnessAccountListResult>;
   refreshHarnessAccounts?(): Promise<HarnessAccountListResult>;
   selectHarnessAccount?(input: HarnessAccountSelectParams): Promise<HarnessAccountListResult>;
+  /** Point one existing Thread at another Account and continue it there. */
+  selectThreadAccount?(input: ThreadAccountSelectParams): Promise<ThreadAccountSelectResult>;
   startHarnessAccountLogin?(
     input: HarnessAccountLoginStartParams,
   ): Promise<HarnessAccountLoginStartResult>;
@@ -308,6 +315,13 @@ export function createRendererModelClient(
     const params = threadUsageInspectionParamsSchema.parse(input);
     const result = await manager.sendRequest(THREAD_USAGE_INSPECT_METHOD, params);
     return threadUsageInspectionSchema.parse(result);
+  };
+  const selectThreadAccount = async (
+    input: ThreadAccountSelectParams,
+  ): Promise<ThreadAccountSelectResult> => {
+    const params = threadAccountSelectParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_ACCOUNT_SELECT_METHOD, params);
+    return threadAccountSelectResultSchema.parse(result);
   };
   const selectThreadModel = async (
     input: ThreadModelSelectParams,
@@ -435,6 +449,7 @@ export function createRendererModelClient(
         removeNotificationCallback();
       };
     },
+    selectThreadAccount,
     selectThreadModel,
     selectThreadThinking,
     selectThreadPermissionMode,

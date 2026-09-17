@@ -127,6 +127,17 @@ type AntigravityTurn = HostThreadSnapshot["turns"][number];
 type AntigravityItemSnapshot = AntigravityTurn["items"][number];
 
 function normalizeItemSnapshot(entry: AntigravityItemSnapshot): AntigravityItemSnapshot {
+  if (
+    entry.item.type === "agentMessage" &&
+    entry.item.text &&
+    entry.item.text.trim().length > 0 &&
+    entry.outcome.status === "failed"
+  ) {
+    return {
+      ...entry,
+      outcome: { status: "succeeded" },
+    };
+  }
   if (entry.item.type !== "toolExecution" || entry.item.output !== undefined) return entry;
   return {
     ...entry,
@@ -138,10 +149,16 @@ function normalizeItemSnapshot(entry: AntigravityItemSnapshot): AntigravityItemS
 }
 
 function normalizeTurns(turns: AntigravityTurn[]): AntigravityTurn[] {
-  return turns.map((turn) => ({
-    ...turn,
-    items: turn.items.map(normalizeItemSnapshot),
-  }));
+  return turns.map((turn) => {
+    const hasResponse = turn.items.some(
+      (item) => item.item.type === "agentMessage" && item.item.text.trim().length > 0,
+    );
+    return {
+      ...turn,
+      outcome: hasResponse && turn.outcome.status === "failed" ? { status: "succeeded" } : turn.outcome,
+      items: turn.items.map(normalizeItemSnapshot),
+    };
+  });
 }
 
 function historyRoot(environment: NodeJS.ProcessEnv): string {

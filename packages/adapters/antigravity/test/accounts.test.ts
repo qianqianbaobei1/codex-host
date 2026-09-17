@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ANTIGRAVITY_ACCOUNTS_DIR,
   AntigravityAccountStore,
+  antigravityAccountKeychain,
   antigravityAccountsFile,
   applyAntigravityAccountEnvironment,
   createEmptyAccountsFile,
@@ -143,6 +144,7 @@ describe("Antigravity shadow HOME", () => {
       createKeychain: async (file) => {
         await writeFile(file, "fake keychain", "utf8");
       },
+      selectKeychain: async () => undefined,
     });
 
     expect(report.linked).toEqual(
@@ -195,9 +197,52 @@ describe("Antigravity shadow HOME", () => {
       createKeychain: async () => {
         throw new Error("security unavailable");
       },
+      selectKeychain: async () => undefined,
     });
     expect(report.skipped).toContain("Library/Keychains/login.keychain-db");
     expect((await stat(shadowHome)).mode & 0o777).toBe(0o700);
+  });
+
+  it("selects the account keychain inside the shadow HOME, never the real domain", async () => {
+    const realHome = await makeRoot("shadow-select");
+    const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+    const shadowHome = path.join(shadowRoot, "work", "home");
+    const selected: Array<{ file: string; home: string }> = [];
+    await ensureAntigravityShadowHome({
+      realHome,
+      shadowHome,
+      shadowRoot,
+      createKeychain: async (file) => {
+        await writeFile(file, "fake keychain", "utf8");
+      },
+      selectKeychain: async (file, home) => {
+        selected.push({ file, home });
+      },
+    });
+    // `security` derives its keychain domain from $HOME, so every selection is
+    // scoped by the account HOME. That is what lets one account run while
+    // another account — or the real login keychain — stays usable.
+    expect(selected).toEqual([{ file: antigravityAccountKeychain(shadowHome), home: shadowHome }]);
+    expect(selected[0]?.home).not.toBe(realHome);
+  });
+
+  it("runs no keychain command at all when keychain management is disabled", async () => {
+    const realHome = await makeRoot("shadow-no-keychain");
+    const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+    const shadowHome = path.join(shadowRoot, "work", "home");
+    const boom = async (): Promise<void> => {
+      throw new Error("keychain command must not run");
+    };
+    const report = await ensureAntigravityShadowHome({
+      realHome,
+      shadowHome,
+      shadowRoot,
+      manageDarwinKeychain: false,
+      createKeychain: boom,
+      selectKeychain: boom,
+    });
+    expect(report.linked).not.toContain("Library/Keychains/login.keychain-db");
+    expect(report.skipped).not.toContain("Library/Keychains/selection");
   });
 
   it("is idempotent and never clobbers existing entries", async () => {
@@ -208,10 +253,12 @@ describe("Antigravity shadow HOME", () => {
     const createKeychain = async (file: string): Promise<void> => {
       await writeFile(file, "fake keychain", "utf8");
     };
-    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot, createKeychain });
+    const selectKeychain = async (): Promise<void> => undefined;
+    const options = { realHome, shadowHome, shadowRoot, createKeychain, selectKeychain };
+    await ensureAntigravityShadowHome(options);
     await rm(path.join(shadowHome, ".gitconfig"));
     await writeFile(path.join(shadowHome, ".gitconfig"), "local override", "utf8");
-    await ensureAntigravityShadowHome({ realHome, shadowHome, shadowRoot, createKeychain });
+    await ensureAntigravityShadowHome(options);
     expect(await readFile(path.join(shadowHome, ".gitconfig"), "utf8")).toBe("local override");
   });
 });

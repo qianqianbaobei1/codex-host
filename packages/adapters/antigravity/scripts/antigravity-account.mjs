@@ -149,22 +149,17 @@ switch (command) {
     const home = await store.ensureHome(account);
     if (flags.run) {
       console.log(`正在为账号 '${account.id}' 启动隔离登录（专用钥匙串 + 影子 HOME）...`);
-      const release = await store.acquireKeychainIsolation(account);
-      try {
-        const { spawnSync } = await import("node:child_process");
-        const agyCmd = process.env.CODEXHOST_ANTIGRAVITY_COMMAND || "agy";
-        spawnSync(agyCmd, [], {
-          stdio: "inherit",
-          env: {
-            ...process.env,
-            HOME: home,
-          },
-        });
-        await store.markReady(account.id);
-        console.log(`\n账号 '${account.id}' 登录已完成并标记为 ready`);
-      } finally {
-        await release();
-      }
+      const { spawnSync } = await import("node:child_process");
+      const agyCmd = process.env.CODEXHOST_ANTIGRAVITY_COMMAND || "agy";
+      spawnSync(agyCmd, [], {
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          HOME: home,
+        },
+      });
+      await store.markReady(account.id);
+      console.log(`\n账号 '${account.id}' 登录已完成并标记为 ready`);
     } else {
       console.log(`HOME=${home} agy`);
       console.log(`\n💡 提示：如需直接启动交互登录并接管隔离钥匙串，请执行：`);

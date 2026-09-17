@@ -330,7 +330,18 @@ describe("Grok Adapter ACP projection", () => {
 
     await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
       status: "ready",
-      catalog: { models: [{ ref: { id: "grok-4.6" } }] },
+      catalog: {
+        models: [
+          {
+            ref: { id: "grok-4.6" },
+            supportedThinkingOptionIds: ["low", "high"],
+          },
+        ],
+        thinkingOptions: [
+          { id: "low", label: "Low" },
+          { id: "high", label: "High" },
+        ],
+      },
       permissionModes: {
         modes: [
           { id: "ask", label: "Ask" },

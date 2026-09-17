@@ -29,6 +29,7 @@ interface RendererCdpClient {
   command(method: string, params?: Record<string, unknown>): Promise<unknown>;
   evaluate<T>(expression: string): Promise<T>;
   close(): void;
+  on?(method: string, listener: (params: unknown) => void): () => void;
 }
 
 interface RendererCdpControlOperations {
@@ -173,6 +174,32 @@ async function readBinding(renderer: RendererCdpClient): Promise<unknown> {
   return renderer.evaluate<unknown>("window.__codexhostRendererBindingProbeV1?.status() ?? null");
 }
 
+/**
+ * The injected source runs inside the Desktop renderer, where faults used to leave no trace at
+ * all: CDP was enabled but no events were ever consumed, so a thrown exception or a runaway
+ * renderer loop looked identical to a hung Desktop. Surface them on the Controller's stderr,
+ * which the Launcher inherits into the auto-launch log.
+ */
+function reportRendererDiagnostics(renderer: RendererCdpClient): void {
+  if (typeof renderer.on !== "function") return;
+  renderer.on("Runtime.exceptionThrown", (params) => {
+    const details = (
+      params as {
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
+      }
+    )?.exceptionDetails;
+    const description = details?.exception?.description ?? details?.text ?? "unknown exception";
+    // Only the first line: V8 stacks are multi-line and would flood the log.
+    console.error(`codexhost renderer exception: ${description.split("\n")[0]}`);
+  });
+  renderer.on("Log.entryAdded", (params) => {
+    const entry = (params as { entry?: { level?: string; source?: string; text?: string } })?.entry;
+    if (entry?.level !== "error") return;
+    const text = (entry.text ?? "").slice(0, 500);
+    console.error(`codexhost renderer log [${entry.source ?? "unknown"}]: ${text}`);
+  });
+}
+
 async function waitForBinding(
   renderer: RendererCdpClient,
   enabledAgents: readonly string[],
@@ -197,6 +224,26 @@ async function waitForBinding(
   throw new Error(`Production Renderer binding did not become ready${detail}`);
 }
 
+/**
+ * A failed install can leave a half-applied integration behind: listeners, a MutationObserver,
+ * and injected styles that keep rewriting the Desktop's DOM. Ask the bundle to tear itself down
+ * before dropping the connection, so a Desktop the user keeps using is not left corrupted by an
+ * integration we already gave up on.
+ */
+async function uninstallRendererIntegration(renderer: RendererCdpClient): Promise<void> {
+  try {
+    await renderer.command("Runtime.evaluate", {
+      expression: [
+        "window.__codexhostRendererBindingProbeV1?.dispose?.();",
+        "for (const node of document.querySelectorAll('style[data-codexhost-rate-limit-style]')) node.remove();",
+      ].join(" "),
+      awaitPromise: true,
+    });
+  } catch {
+    // A wedged renderer cannot answer; the Launcher's circuit breaker covers that case.
+  }
+}
+
 async function installTarget(
   target: CdpTarget,
   rendererSource: string,
@@ -208,6 +255,9 @@ async function installTarget(
   const renderer = await operations.connect(target.webSocketDebuggerUrl);
   try {
     await renderer.command("Runtime.enable");
+    // Optional domain: an older Desktop that rejects it still supports everything below.
+    await renderer.command("Log.enable").catch(() => undefined);
+    reportRendererDiagnostics(renderer);
     await renderer.command("Page.enable");
     await renderer.command("Page.addScriptToEvaluateOnNewDocument", { source: rendererSource });
     await evaluateSource(renderer, rendererSource);
@@ -215,6 +265,12 @@ async function installTarget(
     const binding = await waitForBinding(renderer, enabledAgents, timeoutMs, pollIntervalMs);
     return { renderer, snapshot: { target, draftPrewarmPolicy, binding } };
   } catch (error) {
+    // Without this the failure only surfaced as an exit code, so a Desktop that never became
+    // controllable left the user staring at a blank window with nothing to diagnose.
+    console.error(
+      `codexhost renderer install failed for ${target.url}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    await uninstallRendererIntegration(renderer);
     renderer.close();
     throw error;
   }

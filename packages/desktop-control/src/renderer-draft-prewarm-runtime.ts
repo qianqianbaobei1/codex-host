@@ -80,6 +80,14 @@ export function installDraftPrewarmPolicyBridge(
   let selectedCodexAccountId: string | null = null;
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === "object" && value !== null && !Array.isArray(value);
+  let lastKnownCwd: string | null = null;
+  const observeParameters = (parameters: unknown): void => {
+    if (isRecord(parameters) && typeof parameters.cwd === "string" && parameters.cwd.trim().length > 0) {
+      lastKnownCwd = parameters.cwd;
+    }
+  };
+  const isDraftPrewarmCarrier = (model: string | null): model is string =>
+    typeof model === "string" && model.startsWith("codexhost/");
   const isRemoteControlHost = hostId.startsWith("remote-control:");
   const knownExternalThreadIds = new Set<string>();
   const knownOfficialThreadIds = new Set<string>();
@@ -568,6 +576,7 @@ export function installDraftPrewarmPolicyBridge(
   ]);
   const pollCache = new Map<string, { at: number; value: unknown }>();
   const dispatchSend = (method: string, parameters: unknown, options?: unknown): unknown => {
+    observeParameters(parameters);
     const routedParameters =
       method === "thread/start"
         ? routeThreadStart(parameters)
@@ -632,7 +641,20 @@ export function installDraftPrewarmPolicyBridge(
     return result;
   };
   const routedPrewarm = (parameters: unknown, options?: unknown): unknown => {
+    observeParameters(parameters);
     const routedParameters = routeThreadStart(parameters);
+    if (
+      isDraftPrewarmCarrier(selectedModel) &&
+      lastKnownCwd &&
+      (!isRecord(parameters) || parameters.ephemeral !== true)
+    ) {
+      void Promise.resolve(
+        routedSend("codexhost/draft/prepare", {
+          model: selectedModel,
+          cwd: lastKnownCwd,
+        }),
+      ).catch(() => undefined);
+    }
     if (shouldUseBridge("thread/start", routedParameters)) {
       return routedSend("thread/start", routedParameters, options);
     }
@@ -721,7 +743,24 @@ export function installDraftPrewarmPolicyBridge(
         return true;
       }
       if (selectedModel === model) return false;
+      const previousModel = selectedModel;
       selectedModel = model;
+      if (isDraftPrewarmCarrier(previousModel) && lastKnownCwd) {
+        void Promise.resolve(
+          routedSend("codexhost/draft/release", {
+            model: previousModel,
+            cwd: lastKnownCwd,
+          }),
+        ).catch(() => undefined);
+      }
+      if (isDraftPrewarmCarrier(model) && lastKnownCwd) {
+        void Promise.resolve(
+          routedSend("codexhost/draft/prepare", {
+            model,
+            cwd: lastKnownCwd,
+          }),
+        ).catch(() => undefined);
+      }
       return true;
     },
     selectAccount(accountId: string | null): boolean {
@@ -734,7 +773,18 @@ export function installDraftPrewarmPolicyBridge(
     },
     clear(): Promise<void> {
       prewarmedThreadManager.discardAllPrewarmedThreads();
+      if (isDraftPrewarmCarrier(selectedModel) && lastKnownCwd) {
+        void Promise.resolve(
+          routedSend("codexhost/draft/prepare", {
+            model: selectedModel,
+            cwd: lastKnownCwd,
+          }),
+        ).catch(() => undefined);
+      }
       return Promise.resolve();
+    },
+    lastKnownCwd(): string | null {
+      return lastKnownCwd;
     },
     dispose(): void {
       if (bridge.sendRequest === routedSend) bridge.sendRequest = originalSend;
@@ -765,6 +815,14 @@ export function installDraftPrewarmPolicyBridge(
       knownExternalThreadIds.clear();
       knownOfficialThreadIds.clear();
       threadOwnershipResolutions.clear();
+      if (isDraftPrewarmCarrier(selectedModel) && lastKnownCwd) {
+        void Promise.resolve(
+          routedSend("codexhost/draft/release", {
+            model: selectedModel,
+            cwd: lastKnownCwd,
+          }),
+        ).catch(() => undefined);
+      }
       selectedModel = null;
       selectedCodexAccountId = null;
     },

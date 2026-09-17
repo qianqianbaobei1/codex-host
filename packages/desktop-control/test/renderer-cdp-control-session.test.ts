@@ -64,6 +64,89 @@ describe("Renderer CDP Control Session", () => {
     ).toBeNull();
   });
 
+  it("surfaces renderer exceptions and error logs onto the controller log", async () => {
+    const client = rendererClient();
+    const listeners = new Map<string, (params: unknown) => void>();
+    const subscribing = {
+      ...client,
+      on: (method: string, listener: (params: unknown) => void) => {
+        listeners.set(method, listener);
+        return () => listeners.delete(method);
+      },
+    };
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "source",
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect: vi.fn(async () => subscribing),
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      listeners.get("Runtime.exceptionThrown")?.({
+        exceptionDetails: { exception: { description: "TypeError: boom\n    at renderer" } },
+      });
+      listeners.get("Log.entryAdded")?.({
+        entry: { level: "error", source: "security", text: "CSP" },
+      });
+      // Warnings are noise; only error-level entries are forwarded.
+      listeners.get("Log.entryAdded")?.({
+        entry: { level: "warning", source: "deprecation", text: "noisy" },
+      });
+
+      expect(errorSpy).toHaveBeenCalledWith("codexhost renderer exception: TypeError: boom");
+      expect(errorSpy).toHaveBeenCalledWith("codexhost renderer log [security]: CSP");
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      errorSpy.mockRestore();
+      session.close();
+    }
+  });
+
+  it("uninstalls a partially applied integration when the binding never becomes ready", async () => {
+    const client = rendererClient();
+    // The bundle installed but never published a usable binding, so installation fails.
+    client.evaluateSpy.mockResolvedValue(null);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        createRendererCdpControlSession({
+          rendererCdpEndpoint: "http://127.0.0.1:43123",
+          rendererSource: "source",
+          pollIntervalMs: 1,
+          timeoutMs: 30,
+          operations: {
+            listTargets: vi.fn(async () => [target("page-1")]),
+            connect: vi.fn(async () => client),
+            installDraftPrewarmPolicy: vi.fn(async () => ({
+              state: "ready" as const,
+              reason: "owned-request-bridge" as const,
+            })),
+          },
+        }),
+      ).rejects.toThrow(/binding did not become ready/i);
+
+      // The abandoned integration must not keep mutating a Desktop we gave up on.
+      const teardown = client.commands.filter((entry) =>
+        String(entry.params?.expression ?? "").includes(
+          "__codexhostRendererBindingProbeV1?.dispose",
+        ),
+      );
+      expect(teardown).toHaveLength(1);
+      expect(client.close).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("registers future-document injection before evaluating the current document", async () => {
     const client = rendererClient();
     const source = "globalThis.__codexhostInstalled = true";
@@ -84,6 +167,7 @@ describe("Renderer CDP Control Session", () => {
 
     expect(client.commands).toEqual([
       { method: "Runtime.enable" },
+      { method: "Log.enable" },
       { method: "Page.enable" },
       { method: "Page.addScriptToEvaluateOnNewDocument", params: { source } },
       {

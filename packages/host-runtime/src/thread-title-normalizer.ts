@@ -39,9 +39,15 @@ export function inferTitleTag(text: string): string {
 
 const RECOGNIZABLE_TOPICS: Array<{ topic: string; pattern: RegExp }> = [
   { topic: "Codex Host", pattern: /\bcodex\s*host\b/i },
+  { topic: "Codex", pattern: /\bcodex\b/i },
   { topic: "Claude Code", pattern: /\bclaude\s+code\b/i },
+  { topic: "Claude", pattern: /\bclaude\b/i },
   { topic: "ChatGPT", pattern: /\bchatgpt\b/i },
   { topic: "OpenAI", pattern: /\bopenai\b/i },
+  { topic: "Gemini", pattern: /\bgemini\b/i },
+  { topic: "DeepSeek", pattern: /\bdeepseek\b/i },
+  { topic: "Grok", pattern: /\bgrok\b/i },
+  { topic: "Clash", pattern: /\bclash\b/i },
   { topic: "Python", pattern: /\bpython\b/i },
   { topic: "React", pattern: /\breact\b/i },
   { topic: "Electron", pattern: /\belectron\b/i },
@@ -51,7 +57,11 @@ const RECOGNIZABLE_TOPICS: Array<{ topic: string; pattern: RegExp }> = [
   { topic: "PDF", pattern: /\bpdf\b/i },
   { topic: "API", pattern: /\bapi\b/i },
   { topic: "MCP", pattern: /\bmcp\b/i },
+  { topic: "Git", pattern: /\bgit\b/i },
+  { topic: "Docker", pattern: /\bdocker\b/i },
+  { topic: "Axure", pattern: /\baxure\b/i },
   { topic: "LoopX", pattern: /\bloopx\b/i },
+  { topic: "配电箱", pattern: /配电箱/ },
   { topic: "中国中铁", pattern: /中国中铁/ },
   { topic: "平方网", pattern: /平方网/ },
   { topic: "采购", pattern: /采购/ },
@@ -60,7 +70,7 @@ const RECOGNIZABLE_TOPICS: Array<{ topic: string; pattern: RegExp }> = [
 ];
 
 const OBJECT_SUFFIX =
-  "规则|策略|方案|报告|脚本|接口|页面|组件|图纸|清单|数据|问题|流程|配置|逻辑|标题|命名|文档|账号|额度|路径|文件";
+  "规则|策略|方案|报告|脚本|接口|页面|组件|图纸|清单|数据|问题|流程|配置|逻辑|标题|命名|文档|账号|额度|路径|文件|报错|错误|异常|故障|需求";
 
 const ACTION_WORDS = [
   "重新设计",
@@ -159,14 +169,20 @@ function removeTitleNoise(rawText: string): string {
     .replace(/你?看(?:一下|下)?(?:当前|现在)?(?:的)?(?:规则|方案|内容)?/g, " ")
     .replace(/(?:重新(?:帮我|请你|请)?写)(?:一下)?/g, "重写")
     .replace(/重新\s*写(?:一下)?/g, "重写")
-    .replace(/(?:重写|改写|修复|排查|实现|设计|分析|审视|检查)(?:一下|下)/g, "$1")
+    .replace(/(重写|改写|修复|排查|实现|设计|分析|审视|检查)(?:一下|下)/g, "$1")
     .replace(/(?:一下|下)[啊呀吧呢哦]+/g, "")
-    .replace(/(?:谢谢|感谢|辛苦了)[啊呀吧呢哦]?$/g, "");
+    .replace(/(?:谢谢|感谢|辛苦了)[啊呀吧呢哦]?$/g, "")
+    .replace(/(?:[，,、\s]+)?(?:请)?(?:帮我)?(?:查|看|排查|想知道|搞清楚)?(?:一下|下)?(?:是)?(?:为什么|为啥|怎么回事|是什么原因)[？?啊呀吧呢哦]*$/g, "")
+    .replace(/(?:这是)?(?:什么原因|为什么|为啥)(?:导致的|引起的)?[？?啊呀吧呢哦]*$/g, "")
+    .replace(/(?:这是为啥|这是为什么|怎么回事)[？?啊呀吧呢哦]*$/g, "")
+    .replace(/\[(?:图片|图片附件|附件)\]/gi, " ")
+    .replace(/(?:我想请教一个问题|帮我想一个问题)[：:，,\s]*/g, " ")
+    .replace(/^(?:这是|是)?(?:什么问题|什么原因)(?:导致的)?[？?啊呀吧呢哦]*$/, "排查问题原因");
 
   // Remove leading request grammar but leave the requested action intact.
   for (let i = 0; i < 3; i += 1) {
     text = text.replace(
-      /^\s*(?:如何|怎样|怎么|能否|是否|请|帮我|我想(?:知道|了解)?|需要|继续|针对|关于|对|用|使用|看一下|看下)\s*/,
+      /^\s*(?:如何|怎样|怎么|能否|是否|请|帮我|我想(?:知道|了解)?|需要|继续|针对|关于|对|用|使用|看一下|看下|目前)\s*/,
       "",
     );
   }
@@ -176,17 +192,16 @@ function removeTitleNoise(rawText: string): string {
 
 function extractObject(text: string): string | null {
   const matches = Array.from(
-    text.matchAll(new RegExp(`[\\u4e00-\\u9fa5A-Za-z0-9 _-]{2,20}(?:${OBJECT_SUFFIX})`, "g")),
+    text.matchAll(new RegExp(`(?:[\\u4e00-\\u9fa5A-Za-z0-9_-]{1,12})?(?:${OBJECT_SUFFIX})`, "g")),
   )
     .map((match) => match[0]?.trim() ?? "")
     .filter(Boolean);
   return matches.at(-1) ?? null;
 }
 
-function normalizeActionBody(rawBody: string): string {
+function normalizeSingleClause(clause: string): string {
   let body = compactMixedSpacing(
-    rawBody
-      .replace(/[，。！？、：；,.!?:;—]/g, " ")
+    clause
       .replace(/[【】（）()]/g, " ")
       .replace(/\s+/g, " ")
       .trim(),
@@ -196,16 +211,53 @@ function normalizeActionBody(rawBody: string): string {
   const trailingAction = ACTION_WORDS.find((action) =>
     new RegExp(`${escapeRegExp(action)}$`, "i").test(body),
   );
-  if (object && trailingAction) body = `${trailingAction}${object}`;
+  if (object && trailingAction) {
+    body = `${trailingAction}${object}`;
+  } else {
+    const leadingAction = ACTION_WORDS.find((action) =>
+      new RegExp(`^${escapeRegExp(action)}`, "i").test(body),
+    );
+    const firstObject = Array.from(
+      body.matchAll(new RegExp(`(?:[\\u4e00-\\u9fa5A-Za-z0-9_-]{1,12})?(?:${OBJECT_SUFFIX})`, "g")),
+    )
+      .map((match) => match[0]?.trim() ?? "")
+      .filter(Boolean)[0];
+    if (leadingAction && firstObject) {
+      let coreObject = firstObject;
+      if (coreObject.startsWith(leadingAction)) {
+        coreObject = coreObject.slice(leadingAction.length);
+      }
+      coreObject = coreObject.replace(/^(?:当前|现在|这个|本次|这次|的|\s)+/, "");
+      if (coreObject) {
+        body = `${leadingAction}${coreObject}`;
+      }
+    }
+  }
 
-  // A title should retain the first meaningful clause, not a second sentence
-  // asking the assistant to explain or conclude something.
   body = body
     .replace(/\s+(?:并|然后|同时)?\s*(?:请)?(?:告诉我|说明一下|给出答案|给出结论).*$/g, "")
     .replace(/[并与和对在从向给与以及]+$/g, "")
     .trim();
 
   return compactMixedSpacing(body);
+}
+
+function normalizeActionBody(rawBody: string): string {
+  const clauses = rawBody
+    .split(/[，。！？、：；,.!?:;—\n]+/)
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  if (clauses.length > 1 && clauses[0]) {
+    const firstNormalized = normalizeSingleClause(clauses[0]);
+    const hasAction = ACTION_WORDS.some((action) => firstNormalized.includes(action));
+    const hasObject = new RegExp(`(?:${OBJECT_SUFFIX})`).test(firstNormalized);
+    if (hasAction && hasObject) {
+      return firstNormalized;
+    }
+  }
+
+  return normalizeSingleClause(rawBody.replace(/[，。！？、：；,.!?:;—]/g, " "));
 }
 
 /**
@@ -251,9 +303,9 @@ export function extractMeaningfulTitleText(rawTitle: string): string {
   text = text.replace(/<USER_REQUEST>|<\/USER_REQUEST>/gi, "");
   text = text.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "");
   text = text.replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "");
-  text = text.replace(/\[System Note:[\s\S]*?--- Prior Conversation History ---/gi, "");
+  text = text.replace(/\[System Note:[\s\S]*?--- End Prior Conversation History ---\s*/gi, "");
   text = text.replace(
-    /--- Prior Conversation History ---[\s\S]*?--- End Prior Conversation History ---/gi,
+    /--- Prior Conversation History ---[\s\S]*?--- End Prior Conversation History ---\s*/gi,
     "",
   );
 
@@ -290,15 +342,13 @@ export function extractMeaningfulTitleText(rawTitle: string): string {
 
 function formatTitle(topic: string | null, body: string): string {
   const normalizedTopic = topic ? clipText(cleanTopic(topic), MAX_TOPIC_LENGTH) : "";
-  const normalizedBody = normalizeActionBody(body);
+  const cleanedBody = normalizedTopic ? removeTopic(body, normalizedTopic) : body;
+  const normalizedBody = normalizeActionBody(cleanedBody);
   if (!normalizedBody) return normalizedTopic;
   if (!normalizedTopic) return clipText(normalizedBody, MAX_TITLE_LENGTH);
 
-  const bodyWithoutTopic = normalizeActionBody(removeTopic(normalizedBody, normalizedTopic));
-  if (!bodyWithoutTopic) return normalizedTopic;
-
   const prefix = `[${normalizedTopic}] `;
-  return `${prefix}${clipText(bodyWithoutTopic, MAX_TITLE_LENGTH - Array.from(prefix).length)}`;
+  return `${prefix}${clipText(normalizedBody, MAX_TITLE_LENGTH - Array.from(prefix).length)}`;
 }
 
 export function normalizeThreadTitle(rawTitle: string): string {

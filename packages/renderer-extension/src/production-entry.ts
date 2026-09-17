@@ -1,5 +1,6 @@
 import { DEFAULT_RENDERER_AGENTS, type RendererAgent } from "./agent-selection-state.js";
 import { installRendererBinding } from "./install-renderer-binding.js";
+import { ensureRateLimitBannerSuppressionStyle } from "./renderer-composer-dom.js";
 
 declare global {
   interface Window {
@@ -7,6 +8,10 @@ declare global {
       defaultAgent: RendererAgent;
     };
   }
+}
+
+if (typeof document !== "undefined") {
+  ensureRateLimitBannerSuppressionStyle(document);
 }
 
 const configuration = window.__codexhostProductionConfigV1;

@@ -1066,4 +1066,83 @@ describe("Renderer draft prewarm policy", () => {
       "Renderer draft prewarm policy returned an invalid status",
     );
   });
+
+  it("dispatches draft prepare and release during draft agent selection lifecycle", async () => {
+    const sendRequest = vi.fn(async () => undefined);
+    const manager = requestManagerFixture();
+    const bridge = requestBridgeFixture({ sendRequest });
+    const target: DraftPrewarmPolicyTarget = {};
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const policy = target.__codexhostDraftPrewarmPolicyV1 as {
+      select(model: string | null): boolean;
+      clear(): Promise<void>;
+      dispose(): void;
+      lastKnownCwd(): string | null;
+    };
+
+    // Establish cwd through initial prewarm or sendRequest
+    await bridge.sendRequest("thread/start", { cwd: "/work/my-project", model: "gpt-5" });
+    expect(policy.lastKnownCwd()).toBe("/work/my-project");
+
+    // Select external model -> triggers draft/prepare
+    policy.select("codexhost/antigravity-native/models/gemini-2.5-pro");
+    // Allow microtasks to resolve
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/prepare", {
+      model: "codexhost/antigravity-native/models/gemini-2.5-pro",
+      cwd: "/work/my-project",
+    });
+
+    // Switch to another external model -> releases old, prepares new
+    policy.select("codexhost/claude-code-native");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/release", {
+      model: "codexhost/antigravity-native/models/gemini-2.5-pro",
+      cwd: "/work/my-project",
+    });
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/prepare", {
+      model: "codexhost/claude-code-native",
+      cwd: "/work/my-project",
+    });
+
+    // Clear policy -> discards prewarmed threads and re-prepares active external model
+    await policy.clear();
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/prepare", {
+      model: "codexhost/claude-code-native",
+      cwd: "/work/my-project",
+    });
+
+    // Dispose -> releases active external model
+    policy.dispose();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/release", {
+      model: "codexhost/claude-code-native",
+      cwd: "/work/my-project",
+    });
+  });
+
+  it("triggers draft prepare on prewarmThreadStart when external model is selected", async () => {
+    const sendRequest = vi.fn(async () => undefined);
+    const prewarmThreadStart = vi.fn(async () => undefined);
+    const manager = requestManagerFixture();
+    const bridge = requestBridgeFixture({ sendRequest, prewarmThreadStart });
+    const target: DraftPrewarmPolicyTarget = {};
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const policy = target.__codexhostDraftPrewarmPolicyV1 as {
+      select(model: string | null): boolean;
+    };
+
+    policy.select("codexhost/antigravity-native");
+    await bridge.prewarmThreadStart?.({ cwd: "/work/prewarm-dir", model: "gpt-5" });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendRequest).toHaveBeenCalledWith("codexhost/draft/prepare", {
+      model: "codexhost/antigravity-native",
+      cwd: "/work/prewarm-dir",
+    });
+  });
 });

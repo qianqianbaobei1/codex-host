@@ -1,5 +1,5 @@
 import { AccountRateLimits } from "./codex-runtime/account-rate-limits.js";
-import { inspectHarnessAccounts } from "./harness-accounts.js";
+import { inspectHarnessAccounts, type HarnessCreditsRefreshMode } from "./harness-accounts.js";
 import type { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -32,11 +32,14 @@ import {
   harnessAccountListParamsSchema,
   harnessAccountListResultSchema,
   harnessAccountSelectParamsSchema,
+  threadAccountSelectParamsSchema,
+  threadAccountSelectResultSchema,
   harnessAccountLoginStartParamsSchema,
   harnessAccountLoginStartResultSchema,
   harnessAccountCreateParamsSchema,
   harnessAccountDeleteParamsSchema,
   HARNESS_ACCOUNT_SELECT_METHOD,
+  THREAD_ACCOUNT_SELECT_METHOD,
   HARNESS_ACCOUNT_REFRESH_METHOD,
   HARNESS_ACCOUNT_LOGIN_START_METHOD,
   HARNESS_ACCOUNT_CREATE_METHOD,
@@ -72,6 +75,7 @@ import {
   harnessWebUiOpenResultSchema,
   harnessModelSelectionStateSchema,
   harnessThinkingOptionIdSchema,
+  sortThinkingOptionsByEffort,
   hostItemIdSchema,
   hostThreadIdSchema,
   hostTurnIdSchema,
@@ -186,6 +190,7 @@ import {
   CodexRuntimePool,
   UnknownCodexThreadAccountError,
 } from "./codex-runtime/codex-runtime-pool.js";
+import { ThreadAliasStore, type ThreadAliasStoreLike } from "./thread-alias-store.js";
 import { aggregateOfficialAccountThreadListPage } from "./multi-account-thread-list.js";
 import type { HostUpdateCoordinator } from "./update-coordinator.js";
 
@@ -273,6 +278,7 @@ export interface AppServerHostOptions {
   ) => OfficialAppServerConnection | Promise<OfficialAppServerConnection>;
   accountRepository?: AccountRepositoryLike;
   threadAccountStore?: ThreadAccountStoreLike;
+  threadAliasStore?: ThreadAliasStoreLike;
   /** Whether to normalize Thread titles to the local `[主题] 动作对象` standard. */
   normalizeThreadTitles?: boolean;
   onCreateRequestRoute?: (observation: CreateRequestRouteObservation) => void;
@@ -650,6 +656,7 @@ export class AppServerHost {
   // the user's turn. Serve repeats from a short-lived result cache.
   #accountCache: { at: number; result: HarnessAccountListResult } | null = null;
   static readonly #ACCOUNT_CACHE_TTL_MS = 30_000;
+  #accountCreditsRefresh: Promise<unknown> | null = null;
   #harnessInspectionCache = new Map<string, { at: number; result: HarnessInspection }>();
   #harnessInspectionRequests = new Map<string, Promise<HarnessInspection>>();
   static readonly #HARNESS_INSPECTION_CACHE_TTL_MS = 5_000;
@@ -705,6 +712,7 @@ export class AppServerHost {
   #goalContinuationTimers = new Map<string, NodeJS.Timeout>();
   #drainActiveWorkOnInputEnd = false;
   #desktopInputEnded = false;
+  readonly #threadAliases: ThreadAliasStoreLike;
 
   constructor(options: AppServerHostOptions) {
     this.#options = {
@@ -735,6 +743,8 @@ export class AppServerHost {
       new ThreadAccountStore({ directory: path.join(dataDirectory, "codex-accounts") });
     this.#accountRepository = accountRepository;
     this.#threadAccountStore = threadAccountStore;
+    this.#threadAliases =
+      options.threadAliasStore ?? new ThreadAliasStore({ directory: dataDirectory });
     this.#accountDataDirectory = dataDirectory;
     this.#codexRuntimePool = new CodexRuntimePool({
       accounts: accountRepository,
@@ -1021,7 +1031,7 @@ export class AppServerHost {
             return;
           }
           const result = await this.#harnessAccountList(
-            request.method === HARNESS_ACCOUNT_REFRESH_METHOD,
+            request.method === HARNESS_ACCOUNT_REFRESH_METHOD ? "force" : "none",
           );
           await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
         });
@@ -1056,9 +1066,13 @@ export class AppServerHost {
           // The default changed, so the cached inspection is stale.
           this.#accountInspection = null;
           this.#accountCache = null;
-          this.#harnessInspectionCache.clear();
-          const result = await this.#harnessAccountList(true);
+          this.#invalidateHarnessInspection(params.data.harnessId);
+          // Switching is a local state change: answer from the cached rows and
+          // let quota telemetry refresh afterwards. Awaiting per-account quota
+          // probes here made one click block for twenty seconds.
+          const result = await this.#harnessAccountList();
           await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
+          this.#scheduleHarnessAccountCreditsRefresh();
         });
         continue;
       }
@@ -1086,7 +1100,7 @@ export class AppServerHost {
             await adapter.loginAccount(params.data.accountId);
             this.#accountInspection = null;
             this.#accountCache = null;
-            this.#harnessInspectionCache.clear();
+            this.#invalidateHarnessInspection(params.data.harnessId);
             const result = harnessAccountLoginStartResultSchema.parse({
               started: true,
               harnessId: params.data.harnessId,
@@ -1135,8 +1149,8 @@ export class AppServerHost {
           }
           this.#accountInspection = null;
           this.#accountCache = null;
-          this.#harnessInspectionCache.clear();
-          const result = await this.#harnessAccountList(true);
+          this.#invalidateHarnessInspection(params.data.harnessId);
+          const result = await this.#harnessAccountList("force");
           await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
         });
         continue;
@@ -1175,8 +1189,8 @@ export class AppServerHost {
           }
           this.#accountInspection = null;
           this.#accountCache = null;
-          this.#harnessInspectionCache.clear();
-          const result = await this.#harnessAccountList(true);
+          this.#invalidateHarnessInspection(params.data.harnessId);
+          const result = await this.#harnessAccountList("force");
           await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
         });
         continue;
@@ -1235,6 +1249,18 @@ export class AppServerHost {
       }
       if (request.method === "codexhost/thread/permission-mode/select") {
         this.#dispatchDesktopRequest(() => this.#selectThreadPermissionMode(request), request);
+        continue;
+      }
+      if (request.method === THREAD_ACCOUNT_SELECT_METHOD) {
+        this.#dispatchDesktopRequest(() => this.#selectThreadAccount(request), request);
+        continue;
+      }
+      if (request.method === "codexhost/draft/prepare") {
+        this.#dispatchDesktopRequest(() => this.#prepareDraft(request), request);
+        continue;
+      }
+      if (request.method === "codexhost/draft/release") {
+        this.#dispatchDesktopRequest(() => this.#releaseDraft(request), request);
         continue;
       }
       if (request.method === "codexhost/harness/commands/inspect") {
@@ -1583,6 +1609,14 @@ export class AppServerHost {
           }
           continue;
         }
+        if (
+          location.kind === "official" &&
+          request.method === "thread/name/set" &&
+          this.#options.normalizeThreadTitles &&
+          typeof params.name === "string"
+        ) {
+          params.name = normalizeThreadTitle(params.name);
+        }
       }
       if (
         request.method.startsWith("thread/") &&
@@ -1629,6 +1663,49 @@ export class AppServerHost {
     await (await this.#codexRuntimePool.active()).sendFrame(frame);
   }
 
+  #translateOfficialOutput(value: JsonValue): { modified: boolean; value: JsonValue } {
+    if (!isRecord(value)) return { modified: false, value };
+    let modified = false;
+
+    if (isRecord(value.params) && typeof value.params.threadId === "string") {
+      const ext = this.#threadAliases.reverseResolve(value.params.threadId);
+      if (ext && ext !== value.params.threadId) {
+        value.params.threadId = ext;
+        modified = true;
+      }
+    }
+
+    if (isRecord(value.result)) {
+      if (isRecord(value.result.thread) && typeof value.result.thread.id === "string") {
+        const ext = this.#threadAliases.reverseResolve(value.result.thread.id);
+        if (ext && ext !== value.result.thread.id) {
+          value.result.thread.id = ext;
+          modified = true;
+        }
+      }
+      if (Array.isArray(value.result.threads)) {
+        for (const item of value.result.threads) {
+          if (isRecord(item) && typeof item.id === "string") {
+            const ext = this.#threadAliases.reverseResolve(item.id);
+            if (ext && ext !== item.id) {
+              item.id = ext;
+              modified = true;
+            }
+          }
+        }
+      }
+      if (typeof value.result.threadId === "string") {
+        const ext = this.#threadAliases.reverseResolve(value.result.threadId);
+        if (ext && ext !== value.result.threadId) {
+          value.result.threadId = ext;
+          modified = true;
+        }
+      }
+    }
+
+    return { modified, value };
+  }
+
   async #forwardOfficialRequest(
     request: JsonRpcRequest,
     frame: Buffer<ArrayBufferLike>,
@@ -1639,7 +1716,8 @@ export class AppServerHost {
         request.method === "thread/start" && typeof params?.__codexhostAccountId === "string"
           ? params.__codexhostAccountId
           : null;
-      const threadId = params && typeof params.threadId === "string" ? params.threadId : null;
+      const rawThreadId = params && typeof params.threadId === "string" ? params.threadId : null;
+      const threadId = rawThreadId ? this.#threadAliases.resolve(rawThreadId) : null;
       const loginId = params && typeof params.loginId === "string" ? params.loginId : null;
       const loginAccountId = loginId ? await this.#resolveLoginAccountId(loginId) : undefined;
       const runtime = threadId
@@ -1666,9 +1744,12 @@ export class AppServerHost {
       }
       this.#registerOfficialDesktopRequest(runtime.account.accountId, request);
       try {
-        if (requestedAccountId && params) {
+        const needsParamModification =
+          Boolean(requestedAccountId) || (Boolean(threadId) && threadId !== rawThreadId);
+        if (needsParamModification && params) {
           const officialParams = { ...params };
-          delete officialParams.__codexhostAccountId;
+          if (requestedAccountId) delete officialParams.__codexhostAccountId;
+          if (threadId && threadId !== rawThreadId) officialParams.threadId = threadId;
           await runtime.send({ id: request.id, method: request.method, params: officialParams });
         } else {
           await runtime.sendFrame(frame);
@@ -1699,6 +1780,7 @@ export class AppServerHost {
     value: JsonValue;
   }): Promise<void> {
     const parsed = input.value;
+    let valueModified = false;
     if (
       this.#options.normalizeThreadTitles &&
       isRecord(parsed) &&
@@ -1709,7 +1791,12 @@ export class AppServerHost {
       const normalized = normalizeThreadTitle(parsed.params.threadName);
       if (normalized !== parsed.params.threadName) {
         parsed.params.threadName = normalized;
+        valueModified = true;
       }
+    }
+    const translation = this.#translateOfficialOutput(parsed);
+    if (translation.modified) {
+      valueModified = true;
     }
     this.#observeOfficialTurnStartResponse(parsed);
     if (isRecord(parsed) && !("method" in parsed) && "id" in parsed) {
@@ -1845,14 +1932,18 @@ export class AppServerHost {
       this.#diagnose(error);
     }
     this.#routeObservationTracker.bindOfficialResponse(parsed);
-    if (forwarded === parsed) await this.#writer.frame(input.frame);
+    if (!valueModified && forwarded === parsed) await this.#writer.frame(input.frame);
     else await this.#writer.json(forwarded);
   }
 
   async #requestOfficial(method: string, params: JsonObject): Promise<JsonObject> {
-    return typeof params.threadId === "string"
-      ? this.#codexRuntimePool.requestForThread(params.threadId, method, params)
-      : this.#codexRuntimePool.requestActive(method, params);
+    const rawThreadId = typeof params.threadId === "string" ? params.threadId : null;
+    const threadId = rawThreadId ? this.#threadAliases.resolve(rawThreadId) : null;
+    const effectiveParams =
+      threadId && threadId !== rawThreadId ? { ...params, threadId } : params;
+    return typeof effectiveParams.threadId === "string"
+      ? this.#codexRuntimePool.requestForThread(effectiveParams.threadId, method, effectiveParams)
+      : this.#codexRuntimePool.requestActive(method, effectiveParams);
   }
 
   async #readOfficialThreadForHandover(
@@ -2347,7 +2438,9 @@ export class AppServerHost {
         catalog: {
           models,
           ...(defaultModel ? { defaultModel } : {}),
-          thinkingOptions: [...thinkingById].map(([id, label]) => ({ id, label })),
+          thinkingOptions: sortThinkingOptionsByEffort(
+            [...thinkingById].map(([id, label]) => ({ id, label })),
+          ),
         },
         capabilities: {
           configuration: {
@@ -2765,10 +2858,23 @@ export class AppServerHost {
                   await this.#codexRuntimePool.get(accountId)
                 ).request("thread/list", accountParams),
               ),
-            observeThread: (threadId, accountId) =>
-              this.#codexRuntimePool.bindThread(threadId, accountId),
+            observeThread: async (threadId, accountId) => {
+              await this.#codexRuntimePool.bindThread(threadId, accountId);
+              const ext = this.#threadAliases.reverseResolve(threadId);
+              if (ext) await this.#codexRuntimePool.bindThread(ext, accountId);
+            },
           }),
       });
+      if (Array.isArray(result?.threads)) {
+        for (const thread of result.threads) {
+          if (isRecord(thread) && typeof thread.id === "string") {
+            const ext = this.#threadAliases.reverseResolve(thread.id);
+            if (ext) {
+              thread.id = ext;
+            }
+          }
+        }
+      }
       await this.#writer.json(rpcEnvelope(request, { result }));
     } catch (error) {
       if (error instanceof OfficialThreadListError) {
@@ -3125,6 +3231,18 @@ export class AppServerHost {
     await this.#resumeExternalThread(request, resolution.thread, params, resolution.historyFresh);
   }
 
+  /** A Thread keeps its own native Account; the Harness default is not its identity. */
+  #threadHarnessAccountFields(
+    harnessId: string,
+    threadId: string,
+    nativeSessionId?: string | undefined,
+  ): { harnessAccountId?: string } {
+    const accountId = this.#externalAdapters
+      .get(harnessId)
+      ?.threadAccountId?.(threadId, nativeSessionId);
+    return accountId ? { harnessAccountId: accountId } : {};
+  }
+
   async #inspectThread(request: JsonRpcRequest): Promise<void> {
     const params = threadInspectionParamsSchema.safeParse(request.params);
     if (!params.success) {
@@ -3155,6 +3273,11 @@ export class AppServerHost {
             const inspection = threadInspectionSchema.parse({
               owner: "external",
               harnessId: location.record.harnessId,
+              ...this.#threadHarnessAccountFields(
+                location.record.harnessId,
+                location.record.hostThreadId,
+                location.record.nativeSessionRef?.nativeSessionId,
+              ),
               transportModelId: cached.record.transportModelId,
               ...(selection?.model ? { effectiveModel: selection.model } : {}),
               ...(selection?.thinkingOptionId
@@ -3198,6 +3321,11 @@ export class AppServerHost {
         : {
             owner: "external",
             harnessId: resolution.thread.harnessId,
+            ...this.#threadHarnessAccountFields(
+              resolution.thread.harnessId,
+              resolution.thread.id,
+              resolution.thread.record.nativeSessionRef?.nativeSessionId,
+            ),
             transportModelId: resolution.thread.transportModelId,
             ...(resolution.thread.stateObserver.state.effectiveModel
               ? { effectiveModel: resolution.thread.stateObserver.state.effectiveModel }
@@ -3364,8 +3492,10 @@ export class AppServerHost {
     await this.#writeHarnessCommandCatalog(request, location.record.harnessId);
   }
 
-  async #harnessAccountList(refreshCredits = false): Promise<HarnessAccountListResult> {
-    if (refreshCredits) {
+  async #harnessAccountList(
+    creditRefresh: HarnessCreditsRefreshMode = "none",
+  ): Promise<HarnessAccountListResult> {
+    if (creditRefresh !== "none") {
       // Keep the metadata result as a fallback. A quota probe is telemetry:
       // its timeout or an older plugin must never make a real account vanish.
       const baseline = await this.#harnessAccountList();
@@ -3373,7 +3503,7 @@ export class AppServerHost {
         this.#externalAdapters.values(),
         this.#pluginDescriptors,
         30_000,
-        true,
+        creditRefresh,
       );
       const merged = new Map<string, HarnessAccountListResult["accounts"][number]>();
       for (const account of baseline.accounts) merged.set(harnessAccountKey(account), account);
@@ -3395,6 +3525,35 @@ export class AppServerHost {
     const result = harnessAccountListResultSchema.parse(await this.#accountInspection);
     this.#accountCache = { at: Date.now(), result };
     return result;
+  }
+
+  /**
+   * Refresh quota telemetry after the caller has already answered its request.
+   * Quota is telemetry: a switch or a list must never wait for an AGY start-up,
+   * but the rows should still become accurate a moment later. Runs at most once
+   * at a time; per-account freshness windows inside the adapter bound the rest.
+   */
+  #scheduleHarnessAccountCreditsRefresh(): void {
+    if (this.#accountCreditsRefresh) return;
+    const refresh: Promise<unknown> = this.#harnessAccountList("stale")
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#accountCreditsRefresh === refresh) this.#accountCreditsRefresh = null;
+      });
+    this.#accountCreditsRefresh = refresh;
+  }
+
+  /**
+   * Drop the cached inspection for one Harness. A Catalog is account-scoped
+   * (the adapter resolves the selected account itself), so an Account change
+   * must invalidate that Harness only: clearing every entry also discarded warm
+   * Catalogs of unrelated Harnesses, which cost extra probes on their next use.
+   */
+  #invalidateHarnessInspection(harnessId: string): void {
+    const prefix = `${harnessId}\u0000`;
+    for (const key of [...this.#harnessInspectionCache.keys()]) {
+      if (key.startsWith(prefix)) this.#harnessInspectionCache.delete(key);
+    }
   }
 
   async #writeHarnessCommandCatalog(request: JsonRpcRequest, harnessId: HarnessId): Promise<void> {
@@ -3560,6 +3719,217 @@ export class AppServerHost {
       gate.resolve();
     }
   }
+
+  /**
+   * Point one existing Thread at another native Account and continue it there.
+   *
+   * This is an execution-identity change, not a data migration, so it is one
+   * transaction: validate the target, quiesce the live Session (which releases its
+   * write lease), rebind the Thread, and let the next Turn reopen the same native
+   * conversation under the new credential. Nothing is left half-moved: a failure
+   * before the rebind leaves the previous Account in charge.
+   */
+  async #selectThreadAccount(request: JsonRpcRequest): Promise<void> {
+    const params = threadAccountSelectParamsSchema.safeParse(request.params);
+    if (!params.success) {
+      await this.#writer.json(rpcError(request, -32602, "Invalid Thread Account selection params"));
+      return;
+    }
+    const { threadId, accountId } = params.data;
+    let resolution: ExternalThreadResolution;
+    try {
+      resolution = await withTimeout(
+        this.#resolveExternalThread(threadId),
+        this.#externalOperationTimeoutMs,
+        `External Thread '${threadId}' Account selection`,
+      );
+    } catch (error) {
+      await this.#writer.json(
+        rpcError(request, -32076, `External Thread could not be opened: ${errorMessage(error)}`),
+      );
+      return;
+    }
+    if (await this.#writeResolutionError(request, resolution)) return;
+    if (resolution.kind !== "external") {
+      await this.#writer.json(
+        rpcError(request, -32078, "Account selection requires a current-process external Thread"),
+      );
+      return;
+    }
+    const thread = resolution.thread;
+    const adapter = this.#externalAdapters.get(thread.harnessId);
+    if (!adapter?.selectThreadAccount) {
+      await this.#writer.json(
+        rpcError(
+          request,
+          -32078,
+          `Harness '${thread.harnessId}' does not support switching a Thread's Account`,
+        ),
+      );
+      return;
+    }
+    // A running Turn holds the Session and its write lease; switching underneath it
+    // would either be ignored or split one conversation across two credentials.
+    if (thread.running) {
+      await this.#writer.json(
+        rpcError(request, -32078, "The Thread is running a Turn; switch Accounts after it ends"),
+      );
+      return;
+    }
+    const nativeSessionId = thread.record.nativeSessionRef?.nativeSessionId;
+    try {
+      await withTimeout(
+        (async () => {
+          // Quiesce first: closing the Session releases its lease, so the target
+          // Account cannot be refused by the writer we are replacing.
+          await thread.session.close();
+          await thread.outputTask;
+          this.#externalRuntime.remove(threadId);
+          await adapter.selectThreadAccount?.({
+            threadId,
+            accountId,
+            ...(nativeSessionId ? { nativeSessionId } : {}),
+          });
+        })(),
+        this.#externalOperationTimeoutMs,
+        `External Thread '${threadId}' Account switch`,
+      );
+    } catch (error) {
+      // The previous binding is still in place, so the next Turn resumes on the
+      // Account that owned the Thread before this request.
+      await this.#writer.json(
+        rpcError(request, -32078, `Account switch failed: ${errorMessage(error)}`),
+      );
+      return;
+    }
+    this.#invalidateHarnessInspection(thread.harnessId);
+    const result = threadAccountSelectResultSchema.parse({
+      threadId,
+      harnessId: thread.harnessId,
+      accountId,
+    });
+    await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
+  }
+
+  async #prepareDraft(request: JsonRpcRequest): Promise<void> {
+    const params = isRecord(request.params) ? request.params : null;
+    let harnessId = typeof params?.harnessId === "string" ? params.harnessId : undefined;
+    const rawModel = typeof params?.model === "string" ? params.model : undefined;
+    let model: HarnessModelRef | undefined = undefined;
+    let thinkingOptionId =
+      typeof params?.thinkingOptionId === "string"
+        ? (params.thinkingOptionId as HarnessThinkingOptionId)
+        : undefined;
+    let permissionModeId =
+      typeof params?.permissionModeId === "string"
+        ? (params.permissionModeId as HarnessPermissionModeId)
+        : undefined;
+    const accountId = typeof params?.accountId === "string" ? params.accountId : undefined;
+    const cwd = typeof params?.cwd === "string" ? params.cwd : undefined;
+
+    if (!harnessId && rawModel && rawModel.startsWith("codexhost/")) {
+      try {
+        const route = decodeCreateRoute({ id: request.id, method: "thread/start", params: { model: rawModel } });
+        if (route && route.harnessId !== "codex") {
+          harnessId = route.harnessId;
+          model = route.model;
+          thinkingOptionId = route.thinkingOptionId ?? thinkingOptionId;
+          permissionModeId = route.permissionModeId ?? permissionModeId;
+        }
+      } catch {
+        // ignore decode errors
+      }
+    } else if (rawModel) {
+      model = { id: rawModel as any };
+    }
+
+    if (!harnessId || !cwd) {
+      await this.#writer.json(rpcError(request, -32602, "Draft prepare requires harnessId and cwd"));
+      return;
+    }
+    const adapter = this.#externalAdapters.get(harnessId as ExternalHarnessId);
+    if (!adapter) {
+      await this.#writer.json(rpcError(request, -32601, `Unknown Harness '${harnessId}'`));
+      return;
+    }
+
+    if (typeof (adapter as unknown as { reserveDraft?: unknown }).reserveDraft === "function") {
+      void (adapter as unknown as {
+        reserveDraft(input: {
+          cwd: string;
+          model?: HarnessModelRef;
+          thinkingOptionId?: HarnessThinkingOptionId;
+          permissionModeId?: HarnessPermissionModeId;
+          accountId?: string;
+        }): Promise<void>;
+      })
+        .reserveDraft({
+          cwd,
+          ...(model ? { model } : {}),
+          ...(thinkingOptionId ? { thinkingOptionId } : {}),
+          ...(permissionModeId ? { permissionModeId } : {}),
+          ...(accountId ? { accountId } : {}),
+        })
+        .catch(() => undefined);
+    }
+    await this.#writer.json(rpcEnvelope(request, { result: { status: "preparing" } }));
+  }
+
+  async #releaseDraft(request: JsonRpcRequest): Promise<void> {
+    const params = isRecord(request.params) ? request.params : null;
+    let harnessId = typeof params?.harnessId === "string" ? params.harnessId : undefined;
+    const rawModel = typeof params?.model === "string" ? params.model : undefined;
+    let model: HarnessModelRef | undefined = undefined;
+    let thinkingOptionId =
+      typeof params?.thinkingOptionId === "string"
+        ? (params.thinkingOptionId as HarnessThinkingOptionId)
+        : undefined;
+    let permissionModeId =
+      typeof params?.permissionModeId === "string"
+        ? (params.permissionModeId as HarnessPermissionModeId)
+        : undefined;
+    const accountId = typeof params?.accountId === "string" ? params.accountId : undefined;
+    const cwd = typeof params?.cwd === "string" ? params.cwd : undefined;
+
+    if (!harnessId && rawModel && rawModel.startsWith("codexhost/")) {
+      try {
+        const route = decodeCreateRoute({ id: request.id, method: "thread/start", params: { model: rawModel } });
+        if (route && route.harnessId !== "codex") {
+          harnessId = route.harnessId;
+          model = route.model;
+          thinkingOptionId = route.thinkingOptionId ?? thinkingOptionId;
+          permissionModeId = route.permissionModeId ?? permissionModeId;
+        }
+      } catch {
+        // ignore decode errors
+      }
+    } else if (rawModel) {
+      model = { id: rawModel as any };
+    }
+
+    if (harnessId && cwd) {
+      const adapter = this.#externalAdapters.get(harnessId as ExternalHarnessId);
+      if (typeof (adapter as unknown as { releaseDraft?: unknown })?.releaseDraft === "function") {
+        (adapter as unknown as {
+          releaseDraft(input: {
+            cwd: string;
+            model?: HarnessModelRef;
+            thinkingOptionId?: HarnessThinkingOptionId;
+            permissionModeId?: HarnessPermissionModeId;
+            accountId?: string;
+          }): void;
+        }).releaseDraft({
+          cwd,
+          ...(model ? { model } : {}),
+          ...(thinkingOptionId ? { thinkingOptionId } : {}),
+          ...(permissionModeId ? { permissionModeId } : {}),
+          ...(accountId ? { accountId } : {}),
+        });
+      }
+    }
+    await this.#writer.json(rpcEnvelope(request, { result: { status: "released" } }));
+  }
+
 
   async #selectThreadModel(request: JsonRpcRequest): Promise<void> {
     const params = threadModelSelectParamsSchema.safeParse(request.params);
@@ -4071,9 +4441,12 @@ export class AppServerHost {
             serviceTier: "flex",
             multiAgentMode: "explicitRequestOnly",
             activePermissionProfile: null,
-            runtimeWorkspaceRoots: Array.isArray(params.runtimeWorkspaceRoots)
-              ? params.runtimeWorkspaceRoots
-              : [],
+            runtimeWorkspaceRoots:
+              Array.isArray(params.runtimeWorkspaceRoots) && params.runtimeWorkspaceRoots.length > 0
+                ? (params.runtimeWorkspaceRoots.includes(cwd)
+                    ? params.runtimeWorkspaceRoots
+                    : [cwd, ...params.runtimeWorkspaceRoots])
+                : [cwd],
             instructionSources: [],
           },
         }),
@@ -4314,30 +4687,66 @@ export class AppServerHost {
       // An External Thread may have been created directly by this Host. In
       // that case the official app-server has never seen its id. Verify the
       // exact official identity before releasing our only durable record.
+      let targetOfficialThreadId = this.#threadAliases.resolve(threadId);
       let officialResponse: JsonObject | null = null;
       try {
-        officialResponse = await this.#readOfficialThreadForHandover(threadId, true);
+        officialResponse = await this.#readOfficialThreadForHandover(targetOfficialThreadId, true);
       } catch (error) {
         this.#diagnose(error);
       }
-      const officialThread =
+      let officialThread =
         officialResponse && isRecord(officialResponse.result)
           ? officialResponse.result.thread
           : undefined;
-      const officialExists =
+      let officialExists =
         officialResponse !== null &&
         !isRecord(officialResponse.error) &&
         isRecord(officialThread) &&
-        officialThread.id === threadId;
+        officialThread.id === targetOfficialThreadId;
       if (!officialExists || !isRecord(officialThread)) {
-        await this.#writer.json(
-          rpcError(
-            request,
-            -32078,
-            "External Thread cannot be handed over to Official Codex because the official Thread does not exist",
-          ),
-        );
-        return;
+        try {
+          const startResponse = await this.#codexRuntimePool.requestActive("thread/start", {});
+          const startResult = isRecord(startResponse.result) ? startResponse.result : null;
+          const createdThread =
+            startResult && isRecord(startResult.thread) ? startResult.thread : null;
+          const newOfficialId =
+            createdThread && typeof createdThread.id === "string" ? createdThread.id : null;
+          if (!newOfficialId) {
+            const msg =
+              startResponse &&
+              isRecord(startResponse.error) &&
+              typeof startResponse.error.message === "string"
+                ? startResponse.error.message
+                : "Official Thread creation failed";
+            await this.#writer.json(
+              rpcError(
+                request,
+                -32078,
+                `External Thread cannot be handed over to Official Codex: ${msg}`,
+              ),
+            );
+            return;
+          }
+          targetOfficialThreadId = newOfficialId;
+          await this.#threadAliases.setAlias(threadId, targetOfficialThreadId);
+          const activeAccount = await this.#accountRepository.getActiveAccountId();
+          if (activeAccount) {
+            await this.#codexRuntimePool.bindThread(targetOfficialThreadId, activeAccount);
+            await this.#codexRuntimePool.bindThread(threadId, activeAccount);
+          }
+          officialThread = createdThread;
+          officialExists = true;
+        } catch (error) {
+          this.#diagnose(error);
+          await this.#writer.json(
+            rpcError(
+              request,
+              -32078,
+              `External Thread adoption failed: ${errorMessage(error)}`,
+            ),
+          );
+          return;
+        }
       }
       let externalTurns = location.thread?.turns ?? null;
       let liveExternalThread = location.thread;
@@ -4363,11 +4772,12 @@ export class AppServerHost {
       }
       if (!externalTurns) externalTurns = [];
       try {
-        const officialTurns = Array.isArray(officialThread.turns)
-          ? officialThread.turns.filter((turn): turn is JsonObject => isRecord(turn))
-          : [];
+        const officialTurns =
+          officialThread && Array.isArray(officialThread.turns)
+            ? officialThread.turns.filter((turn): turn is JsonObject => isRecord(turn))
+            : [];
         const items = externalMessagesForOfficialHandover(externalTurns, officialTurns);
-        await this.#injectExternalMessagesIntoOfficial(threadId, items);
+        await this.#injectExternalMessagesIntoOfficial(targetOfficialThreadId, items);
       } catch (error) {
         this.#diagnose(error);
         await this.#writer.json(
@@ -4865,8 +5275,16 @@ export class AppServerHost {
         if (typeof officialThread.cwd === "string" && officialThread.cwd.length > 0) {
           officialCwd = officialThread.cwd;
         }
-        if (typeof officialThread.title === "string" && officialThread.title.length > 0) {
-          officialTitle = officialThread.title;
+        const officialName =
+          typeof officialThread.name === "string" && officialThread.name.trim().length > 0
+            ? officialThread.name.trim()
+            : typeof officialThread.title === "string" && officialThread.title.trim().length > 0
+              ? officialThread.title.trim()
+              : undefined;
+        if (officialName) {
+          officialTitle = this.#options.normalizeThreadTitles
+            ? normalizeThreadTitle(officialName)
+            : officialName;
         }
       }
     } catch (error) {

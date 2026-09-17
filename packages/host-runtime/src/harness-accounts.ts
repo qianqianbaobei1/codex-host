@@ -5,12 +5,21 @@ import {
   type HarnessPluginDescriptor,
 } from "@codexhost/shared-contracts";
 
+/**
+ * How eagerly per-account quota telemetry is refreshed while listing accounts.
+ *
+ * `force` belongs to an explicit user refresh, `stale` to background work that
+ * must respect each Account's freshness window, and `none` keeps listing a
+ * cheap metadata read for the Composer picker.
+ */
+export type HarnessCreditsRefreshMode = "none" | "stale" | "force";
+
 /** A failed/unsupported plugin must not hide other accounts or leak native diagnostics. */
 export async function inspectHarnessAccounts(
   adapters: Iterable<HarnessAdapter>,
   descriptors: readonly HarnessPluginDescriptor[],
   timeoutMs = 12_000,
-  refreshCredits = false,
+  creditRefresh: HarnessCreditsRefreshMode = "none",
 ): Promise<HarnessAccountListResult> {
   const accounts = await Promise.all(
     [...adapters].map(async (adapter) => {
@@ -18,11 +27,10 @@ export async function inspectHarnessAccounts(
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const pending: Promise<unknown> = (async () => {
-          // Listing remains a cheap metadata read for the Composer picker. The
-          // settings page opts into this explicit refresh path when the user
-          // asks to see current quota telemetry.
-          if (refreshCredits && adapter.refreshAccountCredits) {
-            await adapter.refreshAccountCredits().catch(() => undefined);
+          if (creditRefresh !== "none" && adapter.refreshAccountCredits) {
+            await adapter
+              .refreshAccountCredits({ force: creditRefresh === "force" })
+              .catch(() => undefined);
           }
           return adapter.inspectAccounts
             ? adapter.inspectAccounts()

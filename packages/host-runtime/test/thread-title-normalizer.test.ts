@@ -77,4 +77,38 @@ describe("thread-title-normalizer", () => {
     expect(title.includes("请开始推进")).toBe(false);
     expect(title.length).toBeLessThanOrEqual(32);
   });
+
+  it("handles question noise and cleans action prefixes without literal $1", () => {
+    const title = normalizeThreadTitle(
+      "检查一下现在codex的对话命名，有的按规则来，有的没按规则来，查一下是为什么",
+    );
+    expect(title.includes("$1")).toBe(false);
+    expect(title).toBe("[Codex] 检查对话命名");
+  });
+
+  it("extracts tool topics like Clash and Gemini properly", () => {
+    const title = normalizeThreadTitle("帮我看一下clash。目前切换其他的机场就报错 这是为啥");
+    expect(title.startsWith("[Clash]")).toBe(true);
+    expect(title).toContain("报错");
+    expect(title.includes("这是为啥")).toBe(false);
+
+    expect(normalizeThreadTitle("这是什么问题导致的")).toBe("排查问题");
+  });
+
+  it("strips handover system note and prior history envelopes", () => {
+    const raw = `[System Note: The following is prior conversation history from this thread before switching models. Please continue the conversation seamlessly using this context.]
+
+--- Prior Conversation History ---
+[User]:
+帮我想一个问题：如果我们现在想去做一个配电箱的清标问题，要做的是什么？
+[Assistant]:
+可以从以下几点做起...
+--- End Prior Conversation History ---
+
+排查配电箱元器件报价单`;
+    const title = normalizeThreadTitle(raw);
+    expect(title.includes("System Note")).toBe(false);
+    expect(title.includes("Prior Conversation History")).toBe(false);
+    expect(title).toBe("[配电箱] 排查元器件报价单");
+  });
 });

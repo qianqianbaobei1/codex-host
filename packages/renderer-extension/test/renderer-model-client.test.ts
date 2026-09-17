@@ -312,6 +312,7 @@ describe("Renderer fixed Model request client", () => {
       "refreshCodexAccounts",
       "refreshHarnessAccounts",
       "selectHarnessAccount",
+      "selectThreadAccount",
       "selectThreadModel",
       "selectThreadPermissionMode",
       "selectThreadThinking",

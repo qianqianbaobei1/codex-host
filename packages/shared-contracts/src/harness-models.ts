@@ -55,6 +55,134 @@ export const harnessThinkingOptionSchema = z
 
 export type HarnessThinkingOption = z.infer<typeof harnessThinkingOptionSchema>;
 
+export function thinkingEffortRank(option: HarnessThinkingOption): number {
+  const normalizedId = option.id.toLowerCase().replace(/[-_]/g, "");
+  const normalizedLabel = option.label.toLowerCase().replace(/[-_\s]/g, "");
+
+  // Level 0: Off / None / Disabled / 关闭
+  if (
+    normalizedId === "off" ||
+    normalizedId === "none" ||
+    normalizedId === "disabled" ||
+    normalizedId === "false" ||
+    normalizedLabel === "off" ||
+    normalizedLabel.includes("关闭") ||
+    normalizedLabel.includes("不思考")
+  ) {
+    return 0;
+  }
+
+  // Level 1: Minimal / Tiny / Lowest / 极低 / 微度 / 微量
+  if (
+    normalizedId === "minimal" ||
+    normalizedId === "min" ||
+    normalizedId === "tiny" ||
+    normalizedId === "lowest" ||
+    normalizedLabel.includes("minimal") ||
+    normalizedLabel.includes("极低") ||
+    normalizedLabel.includes("微度") ||
+    normalizedLabel.includes("微量")
+  ) {
+    return 10;
+  }
+
+  // Level 2: Auto / 自动
+  if (normalizedId === "auto" || normalizedLabel === "auto" || normalizedLabel.includes("自动")) {
+    return 15;
+  }
+
+  // Level 3: Low / Light / 轻度 / 低 / 节能
+  if (
+    normalizedId === "low" ||
+    normalizedId === "light" ||
+    normalizedLabel.includes("low") ||
+    normalizedLabel.includes("轻度") ||
+    normalizedLabel.includes("低") ||
+    normalizedLabel.includes("节能")
+  ) {
+    return 20;
+  }
+
+  // Level 4: Medium / Moderate / Standard / Default / Normal / 中 / 中度 / 中等 / 均衡 / 标准
+  if (
+    normalizedId === "medium" ||
+    normalizedId === "med" ||
+    normalizedId === "moderate" ||
+    normalizedId === "standard" ||
+    normalizedId === "default" ||
+    normalizedId === "normal" ||
+    normalizedLabel.includes("medium") ||
+    normalizedLabel.includes("moderate") ||
+    normalizedLabel.includes("standard") ||
+    normalizedLabel.includes("中度") ||
+    normalizedLabel.includes("中等") ||
+    normalizedLabel.includes("均衡") ||
+    normalizedLabel.includes("标准") ||
+    normalizedLabel.includes("默认") ||
+    (normalizedLabel.includes("中") && !normalizedLabel.includes("超"))
+  ) {
+    return 30;
+  }
+
+  // Level 5: High / Deep / 高 / 深度
+  if (
+    normalizedId === "high" ||
+    normalizedId === "deep" ||
+    normalizedLabel.includes("high") ||
+    normalizedLabel.includes("deep") ||
+    normalizedLabel.includes("深度") ||
+    (normalizedLabel.includes("高") &&
+      !normalizedLabel.includes("极高") &&
+      !normalizedLabel.includes("最高") &&
+      !normalizedLabel.includes("超高"))
+  ) {
+    return 40;
+  }
+
+  // Level 6: Extra High / XHigh / Very High / 超高 / 最高
+  if (
+    normalizedId === "xhigh" ||
+    normalizedId === "extrahigh" ||
+    normalizedId === "veryhigh" ||
+    normalizedId === "higher" ||
+    normalizedLabel.includes("extrahigh") ||
+    normalizedLabel.includes("veryhigh") ||
+    normalizedLabel.includes("超高") ||
+    normalizedLabel.includes("最高")
+  ) {
+    return 50;
+  }
+
+  // Level 7: Max / Ultra / Extreme / 极高 / 极限 / 最大
+  if (
+    normalizedId === "max" ||
+    normalizedId === "maximum" ||
+    normalizedId === "ultra" ||
+    normalizedId === "extreme" ||
+    normalizedLabel.includes("max") ||
+    normalizedLabel.includes("ultra") ||
+    normalizedLabel.includes("extreme") ||
+    normalizedLabel.includes("极高") ||
+    normalizedLabel.includes("极限") ||
+    normalizedLabel.includes("最大")
+  ) {
+    return 60;
+  }
+
+  const num = Number(option.id);
+  if (!Number.isNaN(num)) {
+    return 100 + num;
+  }
+
+  return 25;
+}
+
+export function sortThinkingOptionsByEffort(
+  options: readonly HarnessThinkingOption[],
+): HarnessThinkingOption[] {
+  return [...options].sort((a, b) => thinkingEffortRank(a) - thinkingEffortRank(b));
+}
+
 export const harnessModelSchema = z
   .object({
     ref: harnessModelRefSchema,
@@ -326,6 +454,8 @@ const externalThreadInspectionSchema = z
   .object({
     owner: z.literal("external"),
     harnessId: nonBlankTextSchema.max(256),
+    /** Native Account this Thread is bound to; omitted when unknown or single-account. */
+    harnessAccountId: nonBlankTextSchema.max(256).optional(),
     transportModelId: nonBlankTextSchema.max(1_024),
     effectiveModel: harnessModelRefSchema.optional(),
     resolvedModelLabel: harnessResolvedModelLabelSchema.optional(),

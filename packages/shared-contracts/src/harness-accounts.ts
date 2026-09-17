@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { harnessIdSchema } from "./ids.js";
+import { harnessIdSchema, hostThreadIdSchema } from "./ids.js";
 import { accountCreditsSnapshotSchema } from "./thread-usage.js";
 
 /** Read-only telemetry for the Harness's current native authentication, never a login record. */
@@ -44,6 +44,36 @@ export type HarnessAccountListResult = z.infer<typeof harnessAccountListResultSc
 
 /** Select the default native account for a Harness that exposes selectable accounts. */
 export const HARNESS_ACCOUNT_SELECT_METHOD = "codexhost/harness/accounts/select" as const;
+
+/** Point one existing Thread at another native Account and continue it there. */
+export const THREAD_ACCOUNT_SELECT_METHOD = "codexhost/thread/account/select" as const;
+
+export const threadAccountSelectParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type ThreadAccountSelectParams = z.infer<typeof threadAccountSelectParamsSchema>;
+
+export const threadAccountSelectResultSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    harnessId: harnessIdSchema,
+    accountId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/u),
+  })
+  .strict();
+export type ThreadAccountSelectResult = z.infer<typeof threadAccountSelectResultSchema>;
 
 /** Explicitly refresh read-only quota telemetry for all reported Harness accounts. */
 export const HARNESS_ACCOUNT_REFRESH_METHOD = "codexhost/harness/accounts/refresh" as const;

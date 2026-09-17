@@ -48,7 +48,7 @@ done
 `;
 
 const SLOW_INIT_SCRIPT = `#!/bin/bash
-sleep 0.25
+sleep 0.15
 echo '${INIT_LINE}'
 while read -r line; do
   case "$line" in
@@ -213,7 +213,7 @@ describe("AntigravityCliTransport turn liveness (activity-aware timeout)", () =>
       });
 
       await expect(transport.start()).rejects.toThrow("Antigravity Session startup timed out");
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       const init = await transport.start();
       expect(init.conversationId).toBe("conv-live");
       await expect(transport.runTurn("after join", () => undefined)).resolves.toMatchObject({

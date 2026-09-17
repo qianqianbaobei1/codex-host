@@ -611,7 +611,10 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
     Number.isFinite(completedAtMs) &&
     startedAtMs >= 0 &&
     completedAtMs >= startedAtMs;
-  const error =
+  const hasAgentOutput = snapshot.items.some(
+    ({ item }) => item.type === "agentMessage" && (item.text?.trim().length ?? 0) > 0,
+  );
+  const rawError =
     snapshot.outcome.status === "failed"
       ? {
           message: snapshot.outcome.error.message,
@@ -619,9 +622,14 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
           additionalDetails: null,
         }
       : null;
+  const error = hasAgentOutput ? null : rawError;
+  const status =
+    hasAgentOutput && snapshot.outcome.status === "failed"
+      ? "completed"
+      : historicalStatus(snapshot.outcome);
   return {
     id: turnId,
-    status: historicalStatus(snapshot.outcome),
+    status,
     items: [
       {
         id: `${turnId}-user`,
@@ -1273,10 +1281,22 @@ export class CodexTurnProjector {
 
     this.#completed = true;
     const completedAt = Math.floor(completedAtMs / 1000);
-    const error = turnError(event.outcome);
+    const hasAgentOutput = this.#wireItemOrder.some((itemId) => {
+      const projected = this.#items.get(itemId);
+      return (
+        projected?.item.type === "agentMessage" &&
+        (projected.item.text?.trim().length ?? 0) > 0
+      );
+    });
+    const rawError = turnError(event.outcome);
+    const error = hasAgentOutput ? null : rawError;
+    const status =
+      hasAgentOutput && event.outcome.status === "failed"
+        ? "completed"
+        : turnStatus(event.outcome);
     const turn: JsonObject = {
       id: this.#turnId,
-      status: turnStatus(event.outcome),
+      status,
       // Current Codex sends Tool/File Change state through Item notifications only.
       items: [
         ...this.#projectInput(),

@@ -68,6 +68,7 @@ import {
   nativeTurnRefSchema,
   type HarnessId,
   type HarnessModelRef,
+  type HarnessPermissionModeId,
   type HarnessThinkingOptionId,
   type JsonValue,
   type NativeSessionRef,
@@ -105,14 +106,19 @@ import {
 } from "./permission-modes.js";
 import { fetchAntigravityQuota } from "./quota.js";
 import {
+  AntigravitySessionLeaseError,
+  acquireSessionLease,
+  type AntigravitySessionLease,
+} from "./session-lease.js";
+import {
   ANTIGRAVITY_ACCOUNT_ID_ENV,
   ANTIGRAVITY_THREAD_ID_ENV,
   antigravityAccountsRoot,
   applyAntigravityAccountEnvironment,
   antigravityRealHome,
   type AntigravityAccount,
+  type AntigravityAccountStore,
   type AntigravityAccountsLoad,
-  type AntigravityKeychainRelease,
 } from "./accounts.js";
 import {
   antigravityToolErrorMessage,
@@ -129,6 +135,15 @@ import {
   type AntigravityStepUpdate,
   type AntigravityTransportOptions,
 } from "./transport.js";
+import {
+  AntigravityDraftReservationPool,
+  type DraftReservationKeyParams,
+} from "./draft-reservation.js";
+import {
+  sharedSessionStoreRoot,
+  accountSessionStoreDirectory,
+} from "./session-store.js";
+
 
 export interface AntigravityAdapterOptions {
   command?: string;
@@ -199,6 +214,35 @@ const CONTEXT_PROBE_BACKOFF_MS = 60_000;
 const PERSISTED_INSPECTION_VERSION = 1;
 const PERSISTED_INSPECTION_MAX_AGE_MS = 6 * 60 * 60_000;
 const DEFAULT_ACCOUNT_COOLDOWN_MS = 15 * 60_000;
+/** A native Session id is used as a file name; never trust it as a path segment. */
+const ACCOUNT_SAFE_NATIVE_ID = /^[A-Za-z0-9._~-]+$/u;
+
+/**
+ * Threads created before Account bindings existed carry no owner in either
+ * binding map, but the conversation store still does: a Session's files live in
+ * exactly one Account HOME. Only a unique hit counts, so an ambiguous answer
+ * stays unknown instead of guessing the Harness-wide default.
+ */
+function accountOwningConversation(
+  store: AntigravityAccountStore,
+  nativeSessionId: string,
+): string | null {
+  if (!ACCOUNT_SAFE_NATIVE_ID.test(nativeSessionId)) return null;
+  const owners = store
+    .list()
+    .filter((account) =>
+      existsSync(
+        path.join(
+          store.homeFor(account),
+          ".gemini",
+          "antigravity-cli",
+          "conversations",
+          `${nativeSessionId}.db`,
+        ),
+      ),
+    );
+  return owners.length === 1 ? (owners[0]?.id ?? null) : null;
+}
 
 function processHasExited(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
@@ -526,7 +570,6 @@ class AntigravityHarnessSession implements HarnessSession {
   readonly #ledger: AntigravitySessionLedger;
   readonly #toolOutputLimit: number;
   readonly #sessionIdleTimeoutMs: number;
-  readonly #keychainRelease: AntigravityKeychainRelease | undefined;
   readonly #history: AntigravityHistory | null;
   #transport: AntigravityCliTransportLike;
   #state: HarnessSessionState;
@@ -555,7 +598,6 @@ class AntigravityHarnessSession implements HarnessSession {
     historyRequired?: number;
     toolOutputLimit: number;
     sessionIdleTimeoutMs?: number;
-    keychainRelease?: AntigravityKeychainRelease;
   }) {
     this.#cwd = input.cwd;
     this.#environment = input.environment ?? process.env;
@@ -570,7 +612,6 @@ class AntigravityHarnessSession implements HarnessSession {
     this.#historyRequired = input.historyRequired ?? 0;
     this.#toolOutputLimit = input.toolOutputLimit;
     this.#sessionIdleTimeoutMs = input.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
-    this.#keychainRelease = input.keychainRelease;
     this.outputs = this.#channel.outputs;
     this.#armSessionIdleTimer();
   }
@@ -676,7 +717,6 @@ class AntigravityHarnessSession implements HarnessSession {
       this.#active = null;
     }
     await this.#transport.close().catch(() => undefined);
-    if (this.#keychainRelease) await this.#keychainRelease().catch(() => undefined);
     await this.#history?.flush().catch(() => undefined);
     this.#channel.end();
   }
@@ -790,9 +830,11 @@ class AntigravityHarnessSession implements HarnessSession {
           status: "cancelled",
           reason: result.error ?? "Cancelled by user",
         };
-      } else if (hasResponse && (isTransientNetErr || !result.error)) {
-        // If the Turn produced assistant output and the error was an underlying network retry
-        // or EOF glitch, treat the Turn as succeeded so the UI does not display an error banner.
+      } else if (hasResponse) {
+        // If the Turn produced assistant output, treat the Turn as succeeded regardless of
+        // any trailing network glitch, location error, or EOF issue. The user's response is already
+        // generated and delivered; failing the turn would destroy the UI action buttons (copy/regenerate)
+        // and display an intrusive error banner.
         outcome = { status: "succeeded" };
         delete result.error;
       } else {
@@ -807,12 +849,20 @@ class AntigravityHarnessSession implements HarnessSession {
       // token-less context event can never overwrite the Host's per-Turn usage.
       void this.#observeContextUsage(active, result, usage);
     } catch (error) {
+      const hasAssistantOutput =
+        active.agentText.trim().length > 0 ||
+        (typeof result?.response === "string" && result.response.trim().length > 0);
       const outcome: TurnOutcome = active.cancellationRequested
         ? { status: "cancelled", reason: "Cancelled by user" }
-        : {
-            status: "failed",
-            error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
-          };
+        : hasAssistantOutput
+          ? { status: "succeeded" }
+          : {
+              status: "failed",
+              error: normalizeError(error, "nativeFailure", this.#transport.stderrTail),
+            };
+      if (hasAssistantOutput && result?.error) {
+        delete result.error;
+      }
       if (result) await this.#persistLedger(active, result, outcome).catch(() => undefined);
       this.#completeTurn(active, outcome, result ?? undefined);
       if (result) {
@@ -1497,6 +1547,13 @@ export class AntigravityAdapter implements HarnessAdapter {
     environment: NodeJS.ProcessEnv;
   }) => Promise<AntigravityModelsResult>;
   readonly #sessions = new Set<AntigravityHarnessSession>();
+
+  /**
+   * One writer per native conversation. The lease is keyed by the native Session
+   * id, not by Thread or Account, so two Accounts, two Hosts, or a crash survivor
+   * cannot open the same conversation at once.
+   */
+  readonly #sessionLeases = new Map<string, AntigravitySessionLease>();
   readonly #probeProcesses = new Set<ChildProcessWithoutNullStreams>();
   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
   readonly #inspectionFailures = new Map<
@@ -1515,6 +1572,7 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly #accountCooldownUntil = new Map<string, number>();
   readonly #loginMonitors = new Map<string, Promise<void>>();
   readonly #accountEmails = new Map<string, string>();
+  readonly #reservationPool: AntigravityDraftReservationPool;
 
   constructor(
     options: AntigravityAdapterOptions = {},
@@ -1535,6 +1593,38 @@ export class AntigravityAdapter implements HarnessAdapter {
       const initialCredits = readAntigravityCreditsSync();
       if (initialCredits) this.#creditsByAccount.set(LEGACY_ACCOUNT_KEY, initialCredits);
     }
+    const storeRoots: string[] = [];
+    if (this.#accounts.mode === "multi") {
+      storeRoots.push(sharedSessionStoreRoot(this.#accounts.store.shadowRoot));
+      for (const acc of this.#accounts.store.list()) {
+        storeRoots.push(accountSessionStoreDirectory(this.#accounts.store.homeFor(acc)));
+      }
+    } else {
+      storeRoots.push(accountSessionStoreDirectory(this.#accountsRealHome));
+    }
+    this.#reservationPool = new AntigravityDraftReservationPool({
+      storeRoots,
+      createTransport: (opts) => this.#createTransport(opts),
+      transportOptionsFactory: (params) => {
+        const dummyInput = {
+          kind: "create" as const,
+          cwd: params.cwd,
+          model: encodeAntigravityModelRef(params.model),
+          ...(params.thinkingOptionId ? { thinkingOptionId: params.thinkingOptionId } : {}),
+          ...(params.permissionModeId ? { permissionModeId: params.permissionModeId } : {}),
+        };
+        const skipPermissions = params.permissionModeId
+          ? decodeAntigravityPermissionModeId(params.permissionModeId) === "dangerously-skip-permissions"
+          : true;
+        return this.#transportOptions(
+          dummyInput,
+          params.model,
+          undefined,
+          skipPermissions,
+          params.thinkingOptionId,
+        );
+      },
+    });
   }
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
@@ -1692,17 +1782,11 @@ export class AntigravityAdapter implements HarnessAdapter {
         ...(this.#options.command ? { command: this.#options.command } : {}),
         environment,
       });
-      const releaseKeychain = await this.#acquireAccountKeychain(environment);
-      let result: AntigravityModelsResult;
-      try {
-        result = await this.#listModels({
-          cwd,
-          ...(this.#options.command ? { command: this.#options.command } : {}),
-          environment,
-        });
-      } finally {
-        await releaseKeychain();
-      }
+      const result = await this.#listModels({
+        cwd,
+        ...(this.#options.command ? { command: this.#options.command } : {}),
+        environment,
+      });
       const models = parseAntigravityModelsOutput(result.stdout);
       const catalog = normalizeAntigravityModelCatalog(models);
       return {
@@ -1794,28 +1878,41 @@ export class AntigravityAdapter implements HarnessAdapter {
     return rows;
   }
 
-  /** Refresh quota telemetry for each configured account without changing the default. */
-  async refreshAccountCredits(): Promise<void> {
+  /**
+   * Refresh quota telemetry for each configured account without changing the
+   * default. Accounts are independent, so they are probed concurrently: a
+   * serial pass cost one AGY start-up per account, which is what made a single
+   * Account switch (and every settings refresh) take twenty seconds.
+   *
+   * `force` is reserved for an explicit user refresh; background callers stay
+   * inside the per-account freshness window so probing never stacks up against
+   * the provider.
+   */
+  async refreshAccountCredits(options: { force?: boolean } = {}): Promise<void> {
     if (this.#accounts.mode !== "multi") return;
-    const accounts = this.#accounts.store
+    const store = this.#accounts.store;
+    const force = options.force === true;
+    const accounts = store
       .list()
       .filter((account) => account.enabled && this.#isAccountUsable(account));
-    for (const account of accounts) {
-      try {
-        await this.#accounts.store.ensureHome(account, {
-          ...(this.#options.manageDarwinKeychain !== undefined
-            ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
-            : {}),
-        });
-        const environment = this.#environment({
-          [ANTIGRAVITY_ACCOUNT_ID_ENV]: account.id,
-        });
-        await this.#refreshCreditsFor(account.id, environment, true);
-      } catch {
-        // Keep the account row visible; the settings surface will show the
-        // existing snapshot or "no quota data" for this account.
-      }
-    }
+    await Promise.allSettled(
+      accounts.map(async (account) => {
+        try {
+          await store.ensureHome(account, {
+            ...(this.#options.manageDarwinKeychain !== undefined
+              ? { manageDarwinKeychain: this.#options.manageDarwinKeychain }
+              : {}),
+          });
+          const environment = this.#environment({
+            [ANTIGRAVITY_ACCOUNT_ID_ENV]: account.id,
+          });
+          await this.#refreshCreditsFor(account.id, environment, force);
+        } catch {
+          // Keep the account row visible; the settings surface will show the
+          // existing snapshot or "no quota data" for this account.
+        }
+      }),
+    );
   }
 
   /** Create a new isolated account entry and prepare its shadow HOME and keychain. */
@@ -1880,7 +1977,6 @@ export class AntigravityAdapter implements HarnessAdapter {
     await mkdir(loginDirectory, { recursive: true, mode: 0o700 });
     const scriptPath = path.join(loginDirectory, `${accountId}-${randomUUID()}.command`);
     const markerPath = `${scriptPath}.completed`;
-    const releaseKeychain = await this.#acquireAccountKeychain(environment);
     const script = [
       "#!/bin/zsh",
       "set -u",
@@ -1909,11 +2005,10 @@ export class AntigravityAdapter implements HarnessAdapter {
     } catch (error) {
       await unlink(scriptPath).catch(() => undefined);
       await unlink(markerPath).catch(() => undefined);
-      await releaseKeychain();
       throw error;
     }
 
-    const monitor = this.#monitorLogin(accountId, tokenFile, before, markerPath, releaseKeychain);
+    const monitor = this.#monitorLogin(accountId, tokenFile, before, markerPath);
     this.#loginMonitors.set(accountId, monitor);
     void monitor.finally(() => {
       if (this.#loginMonitors.get(accountId) === monitor) this.#loginMonitors.delete(accountId);
@@ -1925,7 +2020,6 @@ export class AntigravityAdapter implements HarnessAdapter {
     tokenFile: string,
     before: string | null,
     markerPath: string,
-    releaseKeychain: AntigravityKeychainRelease,
   ): Promise<void> {
     try {
       const deadline = Date.now() + 15 * 60_000;
@@ -1942,7 +2036,6 @@ export class AntigravityAdapter implements HarnessAdapter {
       }
     } finally {
       await unlink(markerPath).catch(() => undefined);
-      await releaseKeychain().catch(() => undefined);
     }
   }
 
@@ -1956,6 +2049,74 @@ export class AntigravityAdapter implements HarnessAdapter {
       throw new Error(`Antigravity account '${account.name}' is unavailable or in cooldown`);
     }
     await this.#accounts.store.setDefaultAccount(accountId);
+  }
+
+  /**
+   * Move one Thread to another Account. The conversation itself does not move —
+   * only the credential that will run it next — so this refuses unless the target
+   * Account can already reach the native conversation, which is exactly the
+   * precondition the shared session store provides.
+   */
+  async selectThreadAccount(input: {
+    threadId: string;
+    accountId: string;
+    nativeSessionId?: string | undefined;
+  }): Promise<void> {
+    if (this.#accounts.mode !== "multi") {
+      throw new Error("Antigravity multi-account mode is not configured");
+    }
+    const store = this.#accounts.store;
+    const account = store.get(input.accountId);
+    if (!account) throw new Error(`Unknown Antigravity account '${input.accountId}'`);
+    if (!this.#isAccountUsable(account)) {
+      throw new Error(`Antigravity account '${account.name}' is unavailable or in cooldown`);
+    }
+    const nativeSessionId = input.nativeSessionId?.trim();
+    if (nativeSessionId) {
+      // Fail closed rather than let AGY silently start a new conversation: without
+      // the shared session store the target Account simply cannot see the files.
+      const conversation = path.join(
+        store.homeFor(account),
+        ".gemini",
+        "antigravity-cli",
+        "conversations",
+        `${nativeSessionId}.db`,
+      );
+      if (ACCOUNT_SAFE_NATIVE_ID.test(nativeSessionId) && !existsSync(conversation)) {
+        throw new Error(
+          `Account '${account.name}' cannot see this conversation yet (shared session store not migrated)`,
+        );
+      }
+    }
+    await store.bindThread({
+      threadId: input.threadId,
+      accountId: account.id,
+      ...(nativeSessionId ? { nativeSessionId } : {}),
+      state: "committed",
+    });
+  }
+
+  /**
+   * The Account a Thread is actually bound to. Selecting a new default Account
+   * never moves an existing Thread, so the renderer needs this to stop showing
+   * the Harness-wide default as if it were the Thread's own Account.
+   */
+  threadAccountId(threadId: string, nativeSessionId?: string): string | null {
+    if (this.#accounts.mode !== "multi") return null;
+    const store = this.#accounts.store;
+    const bound = store.bindingForThread(threadId);
+    if (bound) {
+      const account = store.get(bound.accountId);
+      if (account) return account.id;
+    }
+    if (nativeSessionId) {
+      // Explicit ownership metadata first: the shared-store migration seeds it, so
+      // it stays authoritative after every Account reaches the same store.
+      const owner = store.accountForNativeSession(nativeSessionId);
+      if (owner) return owner.id;
+      return accountOwningConversation(store, nativeSessionId);
+    }
+    return null;
   }
 
   refreshCredits(): Promise<AccountCreditsSnapshot | null> {
@@ -2116,61 +2277,59 @@ export class AntigravityAdapter implements HarnessAdapter {
     environment?: NodeJS.ProcessEnv,
   ): Promise<string> {
     const resolvedEnvironment = environment ?? this.#environment();
-    const releaseKeychain = await this.#acquireAccountKeychain(resolvedEnvironment);
-    try {
-      return await new Promise((resolve, reject) => {
-        let executable: string;
-        try {
-          executable = resolveAntigravityExecutable({
-            ...(this.#options.command ? { command: this.#options.command } : {}),
-            environment: resolvedEnvironment,
-          });
-        } catch (error) {
-          reject(error);
-          return;
-        }
-        const child = spawn(executable, [...arguments_], {
-          env: resolvedEnvironment,
-          detached: process.platform !== "win32",
-          windowsHide: true,
+    // A probe must never run before the account HOME owns its keychain, or AGY
+    // would fall back to the real login keychain (and the wrong credentials).
+    await this.#ensureAccountHome(resolvedEnvironment).catch(() => null);
+    return await new Promise((resolve, reject) => {
+      let executable: string;
+      try {
+        executable = resolveAntigravityExecutable({
+          ...(this.#options.command ? { command: this.#options.command } : {}),
+          environment: resolvedEnvironment,
         });
-        this.#probeProcesses.add(child);
-        let stdout = "";
-        let stderr = "";
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", (chunk: string) => {
-          stdout += chunk;
-        });
-        child.stderr.setEncoding("utf8");
-        child.stderr.on("data", (chunk: string) => {
-          stderr += chunk;
-        });
-        let settled = false;
-        const timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          this.#probeProcesses.delete(child);
-          reject(new Error("Antigravity quota probe timed out"));
-          void terminateProbe(child).catch(() => undefined);
-        }, DEFAULT_PROBE_TIMEOUT_MS);
-        const finish = (callback: () => void): void => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          this.#probeProcesses.delete(child);
-          callback();
-        };
-        child.once("error", (error) => finish(() => reject(error)));
-        child.once("exit", (code) => {
-          finish(() => {
-            if (code === 0) resolve(stdout);
-            else reject(new Error(stderr.trim() || `agy exited with code ${String(code)}`));
-          });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const child = spawn(executable, [...arguments_], {
+        env: resolvedEnvironment,
+        detached: process.platform !== "win32",
+        windowsHide: true,
+      });
+      this.#probeProcesses.add(child);
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.#probeProcesses.delete(child);
+        reject(new Error("Antigravity quota probe timed out"));
+        void terminateProbe(child).catch(() => undefined);
+      }, DEFAULT_PROBE_TIMEOUT_MS);
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#probeProcesses.delete(child);
+        callback();
+      };
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("exit", (code) => {
+        finish(() => {
+          if (code === 0) resolve(stdout);
+          else reject(new Error(stderr.trim() || `agy exited with code ${String(code)}`));
         });
       });
-    } finally {
-      await releaseKeychain();
-    }
+    });
   }
 
   async open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>> {
@@ -2227,27 +2386,12 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     }
     const routed = account ? withAntigravityAccountMarker(input, account.id) : input;
-    let keychainRelease: AntigravityKeychainRelease | undefined;
-    if (
-      account &&
-      this.#accounts.mode === "multi" &&
-      this.#options.manageDarwinKeychain !== false
-    ) {
-      try {
-        keychainRelease = await this.#accounts.store.acquireKeychainIsolation(account);
-      } catch (error) {
-        return {
-          ok: false,
-          error: {
-            code: "unavailable",
-            message: `Antigravity account isolation could not be established: ${errorMessage(error)}`,
-            retryable: true,
-          },
-        };
-      }
-    }
     const environment = this.#environment(routed.environment);
-    const prepared = this.#prepareTransport(routed);
+    let prepared =
+      routed.kind === "create" ? this.#claimReservedTransport(routed, account?.id) : null;
+    if (!prepared) {
+      prepared = this.#prepareTransport(routed);
+    }
     const inspection = await this.#inspectWithEnvironment({ cwd: routed.cwd }, environment);
     if (inspection.status !== "ready") {
       await this.#closePreparedTransport(prepared);
@@ -2264,16 +2408,13 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     });
     if (routed.kind === "create") {
-      const opened = await this.#openCreate(routed, models, prepared, keychainRelease);
+      const opened = await this.#openCreate(routed, models, prepared);
       if (opened.ok) {
-        keychainRelease = undefined;
         const bindingFailure = await this.#recordBinding(account, routed, opened.value);
         if (bindingFailure) {
           await opened.value.close().catch(() => undefined);
           return { ok: false, error: bindingFailure };
         }
-      } else {
-        await keychainRelease?.().catch(() => undefined);
       }
       return opened;
     }
@@ -2287,16 +2428,13 @@ export class AntigravityAdapter implements HarnessAdapter {
         },
       };
     }
-    const opened = await this.#openResume(routed, models, prepared, keychainRelease);
+    const opened = await this.#openResume(routed, models, prepared);
     if (opened.ok) {
-      keychainRelease = undefined;
       const bindingFailure = await this.#recordBinding(account, routed, opened.value);
       if (bindingFailure) {
         await opened.value.close().catch(() => undefined);
         return { ok: false, error: bindingFailure };
       }
-    } else {
-      await keychainRelease?.().catch(() => undefined);
     }
     return opened;
   }
@@ -2309,6 +2447,7 @@ export class AntigravityAdapter implements HarnessAdapter {
       await Promise.allSettled([
         ...sessions.map((s) => s.close()),
         ...probes.map((probe) => terminateProbe(probe)),
+        this.#reservationPool.close(),
       ]);
       await this.#inspectionPersistentWrite?.catch(() => undefined);
       this.#sessions.clear();
@@ -2418,7 +2557,6 @@ export class AntigravityAdapter implements HarnessAdapter {
     input: Extract<OpenSessionInput, { kind: "create" }>,
     models: readonly AntigravityNativeModel[],
     prepared?: PreparedAntigravityTransport | null,
-    keychainRelease?: AntigravityKeychainRelease,
   ): Promise<HarnessResult<HarnessSession>> {
     let modelSlug: string | undefined;
     let model: AntigravityNativeModel | undefined;
@@ -2481,7 +2619,7 @@ export class AntigravityAdapter implements HarnessAdapter {
         environment: this.#environment(input.environment),
         nativeSessionId: init.conversationId,
       });
-      const session = this.#trackSession(
+      const tracked = this.#trackSession(
         new AntigravityHarnessSession({
           cwd: input.cwd,
           environment: this.#environment(input.environment),
@@ -2496,10 +2634,14 @@ export class AntigravityAdapter implements HarnessAdapter {
           ...(this.#options.sessionIdleTimeoutMs !== undefined
             ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
             : {}),
-          ...(keychainRelease ? { keychainRelease } : {}),
         }),
+        this.#resolveAccount(input.environment)?.id ?? "legacy",
       );
-      return { ok: true, value: session };
+      if (!tracked.ok) {
+        await transport.close().catch(() => undefined);
+        return tracked;
+      }
+      return tracked;
     } catch (error) {
       await transport.close().catch(() => undefined);
       return { ok: false, error: normalizeError(error, "unavailable", transport.stderrTail) };
@@ -2510,7 +2652,6 @@ export class AntigravityAdapter implements HarnessAdapter {
     input: Extract<OpenSessionInput, { kind: "resume" }>,
     models: readonly AntigravityNativeModel[],
     prepared?: PreparedAntigravityTransport | null,
-    keychainRelease?: AntigravityKeychainRelease,
   ): Promise<HarnessResult<HarnessSession>> {
     let sourceRef: NativeSessionRef;
     let locator: {
@@ -2584,7 +2725,7 @@ export class AntigravityAdapter implements HarnessAdapter {
         nativeSessionId: sourceRef.nativeSessionId,
         ...(input.knownTurnRefs ? { knownTurnRefs: input.knownTurnRefs } : {}),
       });
-      const session = this.#trackSession(
+      const tracked = this.#trackSession(
         new AntigravityHarnessSession({
           cwd: input.cwd,
           environment: this.#environment(input.environment),
@@ -2600,19 +2741,95 @@ export class AntigravityAdapter implements HarnessAdapter {
           ...(this.#options.sessionIdleTimeoutMs !== undefined
             ? { sessionIdleTimeoutMs: this.#options.sessionIdleTimeoutMs }
             : {}),
-          ...(keychainRelease ? { keychainRelease } : {}),
         }),
+        this.#resolveAccount(input.environment)?.id ?? "legacy",
       );
-      return { ok: true, value: session };
+      if (!tracked.ok) {
+        await transport.close().catch(() => undefined);
+        return tracked;
+      }
+      return tracked;
     } catch (error) {
       await transport.close().catch(() => undefined);
       return { ok: false, error: normalizeError(error, "unavailable", transport.stderrTail) };
     }
   }
 
-  #trackSession(session: AntigravityHarnessSession): AntigravityHarnessSession {
-    this.#sessions.add(session);
-    return session;
+  /** `<accountsRoot>/runtime/leases` — shared by every Account and every Host. */
+  #leaseDirectory(): string {
+    return path.join(
+      antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
+      "runtime",
+      "leases",
+    );
+  }
+
+  /**
+   * Register a Session and claim its native conversation. AGY keeps session-scoped
+   * background writers (summary reconciliation, annotations) that no database lock
+   * covers, so once Accounts share one session store the boundary has to be this
+   * lease rather than "each Account has its own HOME".
+   */
+  #trackSession(
+    session: AntigravityHarnessSession,
+    accountId: string,
+  ): HarnessResult<AntigravityHarnessSession> {
+    const nativeSessionId = session.initialState.nativeRef?.nativeSessionId;
+    if (!nativeSessionId) {
+      // A Session without a native identity cannot be named by another writer.
+      this.#sessions.add(session);
+      return { ok: true, value: session };
+    }
+    let lease: AntigravitySessionLease;
+    try {
+      lease = acquireSessionLease({
+        leasesDirectory: this.#leaseDirectory(),
+        nativeSessionId,
+        accountId,
+      });
+    } catch (error) {
+      if (error instanceof AntigravitySessionLeaseError && error.code === "busy") {
+        return {
+          ok: false,
+          error: {
+            code: "unavailable",
+            message: `This conversation is already open in another account ('${error.holder?.accountId ?? "unknown"}')`,
+            retryable: true,
+          },
+        };
+      }
+      return { ok: false, error: normalizeError(error, "unavailable") };
+    }
+    this.#sessionLeases.set(nativeSessionId, lease);
+    const tracked = this.#withSessionLease(session, nativeSessionId, lease);
+    this.#sessions.add(tracked);
+    return { ok: true, value: tracked };
+  }
+
+  /** Release the conversation exactly when its Session closes. */
+  #withSessionLease(
+    session: AntigravityHarnessSession,
+    nativeSessionId: string,
+    lease: AntigravitySessionLease,
+  ): AntigravityHarnessSession {
+    return new Proxy(session, {
+      get: (target, property) => {
+        if (property === "close") {
+          return async (): Promise<void> => {
+            try {
+              await target.close();
+            } finally {
+              if (this.#sessionLeases.get(nativeSessionId) === lease) {
+                this.#sessionLeases.delete(nativeSessionId);
+              }
+              lease.release();
+            }
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
 
   #transportOptions(
@@ -2708,6 +2925,94 @@ export class AntigravityAdapter implements HarnessAdapter {
     await prepared.transport.close().catch(() => undefined);
   }
 
+  #claimReservedTransport(
+    input: Extract<OpenSessionInput, { kind: "create" }>,
+    accountId?: string,
+  ): PreparedAntigravityTransport | null {
+    try {
+      let modelSlug: string | undefined;
+      if (input.model) {
+        modelSlug = decodeAntigravityModelRef(input.model);
+      } else {
+        modelSlug = "gemini-3.8-flash";
+      }
+      const claimed = this.#reservationPool.claim({
+        cwd: path.resolve(input.cwd),
+        model: modelSlug,
+        accountId,
+        thinkingOptionId: input.thinkingOptionId,
+        permissionModeId: input.permissionModeId,
+      });
+      if (!claimed) return null;
+      return {
+        transport: claimed.transport,
+        startPromise: claimed.startPromise,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async reserveDraft(input: {
+    cwd: string;
+    model?: HarnessModelRef;
+    thinkingOptionId?: HarnessThinkingOptionId;
+    permissionModeId?: HarnessPermissionModeId;
+    accountId?: string;
+  }): Promise<void> {
+    if (this.#closePromise) return;
+    const account = input.accountId
+      ? this.#accounts.mode === "multi"
+        ? this.#accounts.store.get(input.accountId)
+        : undefined
+      : this.#accounts.mode === "multi"
+        ? this.#accounts.store.defaultAccount()
+        : undefined;
+    const accountId = account?.id;
+    let modelSlug: string | undefined;
+    if (input.model) {
+      try {
+        modelSlug = decodeAntigravityModelRef(input.model);
+      } catch {
+        return;
+      }
+    } else {
+      modelSlug = "gemini-3.8-flash";
+    }
+    this.#reservationPool.reserve({
+      cwd: path.resolve(input.cwd),
+      model: modelSlug,
+      accountId,
+      thinkingOptionId: input.thinkingOptionId,
+      permissionModeId: input.permissionModeId,
+    });
+  }
+
+  releaseDraft(input: {
+    cwd: string;
+    model?: HarnessModelRef;
+    thinkingOptionId?: HarnessThinkingOptionId;
+    permissionModeId?: HarnessPermissionModeId;
+    accountId?: string;
+  }): void {
+    let modelSlug: string | undefined;
+    if (input.model) {
+      try {
+        modelSlug = decodeAntigravityModelRef(input.model);
+      } catch {
+        return;
+      }
+    }
+    this.#reservationPool.release({
+      cwd: path.resolve(input.cwd),
+      model: modelSlug ?? "gemini-3.8-flash",
+      accountId: input.accountId,
+      thinkingOptionId: input.thinkingOptionId,
+      permissionModeId: input.permissionModeId,
+    });
+  }
+
+
   #environment(explicit?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const base = resolveAntigravityProxyEnvironment({
       ...process.env,
@@ -2746,16 +3051,6 @@ export class AntigravityAdapter implements HarnessAdapter {
         retryable: true,
       };
     }
-  }
-
-  async #acquireAccountKeychain(
-    environment: NodeJS.ProcessEnv,
-  ): Promise<AntigravityKeychainRelease> {
-    if (this.#accounts.mode !== "multi" || this.#options.manageDarwinKeychain === false)
-      return async () => undefined;
-    const account = this.#resolveAccount(environment);
-    if (!account) throw new Error("Antigravity has no configured account");
-    return this.#accounts.store.acquireKeychainIsolation(account);
   }
 
   /** Configured-but-broken accounts must fail closed instead of using the real HOME. */

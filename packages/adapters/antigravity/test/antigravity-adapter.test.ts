@@ -430,7 +430,11 @@ describe("AntigravityAdapter", () => {
 
   it("supports thinking.select and updates effectiveThinkingOptionId", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "antigravity-thinking-test-"));
-    const environment = { ANTIGRAVITY_APP_DATA_DIR: root, CODEXHOST_DATA_DIR: root };
+    const environment = {
+      HOME: root,
+      ANTIGRAVITY_APP_DATA_DIR: root,
+      CODEXHOST_DATA_DIR: root,
+    };
     const transportFactory = fakeTransportFactory("conv-thinking-select-1");
     // The CLI lists effort variants as separate rows; the Model catalog then
     // exposes them as Thinking options (upstream-aligned parsing).
@@ -1253,4 +1257,48 @@ describe("AntigravityAdapter", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("pre-warms draft via reserveDraft and claims it cleanly on open", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-draft-test-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    let transportCreatedCount = 0;
+    const createTransport = (): AntigravityCliTransportLike => {
+      transportCreatedCount += 1;
+      return fakeTransportFactory(`draft-transport-${transportCreatedCount}`).create();
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      return { stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" };
+    };
+    const adapter = new AntigravityAdapter(
+      { command: path.join(os.homedir(), ".local/bin/agy"), environment },
+      { createTransport, listModels },
+    );
+    try {
+      await adapter.reserveDraft({
+        cwd: root,
+        model: encodeAntigravityModelRef(MODEL),
+      });
+
+      expect(transportCreatedCount).toBe(1);
+
+      // open() should claim the reserved transport without creating a second one
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: root,
+        model: encodeAntigravityModelRef(MODEL),
+        environment,
+      });
+
+      expect(opened.ok).toBe(true);
+      expect(transportCreatedCount).toBe(1);
+
+      if (opened.ok) {
+        await opened.value.close();
+      }
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+

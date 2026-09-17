@@ -13,9 +13,9 @@ export function createHarnessAdapter(context: HarnessPluginContext): Antigravity
     ...(command ? { command } : {}),
     environment,
     accounts,
-    // OAuth is stored in the OS keyring, not just under HOME. On Darwin the
-    // adapter serializes a dedicated account-keychain lease and restores the
-    // user's keychain settings after each Session or probe.
+    // AGY stores OAuth in the OS keyring. On Darwin each account keeps its own
+    // keychain inside its shadow HOME, so accounts run concurrently instead of
+    // serialising on one global keychain.
     manageDarwinKeychain: context.platform === "darwin",
   });
 }

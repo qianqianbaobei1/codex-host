@@ -25,6 +25,9 @@ function outcomeForTurn(turn: AntigravityLedgerTurn): HistoricalTurnOutcome {
   if (turn.status === "cancelled") {
     return { status: "cancelled", reason: turn.error ?? "Cancelled by user" };
   }
+  if (turn.response && turn.response.trim().length > 0) {
+    return { status: "succeeded" };
+  }
   return {
     status: "failed",
     error: {
@@ -64,7 +67,7 @@ function turnSnapshot(sessionId: string, turn: AntigravityLedgerTurn): HostTurnS
       itemId: hostItemIdSchema.parse(`antigravity:${turn.nativeTurnKey}:agent`),
       text: turn.response,
     };
-    items.push({ item, outcome: itemOutcome(outcome) });
+    items.push({ item, outcome: { status: "succeeded" } });
   }
   return {
     nativeTurnRef,

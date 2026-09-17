@@ -60,6 +60,8 @@ export {
   CodexRuntimePool,
   UnknownCodexThreadAccountError,
 } from "./codex-runtime/codex-runtime-pool.js";
+export { ThreadAliasStore } from "./thread-alias-store.js";
+export type { ThreadAliasStoreOptions, ThreadAliasStoreLike } from "./thread-alias-store.js";
 export {
   createRemoteAppServerWebSocketListener,
   isRemoteUnixListenerInvocation,

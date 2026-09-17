@@ -543,6 +543,54 @@ describe("Antigravity per-Thread account routing", () => {
     };
   }
 
+  it("reports the Thread's own Account for read-only display", async () => {
+    const { realHome, store, environment } = await setup();
+    await store.bindThread({ threadId: "thread-9", accountId: "work", state: "committed" });
+    const adapter = new AntigravityAdapter({
+      accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
+      environment,
+    });
+    try {
+      expect(adapter.threadAccountId("thread-9")).toBe("work");
+      // An unbound Thread must not be guessed from the Harness-wide default.
+      expect(store.defaultAccount()?.id).toBe("default");
+      expect(adapter.threadAccountId("thread-other")).toBeNull();
+
+      // Threads created before Account bindings existed are located by the store
+      // that physically holds their conversation, never by the default Account.
+      const legacyStore = path.join(realHome, ".gemini", "antigravity-cli", "conversations");
+      const workStore = path.join(
+        realHome,
+        ".agy-accounts",
+        "work",
+        "home",
+        ".gemini",
+        "antigravity-cli",
+        "conversations",
+      );
+      await mkdir(legacyStore, { recursive: true });
+      await mkdir(workStore, { recursive: true });
+      await writeFile(path.join(legacyStore, "conv-legacy.db"), "", "utf8");
+      await writeFile(path.join(workStore, "conv-work.db"), "", "utf8");
+      expect(adapter.threadAccountId("thread-other", "conv-work")).toBe("work");
+      expect(adapter.threadAccountId("thread-other", "conv-legacy")).toBe("default");
+      expect(adapter.threadAccountId("thread-other", "conv-missing")).toBeNull();
+      // Sharing the session store makes the physical location ambiguous for every
+      // Account, so an explicit owner is the only correct answer.
+      await writeFile(path.join(workStore, "conv-both.db"), "", "utf8");
+      await writeFile(path.join(legacyStore, "conv-both.db"), "", "utf8");
+      expect(adapter.threadAccountId("thread-other", "conv-both")).toBeNull();
+      await store.recordNativeSessionOwner({ nativeSessionId: "conv-both", accountId: "work" });
+      expect(adapter.threadAccountId("thread-other", "conv-both")).toBe("work");
+      expect(adapter.threadAccountId("thread-other", "../../etc/passwd")).toBeNull();
+      // A bound Thread always wins over the on-disk location.
+      expect(adapter.threadAccountId("thread-9", "conv-legacy")).toBe("work");
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it("routes a create to the Thread-bound account and commits the binding", async () => {
     const { realHome, cwd, store, environment } = await setup();
     await store.bindThread({ threadId: "thread-9", accountId: "work", state: "committed" });
@@ -692,6 +740,129 @@ describe("Antigravity per-Thread account routing", () => {
     }
   });
 
+  it("moves a Thread to another Account only when the target can reach the conversation", async () => {
+    const { store, environment } = await setup();
+    await store.bindThread({
+      threadId: "thread-9",
+      accountId: "default",
+      nativeSessionId: "conv-move",
+      state: "committed",
+    });
+    const adapter = new AntigravityAdapter({
+      accounts: { mode: "multi", store },
+      manageDarwinKeychain: false,
+      environment,
+    });
+    try {
+      // Before the session store is shared the target Account cannot see the files,
+      // so the switch fails closed instead of silently starting a new conversation.
+      await expect(
+        adapter.selectThreadAccount({
+          threadId: "thread-9",
+          accountId: "work",
+          nativeSessionId: "conv-move",
+        }),
+      ).rejects.toThrow(/cannot see this conversation/u);
+      expect(store.bindingForThread("thread-9")?.accountId).toBe("default");
+
+      // With the canonical session store in place every Account reaches it.
+      const workConversations = path.join(
+        store.homeFor(store.get("work") as never),
+        ".gemini",
+        "antigravity-cli",
+        "conversations",
+      );
+      await mkdir(workConversations, { recursive: true });
+      await writeFile(path.join(workConversations, "conv-move.db"), "", "utf8");
+      await adapter.selectThreadAccount({
+        threadId: "thread-9",
+        accountId: "work",
+        nativeSessionId: "conv-move",
+      });
+      expect(store.bindingForThread("thread-9")?.accountId).toBe("work");
+      // The native owner follows the switch, so the next resume uses this credential.
+      expect(store.accountForNativeSession("conv-move")?.id).toBe("work");
+      // The default Account for new Threads is untouched by a Thread-scoped switch.
+      expect(store.defaultAccount()?.id).toBe("default");
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("refuses to open a conversation another live Session already owns", async () => {
+    const { realHome, cwd, store, environment } = await setup();
+    const adapter = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      {
+        listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
+        createTransport: () => fakeTransport("conv-leased"),
+      },
+    );
+    const other = new AntigravityAdapter(
+      { accounts: { mode: "multi", store }, manageDarwinKeychain: false, environment },
+      {
+        listModels: async () => ({ stdout: MODELS_OUTPUT, stderr: "" }),
+        createTransport: () => fakeTransport("conv-leased"),
+      },
+    );
+    try {
+      const created = await adapter.open({
+        kind: "create",
+        cwd,
+        environment: { CODEXHOST_THREAD_ID: "thread-lease" },
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const nativeRef = created.value.initialState.nativeRef;
+      if (!nativeRef) throw new Error("synthetic Session did not publish a Native Ref");
+      const leaseFile = path.join(
+        realHome,
+        ".agy-accounts",
+        "runtime",
+        "leases",
+        "conv-leased.lock",
+      );
+      expect(JSON.parse(await readFile(leaseFile, "utf8"))).toMatchObject({
+        nativeSessionId: "conv-leased",
+        generation: 1,
+        state: "held",
+      });
+
+      // A second runtime (another Account or another Host) must be refused before
+      // it can touch the same conversation files.
+      const refused = await other.open({
+        kind: "resume",
+        cwd,
+        nativeRef,
+        environment: { CODEXHOST_THREAD_ID: "thread-lease-2" },
+      });
+      expect(refused).toMatchObject({
+        ok: false,
+        error: { code: "unavailable", retryable: true },
+      });
+
+      // Closing the Session hands the conversation over with a fresh generation.
+      await created.value.close();
+      expect(JSON.parse(await readFile(leaseFile, "utf8"))).toMatchObject({ state: "released" });
+      const reopened = await other.open({
+        kind: "resume",
+        cwd,
+        nativeRef,
+        environment: { CODEXHOST_THREAD_ID: "thread-lease-2" },
+      });
+      expect(reopened.ok).toBe(true);
+      if (!reopened.ok) return;
+      expect(JSON.parse(await readFile(leaseFile, "utf8"))).toMatchObject({
+        generation: 2,
+        state: "held",
+      });
+      await reopened.value.close();
+    } finally {
+      await adapter.close();
+      await other.close();
+    }
+  });
+
   it("reads cached history from the native Session owner's account", async () => {
     const { realHome, cwd, store, environment } = await setup();
     await store.bindThread({
@@ -700,8 +871,11 @@ describe("Antigravity per-Thread account routing", () => {
       nativeSessionId: "native-cache",
       state: "committed",
     });
-    const baseEnvironment = { ...environment };
-    delete baseEnvironment.CODEXHOST_DATA_DIR;
+    const baseEnvironment = {
+      ...environment,
+      CODEX_HOME: undefined,
+      CODEXHOST_DATA_DIR: undefined,
+    };
     const historyDirectory = path.join(
       realHome,
       ".codex",

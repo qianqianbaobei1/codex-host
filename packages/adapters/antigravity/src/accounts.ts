@@ -47,6 +47,13 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  accountSessionStoreDirectory,
+  ensureSharedSessionStoreLayout,
+  sharedSessionStoreRoot,
+  type AntigravitySharedSessionEntry,
+} from "./session-store.js";
+
 /** Root of the shadow layout, relative to the real HOME. */
 export const ANTIGRAVITY_ACCOUNTS_DIR = ".agy-accounts";
 /** Internal marker: the account resolved for the current Session. */
@@ -182,65 +189,48 @@ function invalid(message: string): AntigravityAccountsLoad {
 export interface ShadowHomeReport {
   linked: string[];
   skipped: string[];
+  /**
+   * Session-domain entries that still hold data in this HOME, so they must be
+   * migrated before this Account can see every conversation. Provisioning never
+   * moves them: linking a populated `conversations/` would orphan its Threads.
+   */
+  sessionStorePending?: AntigravitySharedSessionEntry[];
 }
 
 const execFileAsync = promisify(execFile);
 
-export type AntigravityKeychainRelease = () => Promise<void>;
-
-let keychainOperation: Promise<unknown> = Promise.resolve();
-let activeKeychainLease: {
-  file: string;
-  count: number;
-  previousDefault: string[];
-  previousList: string[];
-} | null = null;
+/** Path of the keychain that belongs to one account's shadow HOME. */
+export function antigravityAccountKeychain(shadowHome: string): string {
+  return path.join(shadowHome, "Library", "Keychains", "login.keychain-db");
+}
 
 /**
  * macOS shows a blocking「找不到钥匙串」dialog when a process tries to store a
  * credential and no keychain exists at `$HOME/Library/Keychains`. Creating a
  * dedicated, unlocked, empty-password keychain per account keeps agy working
  * without a prompt and without reaching the shared login keychain.
- *
- * `security create-keychain` also installs the new keychain as the user default
- * and rewrites the user search list, so the previous configuration is restored
- * unconditionally: this overlay must never change global keychain settings.
  */
-export function darwinUserLoginKeychain(environment: NodeJS.ProcessEnv = process.env): string {
+function darwinUserLoginKeychain(environment: NodeJS.ProcessEnv = process.env): string {
   return path.join(antigravityRealHome(environment), "Library", "Keychains", "login.keychain-db");
 }
 
-function sanitizeDarwinKeychainList(list: readonly string[], realLogin: string): string[] {
-  const filtered = list.filter((p) => !p.includes(".agy-accounts"));
-  if (filtered.length === 0 && existsSync(realLogin)) {
-    return [realLogin];
-  }
-  return filtered;
+/**
+ * Every keychain command runs with the account's HOME. `security` resolves the
+ * user keychain domain from `$HOME/Library/Keychains`, so this keeps the whole
+ * keychain world account-local and never touches the real user's settings.
+ */
+function keychainEnvironment(home: string): NodeJS.ProcessEnv {
+  return { ...process.env, HOME: home };
 }
 
-let darwinExitHookRegistered = false;
-function registerDarwinExitHook(): void {
-  if (darwinExitHookRegistered || process.platform !== "darwin") return;
-  darwinExitHookRegistered = true;
-  process.once("exit", () => {
-    try {
-      restoreDarwinUserKeychain(process.env, true);
-    } catch {
-      // Ignore errors on process exit
-    }
-  });
-}
-
-export function restoreDarwinUserKeychain(
-  environment: NodeJS.ProcessEnv = process.env,
-  force = false,
-): void {
+/**
+ * Repair a user keychain list that an older build left pointing at an account
+ * keychain. Accounts now keep their keychain inside their own HOME, so nothing
+ * installs one globally any more; this remains as a one-way repair for machines
+ * that ran the previous build.
+ */
+export function restoreDarwinUserKeychain(environment: NodeJS.ProcessEnv = process.env): void {
   if (process.platform !== "darwin") return;
-  // A live AGY session owns the selected keychain. Restoring the user's
-  // keychain while that session is still running would make its next Keychain
-  // Services lookup use a different account. The exit hook passes `force` so
-  // a crashed/terminating Host still repairs the global setting.
-  if (activeKeychainLease && !force) return;
   try {
     const realLogin = darwinUserLoginKeychain(environment);
     if (!existsSync(realLogin)) return;
@@ -255,7 +245,8 @@ export function restoreDarwinUserKeychain(
       .split("\n")
       .map((l) => l.trim().replace(/^"|"$/gu, ""))
       .filter(Boolean);
-    const sanitizedList = sanitizeDarwinKeychainList(rawList, realLogin);
+    const filteredList = rawList.filter((p) => !p.includes(ANTIGRAVITY_ACCOUNTS_DIR));
+    const sanitizedList = filteredList.length > 0 ? filteredList : [realLogin];
     if (rawDefault.includes(".agy-accounts") || !rawList.includes(realLogin)) {
       execFileSync("security", ["list-keychains", "-d", "user", "-s", ...sanitizedList], {
         stdio: ["pipe", "pipe", "ignore"],
@@ -269,142 +260,35 @@ export function restoreDarwinUserKeychain(
   }
 }
 
-async function createDarwinKeychain(file: string): Promise<void> {
-  const readSetting = async (arguments_: readonly string[]): Promise<string[]> => {
-    const { stdout } = await execFileAsync("security", [...arguments_]);
-    return stdout
-      .split("\n")
-      .map((line) => line.trim().replace(/^"|"$/gu, ""))
-      .filter(Boolean);
-  };
-  const realLogin = darwinUserLoginKeychain();
-  const previousDefaultRaw = await readSetting(["default-keychain", "-d", "user"]).catch(() => []);
-  const previousListRaw = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
-  const previousList = sanitizeDarwinKeychainList(previousListRaw, realLogin);
-  const previousDefault = previousDefaultRaw[0]?.includes(".agy-accounts")
-    ? realLogin
-    : (previousDefaultRaw[0] ?? realLogin);
-  try {
-    // `-p ""` creates the keychain unlocked; `unlock-keychain -p ""` rejects the
-    // empty passphrase on current macOS, so it must not be called.
-    await execFileAsync("security", ["create-keychain", "-p", "", file]);
-    // Never auto-lock: a locked keychain would prompt again on the next write.
-    await execFileAsync("security", ["set-keychain-settings", file]).catch(() => undefined);
-  } finally {
-    if (previousList.length > 0) {
-      await execFileAsync("security", [
-        "list-keychains",
-        "-d",
-        "user",
-        "-s",
-        ...previousList,
-      ]).catch(() => undefined);
-    }
-    if (previousDefault) {
-      await execFileAsync("security", [
-        "default-keychain",
-        "-d",
-        "user",
-        "-s",
-        previousDefault,
-      ]).catch(() => undefined);
-    }
-  }
+async function createDarwinKeychain(file: string, home: string): Promise<void> {
+  const environment = keychainEnvironment(home);
+  // `-p ""` creates the keychain unlocked; `unlock-keychain -p ""` rejects the
+  // empty passphrase on current macOS, so it must not be called.
+  await execFileAsync("security", ["create-keychain", "-p", "", file], { env: environment });
+  // Never auto-lock: a locked keychain would prompt again on the next write.
+  await execFileAsync("security", ["set-keychain-settings", file], { env: environment }).catch(
+    () => undefined,
+  );
 }
 
-/**
- * Keychain Services ignores HOME when resolving generic passwords. Keep only
- * the account keychain in the user search list for the lifetime of each AGY
- * process, and restore the user's list after the last same-account user goes
- * away. Different account processes are rejected while a lease is active so a
- * credential can never be selected from the wrong account.
- */
-async function acquireDarwinKeychain(file: string): Promise<AntigravityKeychainRelease> {
-  if (process.platform !== "darwin") return async () => undefined;
-  registerDarwinExitHook();
-  const operation = keychainOperation.then(async () => {
-    if (activeKeychainLease) {
-      if (activeKeychainLease.file !== file) {
-        throw new Error("Antigravity account keychain isolation is busy for another account");
-      }
-      activeKeychainLease.count += 1;
-    } else {
-      const readSetting = async (arguments_: readonly string[]): Promise<string[]> => {
-        const { stdout } = await execFileAsync("security", [...arguments_]);
-        return stdout
-          .split("\n")
-          .map((line) => line.trim().replace(/^"|"$/gu, ""))
-          .filter(Boolean);
-      };
-      const realLogin = darwinUserLoginKeychain();
-      const previousDefaultRaw = await readSetting(["default-keychain", "-d", "user"]).catch(
-        () => [],
-      );
-      const previousListRaw = await readSetting(["list-keychains", "-d", "user"]).catch(() => []);
-      const previousList = sanitizeDarwinKeychainList(previousListRaw, realLogin);
-      const previousDefault = previousDefaultRaw[0]?.includes(".agy-accounts")
-        ? realLogin
-        : (previousDefaultRaw[0] ?? realLogin);
-      await execFileAsync("security", ["list-keychains", "-d", "user", "-s", file]);
-      await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file]);
-      activeKeychainLease = {
-        file,
-        count: 1,
-        previousDefault: [previousDefault],
-        previousList,
-      };
-    }
-
-    let released = false;
-    return async (): Promise<void> => {
-      if (released) return;
-      released = true;
-      const releaseOperation = keychainOperation.then(async () => {
-        const lease = activeKeychainLease;
-        if (!lease || lease.file !== file) return;
-        lease.count -= 1;
-        if (lease.count > 0) return;
-        try {
-          if (lease.previousList.length > 0) {
-            await execFileAsync("security", [
-              "list-keychains",
-              "-d",
-              "user",
-              "-s",
-              ...lease.previousList,
-            ]).catch(() => undefined);
-          }
-          const previous = lease.previousDefault[0];
-          if (previous) {
-            await execFileAsync("security", [
-              "default-keychain",
-              "-d",
-              "user",
-              "-s",
-              previous,
-            ]).catch(() => undefined);
-          }
-        } finally {
-          // A stale keychain path from a removed account must never poison the
-          // in-process lease state or turn a successful model probe into an
-          // inspection error.
-          activeKeychainLease = null;
-        }
-      });
-      keychainOperation = releaseOperation.catch(() => undefined);
-      await releaseOperation;
-    };
+/** Point one HOME at its own keychain. Idempotent and free of global side effects. */
+async function selectDarwinKeychain(file: string, home: string): Promise<void> {
+  if (process.platform !== "darwin") return;
+  const environment = keychainEnvironment(home);
+  await execFileAsync("security", ["list-keychains", "-d", "user", "-s", file], {
+    env: environment,
   });
-  keychainOperation = operation.catch(() => undefined);
-  return operation;
+  await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file], {
+    env: environment,
+  });
 }
 
 /**
  * Build (or repair) a shadow HOME. Everything in the real HOME is symlinked so
  * shell tools keep the user's git/ssh/gh/npm credentials, except:
  *  - `.gemini`, which is rebuilt per account (config/skills shared by link),
- *  - `Library/Keychains`, which is created per account and selected through a
- *    serialized Darwin keychain lease,
+ *  - `Library/Keychains`, which is created per account and selected as that
+ *    HOME's keychain domain,
  *  - any entry that would place the shadow root inside its own link target.
  * Idempotent: existing entries are left untouched.
  */
@@ -412,8 +296,12 @@ export async function ensureAntigravityShadowHome(input: {
   realHome: string;
   shadowHome: string;
   shadowRoot: string;
+  /** Skip every keychain command; used by tests and by non-macOS hosts. */
+  manageDarwinKeychain?: boolean;
   /** Test seam; defaults to `security create-keychain` on macOS. */
-  createKeychain?: (file: string) => Promise<void>;
+  createKeychain?: (file: string, home: string) => Promise<void>;
+  /** Test seam; defaults to `security list-keychains/default-keychain`. */
+  selectKeychain?: (file: string, home: string) => Promise<void>;
 }): Promise<ShadowHomeReport> {
   const realHome = path.resolve(input.realHome);
   const shadowHome = path.resolve(input.shadowHome);
@@ -506,9 +394,12 @@ export async function ensureAntigravityShadowHome(input: {
 
   // macOS shows a blocking「找不到钥匙串」dialog when agy stores a credential and
   // no keychain exists at `$HOME/Library/Keychains`. A dedicated per-account
-  // keychain is prepared here; callers still need acquireKeychainIsolation()
-  // while AGY is running because Keychain Services is user-scoped, not HOME-scoped.
-  const keychainFile = path.join(keychainDirectory, "login.keychain-db");
+  // keychain is prepared here and then selected as this HOME's keychain domain:
+  // AGY resolves its keyring through `$HOME`, so the account keeps its own
+  // credentials while other accounts — and the real login keychain — stay
+  // untouched and usable at the same time.
+  const keychainFile = antigravityAccountKeychain(shadowHome);
+  const manageKeychain = input.manageDarwinKeychain !== false;
   if (
     !(await lstat(keychainFile).then(
       () => true,
@@ -517,17 +408,41 @@ export async function ensureAntigravityShadowHome(input: {
   ) {
     const create =
       input.createKeychain ??
-      (process.platform === "darwin" ? createDarwinKeychain : async () => undefined);
+      (process.platform === "darwin" && manageKeychain
+        ? createDarwinKeychain
+        : async () => undefined);
     try {
-      await create(keychainFile);
+      await create(keychainFile, shadowHome);
       linked.push("Library/Keychains/login.keychain-db");
     } catch {
       skipped.push("Library/Keychains/login.keychain-db");
     }
   }
+  if (manageKeychain) {
+    const select = input.selectKeychain ?? selectDarwinKeychain;
+    await select(keychainFile, shadowHome).catch(() => {
+      skipped.push("Library/Keychains/selection");
+    });
+  }
+
+  // A conversation belongs to the Session, not to the Account, so every Account
+  // reaches the same canonical session store. Only entries that cannot lose data
+  // adopt the layout here; a populated entry is reported and left untouched for
+  // the offline migration (`antigravity-shared-store.mjs`).
+  const sessionStore = ensureSharedSessionStoreLayout({
+    storeDir: accountSessionStoreDirectory(shadowHome),
+    sharedRoot: sharedSessionStoreRoot(shadowRoot),
+  });
+  for (const entry of sessionStore.linked) linked.push(`.gemini/antigravity-cli/${entry}`);
+  for (const entry of sessionStore.pending)
+    skipped.push(`.gemini/antigravity-cli/${entry} (migrate)`);
 
   await chmod(shadowHome, 0o700).catch(() => undefined);
-  return { linked, skipped };
+  return {
+    linked,
+    skipped,
+    ...(sessionStore.pending.length > 0 ? { sessionStorePending: sessionStore.pending } : {}),
+  };
 }
 
 export function loadAntigravityAccountsSync(
@@ -841,37 +756,16 @@ export class AntigravityAccountStore {
     account: AntigravityAccount,
     options: { manageDarwinKeychain?: boolean } = {},
   ): Promise<string> {
-    if (process.platform === "darwin") {
-      restoreDarwinUserKeychain();
-    }
     const home = this.homeFor(account);
     if (account.legacy === true || this.#shadowReady.has(account.id)) return home;
     await ensureAntigravityShadowHome({
       realHome: this.#realHome,
       shadowHome: home,
       shadowRoot: this.shadowRoot,
-      ...(options.manageDarwinKeychain === false ? { createKeychain: async () => undefined } : {}),
+      ...(options.manageDarwinKeychain === false ? { manageDarwinKeychain: false } : {}),
     });
     this.#shadowReady.add(account.id);
     return home;
-  }
-
-  async acquireKeychainIsolation(account: AntigravityAccount): Promise<AntigravityKeychainRelease> {
-    if (process.platform !== "darwin") return async () => undefined;
-    if (account.legacy === true) {
-      return acquireDarwinKeychain(darwinUserLoginKeychain());
-    }
-    const home = await this.ensureHome(account);
-    const file = path.join(home, "Library", "Keychains", "login.keychain-db");
-    if (
-      !(await lstat(file).then(
-        () => true,
-        () => false,
-      ))
-    ) {
-      throw new Error(`Antigravity account '${account.name}' has no isolated keychain`);
-    }
-    return acquireDarwinKeychain(file);
   }
 
   async bindThread(input: {
@@ -913,6 +807,25 @@ export class AntigravityAccountStore {
       accountId: binding.accountId,
       nativeSessionId: input.nativeSessionId,
       state: "committed",
+    });
+  }
+
+  /**
+   * Record which Account owns an existing native conversation, without inventing
+   * a Thread for it. Used by the shared-store migration, which is the last moment
+   * at which the owning Account is still knowable from disk.
+   */
+  async recordNativeSessionOwner(input: {
+    nativeSessionId: string;
+    accountId: string;
+  }): Promise<void> {
+    if (!this.#accounts.has(input.accountId)) {
+      throw new Error(`Unknown Antigravity account '${input.accountId}'`);
+    }
+    if (!input.nativeSessionId.trim()) return;
+    await this.#mutate(async () => {
+      this.#nativeSessionBindings.set(input.nativeSessionId, input.accountId);
+      await this.#persist();
     });
   }
 

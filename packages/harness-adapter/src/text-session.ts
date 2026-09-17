@@ -571,10 +571,34 @@ export interface HarnessAdapter {
    * than reported with fabricated quota.
    */
   inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[] | null>;
-  /** Explicitly refresh read-only quota telemetry without changing account selection. */
-  refreshAccountCredits?(): Promise<void>;
+  /**
+   * Refresh read-only quota telemetry without changing account selection.
+   * `force` (explicit user refresh) ignores the per-account freshness window;
+   * without it a caller may only probe accounts whose snapshot went stale, so
+   * background refreshes never stack up against the provider.
+   */
+  refreshAccountCredits?(options?: { force?: boolean }): Promise<void>;
   /** Select the default account used by newly created Threads. Existing Threads keep theirs. */
   selectAccount?(accountId: string): Promise<void>;
+  /**
+   * Point an existing Thread at another native Account, so the next Turn continues
+   * the same native conversation under that credential. Implementations must
+   * refuse when the target Account cannot reach the conversation, and must not
+   * touch a Thread that is currently running.
+   */
+  selectThreadAccount?(input: {
+    threadId: string;
+    accountId: string;
+    nativeSessionId?: string | undefined;
+  }): Promise<void>;
+  /**
+   * Read-only: the native Account a Host Thread is bound to, or null when the
+   * Harness cannot say (single-account mode, unknown Thread, deleted Account).
+   * `nativeSessionId` lets a Harness fall back to the stored Session's owner for
+   * Threads created before Account bindings existed. Must not spawn,
+   * authenticate, or open a Native Session.
+   */
+  threadAccountId?(threadId: string, nativeSessionId?: string): string | null;
   /** Start an explicit user-authorized login without performing background auth. */
   loginAccount?(accountId: string): Promise<void>;
   /** Create a new isolated native account (metadata and shadow environment). */

@@ -7,7 +7,11 @@ import type {
   HarnessThinkingOption,
   HarnessThinkingOptionId,
 } from "@codexhost/harness-adapter";
-import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "@codexhost/shared-contracts";
+import {
+  harnessModelRefSchema,
+  harnessThinkingOptionIdSchema,
+  sortThinkingOptionsByEffort,
+} from "@codexhost/shared-contracts";
 
 export interface GrokModelState {
   catalog: HarnessModelCatalog;
@@ -35,7 +39,7 @@ function thinkingOptions(value: unknown): HarnessThinkingOption[] {
     seen.add(id.data);
     options.push({ id: id.data, label: candidate.label });
   }
-  return options;
+  return sortThinkingOptionsByEffort(options);
 }
 
 export function parseGrokModelState(value: unknown): GrokModelState | null {
@@ -80,7 +84,7 @@ export function parseGrokModelState(value: unknown): GrokModelState | null {
     });
   }
   if (!models.some(({ ref }) => ref.id === currentModel.data.id)) return null;
-  const options = [...allThinking.values()];
+  const options = sortThinkingOptionsByEffort([...allThinking.values()]);
   return {
     currentModel: currentModel.data,
     contextWindowTokensByModel,
