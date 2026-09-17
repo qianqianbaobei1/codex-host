@@ -61,6 +61,12 @@ import { timestampedLogLine } from "./diagnostic-log.js";
 const TRANSIENT_INSTALL_RETRY_MS = 250;
 const RECOVERY_RETRY_INITIAL_MS = 30_000;
 const RECOVERY_RETRY_MAX_MS = 300_000;
+/**
+ * A monitor gap this large means the process was not scheduled — system sleep, in practice. It sits
+ * well above the 5s backoff-reset threshold on purpose: a briefly loaded machine must not trigger a
+ * full renderer reinstall.
+ */
+const SLEEP_GAP_THRESHOLD_MS = 30_000;
 const startupTraceStartedAt = Date.now();
 
 function startupTrace(stage: string, detail?: unknown): void {
@@ -365,7 +371,19 @@ export async function runDesktopController(
       await dependencies.sleep(dependencies.monitorIntervalMs);
       if (signal.aborted) continue;
       const currentTickAt = now();
-      if (currentTickAt - lastTickAt > Math.max(dependencies.monitorIntervalMs * 3, 5_000)) {
+      const tickGap = currentTickAt - lastTickAt;
+      if (tickGap > Math.max(dependencies.monitorIntervalMs * 3, 5_000)) {
+        nextRecoveryAt = 0;
+        recoveryDelayMs = RECOVERY_RETRY_INITIAL_MS;
+      }
+      // A much larger gap means this process was not scheduled for tens of seconds — in practice a
+      // system sleep. The CDP connection and the renderer generation may both be stale, so drop
+      // the session and force a full reinstall rather than trusting an incremental check. The
+      // threshold is deliberately far above the backoff reset so ordinary scheduling jitter (a
+      // loaded machine delaying a tick by a few seconds) never triggers a reinstall.
+      if (tickGap > SLEEP_GAP_THRESHOLD_MS) {
+        startupTrace("detected a long monitor gap; forcing renderer reinstall", tickGap);
+        resetSession();
         nextRecoveryAt = 0;
         recoveryDelayMs = RECOVERY_RETRY_INITIAL_MS;
       }

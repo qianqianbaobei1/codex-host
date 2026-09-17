@@ -249,6 +249,31 @@ async function uninstallRendererIntegration(renderer: RendererCdpClient): Promis
   }
 }
 
+/**
+ * A main-frame navigation replaces the document, so every binding installed into the old one is
+ * gone. `Page.addScriptToEvaluateOnNewDocument` re-runs the bundle for the new document, and the
+ * Controller's monitor loop re-verifies the binding, so recovery already happens — but it used to
+ * be silent, which made "codexhost stopped working after ChatGPT reloaded" impossible to confirm
+ * from the logs.
+ *
+ * Deliberately does not reinstall from inside this callback: the new document is still loading, and
+ * racing the page's own startup is exactly the kind of timing hazard that produced the ambiguous
+ * request-manager failures.
+ */
+function reportRendererNavigation(renderer: RendererCdpClient): void {
+  if (typeof renderer.on !== "function") return;
+  renderer.on("Page.frameNavigated", (params) => {
+    const frame = (params as { frame?: { parentId?: string; url?: string } })?.frame;
+    // Child frames keep the same document root and do not invalidate the installation.
+    if (!frame || frame.parentId) return;
+    console.error(
+      timestampedLogLine(
+        `codexhost renderer navigated to ${frame.url ?? "unknown"}; renderer integration will be re-verified`,
+      ),
+    );
+  });
+}
+
 async function installTarget(
   target: CdpTarget,
   rendererSource: string,
@@ -264,6 +289,7 @@ async function installTarget(
     await renderer.command("Log.enable").catch(() => undefined);
     reportRendererDiagnostics(renderer);
     await renderer.command("Page.enable");
+    reportRendererNavigation(renderer);
     await renderer.command("Page.addScriptToEvaluateOnNewDocument", { source: rendererSource });
     await evaluateSource(renderer, rendererSource);
     const draftPrewarmPolicy = await operations.installDraftPrewarmPolicy(renderer);

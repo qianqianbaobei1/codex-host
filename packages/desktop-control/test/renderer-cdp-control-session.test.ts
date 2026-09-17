@@ -153,6 +153,51 @@ describe("Renderer CDP Control Session", () => {
     }
   });
 
+  it("reports a main-frame navigation so a reload is visible in the logs", async () => {
+    const client = rendererClient();
+    const listeners = new Map<string, (params: unknown) => void>();
+    const subscribing = {
+      ...client,
+      on: (method: string, listener: (params: unknown) => void) => {
+        listeners.set(method, listener);
+        return () => listeners.delete(method);
+      },
+    };
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "source",
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect: vi.fn(async () => subscribing),
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      listeners.get("Page.frameNavigated")?.({
+        frame: { url: "app://-/index.html" },
+      });
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("codexhost renderer navigated to app://-/index.html"),
+      );
+      // A child frame keeps the same document root; it must not be reported as a reload.
+      errorSpy.mockClear();
+      listeners.get("Page.frameNavigated")?.({
+        frame: { url: "app://-/iframe.html", parentId: "parent" },
+      });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      session.close();
+    }
+  });
+
   it("registers future-document injection before evaluating the current document", async () => {
     const client = rendererClient();
     const source = "globalThis.__codexhostInstalled = true";
