@@ -331,7 +331,7 @@ describe("Kiro regression lifecycle", () => {
     expect(states.at(-1)?.effectiveThinkingOptionId).toBeUndefined();
   });
 
-  it("restores native effort and refuses unconfirmed or busy changes", async () => {
+  it("restores native effort, rejects unconfirmed changes, and selects during a Turn", async () => {
     const fake = effortTransport();
     fake.setCurrent("effortLevel", "high");
     const adapter = new KiroAdapter({}, { createTransport: () => fake });
@@ -360,12 +360,21 @@ describe("Kiro regression lifecycle", () => {
         turnId: hostTurnIdSchema.parse("busy"),
         input: [{ type: "text", text: "test" }],
       });
+      fake.configResult = undefined;
       expect(
         await session.execute({
           type: "thinking.select",
           thinkingOptionId: "low" as HarnessThinkingOptionId,
         }),
-      ).toMatchObject({ ok: false, error: { code: "sessionBusy" } });
+      ).toMatchObject({ ok: true });
+      expect(
+        await session.execute({
+          type: "model.select",
+          model: { id: "adjustable" } as HarnessModelRef,
+        }),
+      ).toMatchObject({ ok: true });
+      expect(fake.configCalls).toContainEqual({ id: "effortLevel", value: "low" });
+      expect(fake.configCalls).toContainEqual({ id: "model", value: "adjustable" });
     } finally {
       await adapter.close();
     }
