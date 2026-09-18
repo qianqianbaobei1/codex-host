@@ -37,6 +37,7 @@ import {
   readdir,
   realpath,
   rename,
+  rm,
   symlink,
   chmod,
   writeFile,
@@ -201,9 +202,28 @@ export interface ShadowHomeReport {
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * File name of an account's keychain inside its shadow HOME.
+ *
+ * Deliberately NOT `login.keychain-db`: macOS reserves that name and refuses an empty password for
+ * it — measured on this machine, `create-keychain -p "" login.keychain-db` succeeds while the
+ * matching `unlock-keychain -p ""` fails with errSecAuthFailed, and renaming the very same file
+ * makes both succeed. A keychain nobody can open is what made AGY's credential call (go-keyring →
+ * `/usr/bin/security`) raise a recurring「unlock keychain」dialog that no password the user knows
+ * could satisfy, because the dialog names it "login".
+ */
+export const ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE = "agy-account.keychain-db";
+
+/** The name an earlier build used, which can never be opened. Removed when one is found. */
+const LEGACY_ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE = "login.keychain-db";
+
 /** Path of the keychain that belongs to one account's shadow HOME. */
 export function antigravityAccountKeychain(shadowHome: string): string {
-  return path.join(shadowHome, "Library", "Keychains", "login.keychain-db");
+  return path.join(shadowHome, "Library", "Keychains", ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE);
+}
+
+export function legacyAntigravityAccountKeychain(shadowHome: string): string {
+  return path.join(shadowHome, "Library", "Keychains", LEGACY_ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE);
 }
 
 /**
@@ -234,22 +254,33 @@ function keychainEnvironment(home: string): NodeJS.ProcessEnv {
 export function restoreDarwinUserKeychain(environment: NodeJS.ProcessEnv = process.env): void {
   if (process.platform !== "darwin") return;
   try {
-    const realLogin = darwinUserLoginKeychain(environment);
+    const realHome = antigravityRealHome(process.env);
+    const realLogin = path.join(realHome, "Library", "Keychains", "login.keychain-db");
     if (!existsSync(realLogin)) return;
-    const rawDefault = execFileSync("security", ["default-keychain", "-d", "user"], {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    }).trim();
-    const rawList = execFileSync("security", ["list-keychains", "-d", "user"], {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    })
-      .split("\n")
-      .map((l) => l.trim().replace(/^"|"$/gu, ""))
-      .filter(Boolean);
+    let rawDefault = "";
+    try {
+      rawDefault = execFileSync("security", ["default-keychain", "-d", "user"], {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // Ignored: missing or unopenable default keychain
+    }
+    let rawList: string[] = [];
+    try {
+      rawList = execFileSync("security", ["list-keychains", "-d", "user"], {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      })
+        .split("\n")
+        .map((l) => l.trim().replace(/^"|"$/gu, ""))
+        .filter(Boolean);
+    } catch {
+      // Ignored
+    }
     const filteredList = rawList.filter((p) => !p.includes(ANTIGRAVITY_ACCOUNTS_DIR));
-    const sanitizedList = filteredList.length > 0 ? filteredList : [realLogin];
-    if (rawDefault.includes(".agy-accounts") || !rawList.includes(realLogin)) {
+    const sanitizedList = filteredList.includes(realLogin) ? filteredList : [realLogin, ...filteredList];
+    if (!rawDefault || rawDefault.includes(".agy-accounts") || !rawList.includes(realLogin)) {
       execFileSync("security", ["list-keychains", "-d", "user", "-s", ...sanitizedList], {
         stdio: ["pipe", "pipe", "ignore"],
       });
@@ -304,16 +335,13 @@ async function createDarwinKeychain(file: string, home: string): Promise<void> {
   );
 }
 
-/** Point one HOME at its own keychain. Idempotent and free of global side effects. */
-async function selectDarwinKeychain(file: string, home: string): Promise<void> {
-  if (process.platform !== "darwin") return;
-  const environment = keychainEnvironment(home);
-  await execFileAsync("security", ["list-keychains", "-d", "user", "-s", file], {
-    env: environment,
-  });
-  await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file], {
-    env: environment,
-  });
+/**
+ * In Scheme A, we never overwrite the user domain's search list or default keychain.
+ * Modifying `security default-keychain` or `list-keychains` has user-session-wide side
+ * effects on macOS that corrupt the user's default keychain and break applications.
+ */
+async function selectDarwinKeychain(_file: string, _home: string): Promise<void> {
+  // Intentionally no-op to prevent corrupting the user's global keychain search list.
 }
 
 /**
@@ -339,6 +367,8 @@ export async function ensureAntigravityShadowHome(input: {
   unlockKeychain?: (file: string, home: string) => Promise<boolean>;
   /** Test seam; defaults to `security delete-keychain` followed by a fresh create. */
   recreateKeychain?: (file: string, home: string) => Promise<void>;
+  /** Test seam; defaults to `restoreDarwinUserKeychain` on macOS. */
+  restoreUserKeychain?: () => void;
 }): Promise<ShadowHomeReport> {
   const realHome = path.resolve(input.realHome);
   const shadowHome = path.resolve(input.shadowHome);
@@ -438,6 +468,18 @@ export async function ensureAntigravityShadowHome(input: {
   // untouched and usable at the same time.
   const keychainFile = antigravityAccountKeychain(shadowHome);
   const manageKeychain = input.manageDarwinKeychain !== false;
+  // Drop the reserved name left by an earlier build. It cannot be opened, so keeping it would
+  // leave AGY pointing its credential calls at a keychain that only ever prompts.
+  const legacyKeychainFile = legacyAntigravityAccountKeychain(shadowHome);
+  if (
+    await lstat(legacyKeychainFile).then(
+      () => true,
+      () => false,
+    )
+  ) {
+    await rm(legacyKeychainFile, { force: true }).catch(() => undefined);
+    repaired.push(`Library/Keychains/${LEGACY_ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE}`);
+  }
   if (
     !(await lstat(keychainFile).then(
       () => true,
@@ -451,9 +493,9 @@ export async function ensureAntigravityShadowHome(input: {
         : async () => undefined);
     try {
       await create(keychainFile, shadowHome);
-      linked.push("Library/Keychains/login.keychain-db");
+      linked.push(`Library/Keychains/${ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE}`);
     } catch {
-      skipped.push("Library/Keychains/login.keychain-db");
+      skipped.push(`Library/Keychains/${ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE}`);
     }
   } else {
     // A keychain that exists but cannot be opened with its own (empty) password is unusable and
@@ -469,9 +511,9 @@ export async function ensureAntigravityShadowHome(input: {
     if (unlock && !(await unlock(keychainFile, shadowHome).catch(() => false))) {
       try {
         await recreate(keychainFile, shadowHome);
-        repaired.push("Library/Keychains/login.keychain-db");
+        repaired.push(`Library/Keychains/${ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE}`);
       } catch {
-        skipped.push("Library/Keychains/login.keychain-db");
+        skipped.push(`Library/Keychains/${ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE}`);
       }
     }
   }
@@ -480,6 +522,21 @@ export async function ensureAntigravityShadowHome(input: {
     await select(keychainFile, shadowHome).catch(() => {
       skipped.push("Library/Keychains/selection");
     });
+    // `security create-keychain/list-keychains/default-keychain` write the *user* keychain domain
+    // even when they run with a shadow HOME — measured: a shadow-home create-keychain added the
+    // account keychain to the real user's search list. That leaves every other app unable to find
+    // its own items, so put the real user's default and search list back immediately instead of
+    // waiting for the next adapter start to repair it.
+    const restore =
+      input.restoreUserKeychain ??
+      (process.platform === "darwin" ? () => restoreDarwinUserKeychain() : null);
+    if (restore && process.platform === "darwin") {
+      try {
+        restore();
+      } catch {
+        skipped.push("Library/Keychains/selection");
+      }
+    }
   }
 
   // A conversation belongs to the Session, not to the Account, so every Account

@@ -153,7 +153,7 @@ describe("Antigravity shadow HOME", () => {
         ".gitconfig",
         ".gemini/config",
         "Library/Caches",
-        "Library/Keychains/login.keychain-db",
+        "Library/Keychains/agy-account.keychain-db",
       ]),
     );
     expect(report.skipped).toEqual(
@@ -174,7 +174,10 @@ describe("Antigravity shadow HOME", () => {
     // The macOS keychain stays per account: a dedicated keychain prevents both
     // credential sharing and the blocking「找不到钥匙串」dialog.
     expect(
-      await readFile(path.join(shadowHome, "Library", "Keychains", "login.keychain-db"), "utf8"),
+      await readFile(
+        path.join(shadowHome, "Library", "Keychains", "agy-account.keychain-db"),
+        "utf8",
+      ),
     ).toBe("fake keychain");
     expect(await readlink(path.join(shadowHome, "Library", "Caches"))).toBe(
       path.join(realHome, "Library", "Caches"),
@@ -199,7 +202,7 @@ describe("Antigravity shadow HOME", () => {
       },
       selectKeychain: async () => undefined,
     });
-    expect(report.skipped).toContain("Library/Keychains/login.keychain-db");
+    expect(report.skipped).toContain("Library/Keychains/agy-account.keychain-db");
     expect((await stat(shadowHome)).mode & 0o777).toBe(0o700);
   });
 
@@ -241,7 +244,7 @@ describe("Antigravity shadow HOME", () => {
       createKeychain: boom,
       selectKeychain: boom,
     });
-    expect(report.linked).not.toContain("Library/Keychains/login.keychain-db");
+    expect(report.linked).not.toContain("Library/Keychains/agy-account.keychain-db");
     expect(report.skipped).not.toContain("Library/Keychains/selection");
   });
 
@@ -499,7 +502,7 @@ describe("account keychain self-heal", () => {
       });
 
       expect(recreated).toEqual([file]);
-      expect(report.repaired).toEqual(["Library/Keychains/login.keychain-db"]);
+      expect(report.repaired).toEqual(["Library/Keychains/agy-account.keychain-db"]);
       expect(await readFile(file, "utf8")).toBe("fresh keychain");
     } finally {
       await rm(realHome, { recursive: true, force: true });
@@ -538,6 +541,76 @@ describe("account keychain self-heal", () => {
       expect(recreated).toBe(0);
       expect(report.repaired).toEqual([]);
       expect(await readFile(file, "utf8")).toBe("healthy keychain");
+    } finally {
+      await rm(realHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reserved keychain name migration", () => {
+  it("removes a shadow keychain left under the reserved login name", async () => {
+    const realHome = await mkdtemp(path.join(os.tmpdir(), "codexhost-ag-kc-legacy-"));
+    try {
+      await mkdir(path.join(realHome, "Library", "Keychains"), { recursive: true });
+      await writeFile(path.join(realHome, "Library", "Keychains", "login.keychain-db"), "k");
+      const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+      const shadowHome = path.join(shadowRoot, "work", "home");
+      // macOS refuses an empty password for a keychain *named* login.keychain-db, so an earlier
+      // build left one that AGY could never open.
+      const legacy = path.join(shadowHome, "Library", "Keychains", "login.keychain-db");
+      await mkdir(path.dirname(legacy), { recursive: true });
+      await writeFile(legacy, "unopenable keychain");
+
+      const report = await ensureAntigravityShadowHome({
+        realHome,
+        shadowHome,
+        shadowRoot,
+        createKeychain: async (file) => {
+          await writeFile(file, "fresh keychain");
+        },
+        selectKeychain: async () => undefined,
+        unlockKeychain: async () => true,
+      });
+
+      await expect(lstat(legacy)).rejects.toThrow();
+      expect(report.repaired).toContain("Library/Keychains/login.keychain-db");
+      expect(await readFile(antigravityAccountKeychain(shadowHome), "utf8")).toBe("fresh keychain");
+    } finally {
+      await rm(realHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("shadow keychain does not capture the user keychain domain", () => {
+  it("restores the real user keychain right after selecting an account keychain", async () => {
+    const realHome = await mkdtemp(path.join(os.tmpdir(), "codexhost-ag-kc-user-"));
+    try {
+      await mkdir(path.join(realHome, "Library", "Keychains"), { recursive: true });
+      await writeFile(path.join(realHome, "Library", "Keychains", "login.keychain-db"), "k");
+      const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+      const shadowHome = path.join(shadowRoot, "work", "home");
+
+      // `security` writes the user keychain domain even with a shadow HOME, so the real user's
+      // default/search list has to be put back as part of provisioning.
+      const order: string[] = [];
+      await ensureAntigravityShadowHome({
+        realHome,
+        shadowHome,
+        shadowRoot,
+        createKeychain: async (file) => {
+          order.push("create");
+          await writeFile(file, "fresh keychain");
+        },
+        selectKeychain: async () => {
+          order.push("select");
+        },
+        restoreUserKeychain: () => {
+          order.push("restore-user");
+        },
+        unlockKeychain: async () => true,
+      });
+
+      expect(order).toEqual(["create", "select", "restore-user"]);
     } finally {
       await rm(realHome, { recursive: true, force: true });
     }
