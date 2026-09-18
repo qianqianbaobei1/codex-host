@@ -754,7 +754,7 @@ fn supervise_desktop(
         let root_is_running = desktop.is_running()?;
         let refresh_desktop_tree = desktop_tree_refresh_due(last_desktop_tree_refresh, now);
         let desktop_is_running = if root_is_running && refresh_desktop_tree {
-            let live = desktop.observe()?;
+            let live = desktop.observe_owned()?;
             last_desktop_tree_refresh = now;
             live.iter().any(|process| process.id == desktop_pid)
         } else {

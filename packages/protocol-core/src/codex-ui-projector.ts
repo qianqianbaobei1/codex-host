@@ -614,12 +614,17 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
   const hasAgentOutput = snapshot.items.some(
     ({ item }) => item.type === "agentMessage" && (item.text?.trim().length ?? 0) > 0,
   );
+  // Historical Turn errors are projected in exactly the shape the Desktop builds for its own
+  // Turns, which carries four fields. Live failure notifications are left with the three the
+  // client reads, because that path renders today and a strict client schema is not worth a
+  // regression for symmetry.
   const rawError =
     snapshot.outcome.status === "failed"
       ? {
           message: snapshot.outcome.error.message,
           codexErrorInfo: "other",
           additionalDetails: null,
+          misalignment: null,
         }
       : null;
   // Same rule as the live projector: a host-side failure is not hidden behind streamed output.

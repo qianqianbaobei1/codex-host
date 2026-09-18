@@ -595,6 +595,17 @@ impl DesktopSession {
         self.tree.observe()
     }
 
+    /// Liveness of this Desktop tree for the periodic lifecycle tick.
+    ///
+    /// `observe` reads every process in the system, which the launcher was paying for twice a
+    /// second for the whole session just to answer "is the Desktop still there". This reads only
+    /// this tree's own processes and feeds the same ownership ledger, so escaped descendants are
+    /// still adopted while their parent link is visible.
+    pub fn observe_owned(&mut self) -> Result<Vec<ProcessSnapshot>, PlatformError> {
+        let _ = self.launch_process.try_wait()?;
+        self.tree.observe_owned()
+    }
+
     pub fn is_running(&mut self) -> Result<bool, PlatformError> {
         self.tree.root_is_current()
     }
