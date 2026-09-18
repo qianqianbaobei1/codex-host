@@ -6,11 +6,16 @@ import {
   type HarnessAccountSelectParams,
   type HarnessAccountCreateParams,
   type HarnessAccountDeleteParams,
+  type HarnessAccountSnapshot,
+  type AccountCreditsSnapshot,
 } from "@codexhost/shared-contracts";
 import { KNOWN_RENDERER_AGENTS } from "../agent-selection-state.js";
 import { createRendererAgentIcon } from "../renderer-agent-icon.js";
 import { rendererCreditsTone } from "../renderer-credits-control.js";
-import { formatRendererCreditsPercent } from "../renderer-usage-control.js";
+import {
+  ACCOUNT_CREDITS_UNKNOWN,
+  formatRendererCreditsPercent,
+} from "../renderer-usage-control.js";
 import {
   creditsProductLabel,
   renderAccountUsage,
@@ -19,6 +24,35 @@ import {
 import { createRendererSettingsIcon } from "./icons.js";
 import type { RendererSettingsPageMountContext } from "./core.js";
 import type { RendererSettingsMessages } from "./localization.js";
+
+export type HarnessAccountCreditsCell =
+  | { readonly kind: "credits"; readonly credits: AccountCreditsSnapshot }
+  | { readonly kind: "unknown"; readonly reason?: string }
+  | { readonly kind: "needs_login" }
+  | { readonly kind: "idle" };
+
+/**
+ * Decide what one read-only Account row shows in its Credits cell.
+ *
+ * A failed probe has no current reading, so the last known numbers must not be presented as the
+ * current state — doing exactly that once made two Accounts display the same figures because both
+ * probes had failed. The cell shows the unknown placeholder instead and keeps the reason for the
+ * tooltip; a successful probe shows plain numbers with no extra hint.
+ */
+export function harnessAccountCreditsCell(account: {
+  credits?: AccountCreditsSnapshot | undefined;
+  creditsStale?: boolean | undefined;
+  creditsError?: string | undefined;
+  authState?: HarnessAccountSnapshot["authState"];
+}): HarnessAccountCreditsCell {
+  if (account.authState === "needs_login") return { kind: "needs_login" };
+  if (account.creditsStale === true) {
+    return account.creditsError === undefined
+      ? { kind: "unknown" }
+      : { kind: "unknown", reason: account.creditsError };
+  }
+  return account.credits ? { kind: "credits", credits: account.credits } : { kind: "idle" };
+}
 
 export interface RendererHarnessAccountClient {
   listHarnessAccounts?(): Promise<HarnessAccountListResult>;
@@ -366,14 +400,18 @@ export function mountHarnessAccounts(
       }
       person.append(identity);
 
+      const cell = harnessAccountCreditsCell(account);
+      // Only a confirmed reading reaches the DOM: while it is stale, `sourceCredits` stays undefined
+      // so neither the meters nor the expandable product details can show the stored numbers.
+      const sourceCredits = cell.kind === "credits" ? cell.credits : undefined;
       const hasSubProducts =
         account.harnessId === "grok" &&
-        Boolean(account.credits?.productUsage && account.credits.productUsage.length > 0);
+        Boolean(sourceCredits?.productUsage && sourceCredits.productUsage.length > 0);
 
       const usageCredits =
-        hasSubProducts && account.credits
-          ? { ...account.credits, productUsage: undefined }
-          : account.credits;
+        hasSubProducts && sourceCredits
+          ? { ...sourceCredits, productUsage: undefined }
+          : sourceCredits;
 
       const usage = usageCredits
         ? renderAccountUsage(
@@ -387,37 +425,32 @@ export function mountHarnessAccounts(
       if (!usage) continue;
       if (!usageCredits) {
         usage.className = "settings-account-usage__message";
-        usage.textContent = account.creditsStale
-          ? messages.accountCreditsFailed
-          : account.authState === "needs_login"
-            ? messages.harnessAccountNeedsLogin
-            : refreshing
-              ? messages.accountCreditsLoading
-              : messages.accountCreditsEmpty;
+        usage.textContent =
+          cell.kind === "unknown"
+            ? ACCOUNT_CREDITS_UNKNOWN
+            : cell.kind === "needs_login"
+              ? messages.harnessAccountNeedsLogin
+              : refreshing
+                ? messages.accountCreditsLoading
+                : messages.accountCreditsEmpty;
+        if (cell.kind === "unknown") {
+          // The reason stays reachable on hover; the visible cell only states that there is no reading.
+          usage.title =
+            cell.reason === undefined
+              ? messages.accountCreditsFailed
+              : `${messages.accountCreditsFailed}: ${cell.reason}`;
+        }
       }
 
       const usageContainer = document.createElement("div");
       usageContainer.className = "settings-harness-account__usage-container";
       usageContainer.append(usage);
-      if (account.creditsStale && usageCredits) {
-        // The numbers are the last good reading; say so instead of letting a
-        // failed probe look like the current state (two Accounts once showed the
-        // same figure because both probes had failed).
-        usage.classList.add("settings-account-usage--stale");
-        const note = document.createElement("span");
-        note.className = "settings-account-usage__message";
-        note.textContent = messages.accountCreditsFailed;
-        note.title = account.creditsError
-          ? `${messages.accountCreditsFailed}: ${account.creditsError}`
-          : messages.accountCreditsFailed;
-        usageContainer.append(note);
-      }
 
       if (hasSubProducts) {
         const toggleBtn = document.createElement("button");
         toggleBtn.type = "button";
         toggleBtn.className = "settings-ghost-button settings-grok-expand-btn";
-        const count = account.credits?.productUsage?.length ?? 0;
+        const count = sourceCredits?.productUsage?.length ?? 0;
         toggleBtn.textContent = isExpanded
           ? `${messages.harnessAccountCollapseCredits} ⌃`
           : `${messages.harnessAccountViewAllCredits}${count > 0 ? ` (${count})` : ""} ⌄`;
@@ -432,10 +465,10 @@ export function mountHarnessAccounts(
         usageContainer.append(toggleBtn);
       }
 
-      if (hasSubProducts && isExpanded && account.credits?.productUsage) {
+      if (hasSubProducts && isExpanded && sourceCredits?.productUsage) {
         const details = document.createElement("div");
         details.className = "settings-grok-details";
-        for (const product of account.credits.productUsage) {
+        for (const product of sourceCredits.productUsage) {
           const item = document.createElement("div");
           item.className = "settings-grok-detail-row";
           const label = document.createElement("span");

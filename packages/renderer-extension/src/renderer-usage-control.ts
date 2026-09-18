@@ -120,6 +120,14 @@ export function formatRendererCreditsPercent(value: number): string {
   return `${decimal(value, 1)}%`;
 }
 
+/**
+ * Stands in for a Credits value that has no current reading.
+ *
+ * Deliberately not `0`: in the remaining view `0%` claims the quota is exhausted and in the used
+ * view it claims nothing was used, while the truth is that the probe returned no value at all.
+ */
+export const ACCOUNT_CREDITS_UNKNOWN = "-";
+
 export interface RendererUsageRingOptions {
   size: number;
   strokeWidth: number;

@@ -732,11 +732,6 @@
 .settings-account-unknown {
   color: var(--settings-muted);
 }
-/* The numbers are the last good reading, not the current state: dim them so a
-   stale row cannot be mistaken for a fresh one. */
-.settings-account-usage--stale {
-  opacity: 0.55;
-}
 .settings-account-usage > button {
   justify-self: start;
 }

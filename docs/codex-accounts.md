@@ -17,7 +17,7 @@
 
 同页下方的「其他已识别账号」展示 Grok Build、agy（Antigravity）、Claude Code 当前原生认证可读取的真实额度。Grok Build 与 Claude Code 是只读区：不提供添加、删除、切换或设为默认。agy（Antigravity）另外支持多账号管理——添加账号、设为默认、重新登录、删除——这些操作只作用于该 Harness 自己的账号与 Thread 路由，不修改 Codex 默认账号。上述「已连接账号」数量仍仅统计 Codex；搜索和已用/剩余切换同时作用于两个区域，刷新按钮重新查询两类额度。
 
-- 查询失败不再让整行消失，也不再把上一份数值当成当前值：保留最后一次成功读到的数字，整块置灰并标注「额度读取失败」，悬停给出真实原因；下一次成功查询自动清除标记。失败状态与数值一起写入该账号的 `quota-snapshot.json`，因此重启 Host 不会把旧数字重新显示成刚读到的结果。API Key、第三方 Provider 或未登录仍然不显示占位行；整个只读区没有账号时隐藏。
+- 查询失败时额度格显示 `-`：不显示上一份数字，也不显示「读取失败」这类文字（悬停仍能看到真实原因），下一次成功查询自动恢复数字。不用 `0` 代替：在剩余视图里 `0%` 意味着“已耗尽”、在已用视图里意味着“未使用”，两者都是断言，而事实是没读到。失败状态与数值一起写入该账号的 `quota-snapshot.json`，因此重启 Host 也不会把旧数字重新显示成刚读到的结果。读取失败的账号不因此被禁用（未验证不等于无额度），设置页与 Agent 选择器使用同一条规则。API Key、第三方 Provider 或未登录仍然不显示占位行；整个只读区没有账号时隐藏。
 - Host 每次启动都会在后台自动查询一次各账号额度（默认延迟 15 秒，避开 Desktop 自身的启动高峰），不需要用户先打开设置页；之后的后台刷新受每账号 60 秒冷却限制。
 - 左侧展示 Harness Logo；主标题优先显示邮箱或可识别名称，Harness 名称和套餐作为次级信息。没有账号身份时以 Harness 名称为主标题，不重复显示「当前登录账号」，不会猜测邮箱。邮箱单行显示，最大宽度 24ch，超出以省略号截断；悬停可查看完整身份。不记录或展示账号快照更新时间。
 - Grok Build 复用原生 xAI OAuth 认证和 billing 查询，展示周期、重置时间及产品用量；不将其他 issuer 的 Token 发到 xAI。显式配置 `XAI_API_KEY`、`GROK_API_KEY` 或 `GROK_TOKEN` 时保守地不展示保存的 OAuth 账号。此页展示 Harness 账号额度，不判定某个 Thread 的逐模型凭据或实际 Billing Source。
@@ -61,7 +61,7 @@ Windows Desktop / Remote Control 的官方后台按账号 `CODEX_HOME` 隔离；
 - `packages/renderer-extension/src/settings/accounts-page.ts`：账号生命周期、查询、登录与操作。
 - `packages/renderer-extension/src/settings/accounts-list.ts`：四列账号行与重置卡展开。
 - `packages/renderer-extension/src/settings/accounts-usage.ts`：额度显示和重置卡详情。
-- `packages/renderer-extension/src/settings/harness-accounts.ts`：其他 Harness 账号区（含「额度读取失败」置灰标记与原因 tooltip）。
+- `packages/renderer-extension/src/settings/harness-accounts.ts`：其他 Harness 账号区（失败时额度格显示 `-`，原因保留在悬停里）。
 - `packages/host-runtime/src/harness-accounts.ts`：公共只读账号聚合与校验；不符契约的行会被丢弃并写入 Host 诊断，而不是静默消失。
 - `packages/adapters/antigravity/src/accounts.ts`：Antigravity 账号存储、影子 HOME 与「每账号一个钥匙串域」的隔离与修复。
 - `packages/adapters/antigravity/src/antigravity-adapter.ts`：额度探测与失败标记、（重新）登录终端与凭据清理。

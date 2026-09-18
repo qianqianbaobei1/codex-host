@@ -12,6 +12,7 @@ import {
   type HarnessPermissionModeScope,
   type HarnessThinkingOptionId,
   type AccountCreditsSnapshot,
+  type HarnessAccountSnapshot,
   type ThreadInspection,
   type ThreadUsageInspection,
   type ThreadUsageSnapshot,
@@ -46,6 +47,7 @@ import {
   type ExternalPermissionModeControlView,
 } from "./renderer-composer-dom.js";
 import { rendererHarnessMessages } from "./renderer-harness-localization.js";
+import type { RendererSettingsLocale } from "./settings/localization.js";
 import { RendererCodexAccountState } from "./renderer-codex-account-state.js";
 import { RendererHarnessAccountState } from "./renderer-harness-account-state.js";
 import {
@@ -66,7 +68,7 @@ import type { RendererModelClient } from "./renderer-model-client.js";
 import { RendererMethodUnavailableError } from "./renderer-request-sender.js";
 import { thinkingOptionsForModel } from "./renderer-model-picker.js";
 import { RENDERER_AGENT_INSTALL_URLS } from "./renderer-agent-picker.js";
-import { formatRendererCreditsPercent } from "./renderer-usage-control.js";
+import { formatRendererCreditsPercent, ACCOUNT_CREDITS_UNKNOWN } from "./renderer-usage-control.js";
 import {
   readClaudePermissionModePreference,
   writeClaudePermissionModePreference,
@@ -172,6 +174,32 @@ export function rendererAntigravityQuotaAvailableForModel(
   if (current.length > 0) return current.some((product) => product.usagePercent < 100);
   if (scoped.length > 0) return true;
   return accountCreditsWindowHasReset(credits.resetsAt, now) ? true : credits.usedPercent < 100;
+}
+
+/**
+ * The secondary line of one Antigravity account row in the Agent picker.
+ *
+ * A failed probe has no current reading, so the row shows the unknown placeholder instead of the
+ * stored number, matching the Settings account rows. A successful probe shows plain numbers.
+ */
+export function rendererHarnessAccountUsageLabel(
+  account: {
+    credits?: AccountCreditsSnapshot | undefined;
+    creditsStale?: boolean | undefined;
+    authState?: HarnessAccountSnapshot["authState"];
+  },
+  locale: RendererSettingsLocale,
+): string | undefined {
+  const zh = locale === "zh-CN";
+  if (account.authState === "needs_login") return zh ? "需要重新登录" : "Needs sign-in";
+  if (account.creditsStale === true) {
+    return zh ? `Gemini 剩余 ${ACCOUNT_CREDITS_UNKNOWN}` : `Gemini: ${ACCOUNT_CREDITS_UNKNOWN}`;
+  }
+  if (!account.credits) return undefined;
+  const remaining = rendererAntigravityGeminiRemainingPercent(account.credits);
+  if (remaining === null) return undefined;
+  const formatted = formatRendererCreditsPercent(remaining);
+  return zh ? `Gemini 剩余 ${formatted}` : `Gemini ${formatted} left`;
 }
 
 function isRetryableHarnessAvailability(
@@ -925,18 +953,6 @@ export function installRendererBindingProbe(
     );
   };
 
-  // Show the remaining quota, matching the account settings page and the
-  // Credits pill. Showing "used" here made the same account look contradictory
-  // (e.g. "used 99%" beside "0.6% left").
-  const harnessAccountUsageLabel = (credits: AccountCreditsSnapshot): string | undefined => {
-    const remaining = rendererAntigravityGeminiRemainingPercent(credits);
-    if (remaining === null) return undefined;
-    const formatted = formatRendererCreditsPercent(remaining);
-    return settingsLifecycle.locale === "zh-CN"
-      ? `Gemini 剩余 ${formatted}`
-      : `Gemini ${formatted} left`;
-  };
-
   const renderMounted = (mounted: MountedComposer): void => {
     const state = controller.get(mounted.composer);
     const currentAgent = state.agent;
@@ -956,23 +972,20 @@ export function installRendererBindingProbe(
       .filter((account) => account.harnessId === "antigravity" && account.accountId)
       .map((account) => {
         const id = account.accountId ?? "";
-        const secondary =
-          account.authState === "needs_login"
-            ? settingsLifecycle.locale === "zh-CN"
-              ? "需要重新登录"
-              : "Needs sign-in"
-            : account.credits
-              ? harnessAccountUsageLabel(account.credits)
-              : undefined;
+        const secondary = rendererHarnessAccountUsageLabel(account, settingsLifecycle.locale);
         return {
           id,
           label: account.label ?? account.email ?? id,
+          // An unverified reading must not gate selection: treating "no current reading" as "no
+          // quota" would hide the very Account the user is trying to pick. This matches the
+          // adapter, where unknown credits are treated as available.
           selectable:
             account.selectable !== false &&
-            rendererAntigravityQuotaAvailableForModel(
-              account.credits,
-              selectedAntigravityModelLabel,
-            ),
+            (account.creditsStale === true ||
+              rendererAntigravityQuotaAvailableForModel(
+                account.credits,
+                selectedAntigravityModelLabel,
+              )),
           ...(secondary ? { secondary } : {}),
         };
       });

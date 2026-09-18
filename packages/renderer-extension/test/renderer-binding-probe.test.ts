@@ -37,6 +37,7 @@ import {
   selectedThreadHarnessAccountId,
   rendererAntigravityGeminiRemainingPercent,
   rendererAntigravityQuotaAvailableForModel,
+  rendererHarnessAccountUsageLabel,
 } from "../src/renderer-binding-probe.js";
 import {
   editorForElement,
@@ -62,6 +63,7 @@ describe("Renderer connection diagnostics", () => {
   it("uses Gemini model windows instead of the global leading quota for account rows", () => {
     const credits = {
       usedPercent: 67.65,
+      periodType: "weekly" as const,
       productUsage: [
         { product: "Gemini Models · Weekly window", usagePercent: 34.13 },
         { product: "Gemini Models · 5-hour window", usagePercent: 0.01 },
@@ -70,6 +72,19 @@ describe("Renderer connection diagnostics", () => {
     };
 
     expect(rendererAntigravityGeminiRemainingPercent(credits)).toBeCloseTo(65.87, 2);
+    // A failed probe has no current reading: the picker row shows the placeholder instead of the
+    // stored figure, matching the Settings rows, and plain numbers when the probe succeeded.
+    expect(rendererHarnessAccountUsageLabel({ credits }, "zh-CN")).toBe("Gemini 剩余 65.9%");
+    expect(rendererHarnessAccountUsageLabel({ credits, creditsStale: true }, "zh-CN")).toBe(
+      "Gemini 剩余 -",
+    );
+    expect(rendererHarnessAccountUsageLabel({ credits, creditsStale: true }, "en")).toBe(
+      "Gemini: -",
+    );
+    expect(rendererHarnessAccountUsageLabel({ credits, authState: "needs_login" }, "zh-CN")).toBe(
+      "需要重新登录",
+    );
+    expect(rendererHarnessAccountUsageLabel({}, "en")).toBeUndefined();
     expect(
       rendererAntigravityGeminiRemainingPercent({
         usedPercent: 100,
