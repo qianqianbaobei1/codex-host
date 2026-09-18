@@ -27,7 +27,7 @@
     "install:local": "bash scripts/install-local.sh",
     "antigravity:account": "node packages/adapters/antigravity/scripts/antigravity-account.mjs",
     "build": "npm run build:typescript && npm run build:renderer && npm run build:release && npm run build:rust",
-    "build:typescript": "tsc -b && npm run build:plugins",
+    "build:typescript": "tsc -b && npm run build --workspace=@codexhost/shared-contracts && npm run build:plugins",
     "build:release": "npm run build:release:host && npm run build:release:desktop-control",
     "build:release:host": "node packages/host-runtime/scripts/build-release.mjs --output packages/host-runtime/dist/main.js",
     "build:release:desktop-control": "node packages/desktop-control/scripts/build-release.mjs --output packages/desktop-control/dist/release-main.js",
