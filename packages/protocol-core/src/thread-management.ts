@@ -146,7 +146,7 @@ function decodeSortDirection(value: unknown): ThreadListSortDirection {
 }
 
 function decodeSortKey(value: unknown): OfficialThreadListSortKey {
-  if (value === undefined || value === null) return "created_at";
+  if (value === undefined || value === null) return "updated_at";
   if (
     value !== "created_at" &&
     value !== "updated_at" &&

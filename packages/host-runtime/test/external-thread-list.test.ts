@@ -167,6 +167,20 @@ describe("External Thread metadata catalog", () => {
     expect(second.hasMore).toBe(false);
   });
 
+  it("floats running threads to the top for updated_at sorting", () => {
+    const olderRunning = record("older-running", { updatedAt: "2026-01-01T00:00:00.000Z" });
+    const newerIdle = record("newer-idle", { updatedAt: "2026-08-01T00:00:00.000Z" });
+    const page = listExternalThreadMetadata({
+      records: [newerIdle, olderRunning],
+      query: query({ sortKey: "updated_at", sortDirection: "desc" }),
+      runtimeFor: (id) => (id === "older-running" ? { running: true } : null),
+    });
+    expect(page.data.map((entry) => entry.thread.id)).toEqual(["older-running", "newer-idle"]);
+    expect(page.data[0]?.thread.updatedAt).toBeGreaterThan(
+      page.data[1]?.thread.updatedAt as number,
+    );
+  });
+
   it("filters and returns the first page from 1000 in-memory records", () => {
     const records = Array.from({ length: 1_000 }, (_, index) =>
       record(`scale-${index.toString().padStart(4, "0")}`, {

@@ -108,6 +108,47 @@ export function inspectRendererSidebarContract(
   };
 }
 
+export function ensureSidebarSortByUpdatedAt(root: ParentNode = document): boolean {
+  const btn = root.querySelector<HTMLElement>('button[aria-label="项目侧边栏选项"]');
+  if (!btn) return false;
+  const fiberNames = Object.getOwnPropertyNames(btn).filter((name) =>
+    name.startsWith("__reactFiber$"),
+  );
+  const fiberName = fiberNames[0];
+  if (!fiberName) return false;
+  let fiber = Object.getOwnPropertyDescriptor(btn, fiberName)?.value;
+  while (isRecord(fiber)) {
+    const props = fiber.memoizedProps;
+    if (isRecord(props) && Array.isArray(props.items)) {
+      const sortSection = props.items.find(
+        (item: unknown): item is Record<string, unknown> =>
+          isRecord(item) && item.id === "sort-sidebar",
+      );
+      if (isRecord(sortSection) && Array.isArray(sortSection.submenu)) {
+        const manualOpt = sortSection.submenu.find(
+          (opt: unknown): opt is Record<string, unknown> =>
+            isRecord(opt) && opt.id === "sort-manual",
+        );
+        const updatedOpt = sortSection.submenu.find(
+          (opt: unknown): opt is Record<string, unknown> =>
+            isRecord(opt) && opt.id === "sort-updated_at",
+        );
+        if (
+          manualOpt?.checked === true &&
+          updatedOpt &&
+          typeof updatedOpt.onSelect === "function"
+        ) {
+          (updatedOpt.onSelect as () => void)();
+          return true;
+        }
+      }
+      return false;
+    }
+    fiber = isRecord(fiber.return) ? fiber.return : null;
+  }
+  return false;
+}
+
 export interface SidebarAgentIconRow {
   isConnected(): boolean;
   hostId(): string | null;
@@ -121,6 +162,7 @@ export interface SidebarAgentIconDom {
   rows(): readonly SidebarAgentIconRow[];
   observe(onChange: () => void): () => void;
   clear(): void;
+  ensureUpdatedSortMode?(): boolean;
 }
 
 export interface RendererSidebarAgentIcons {
@@ -244,6 +286,10 @@ class BrowserSidebarAgentIconDom implements SidebarAgentIconDom {
     for (const row of this.#trackedRows) row.clear();
     this.#trackedRows.clear();
   }
+
+  ensureUpdatedSortMode(): boolean {
+    return ensureSidebarSortByUpdatedAt(this.root);
+  }
 }
 
 export function installRendererSidebarAgentIcons(options: {
@@ -349,6 +395,7 @@ export function installRendererSidebarAgentIcons(options: {
   const scan = (): void => {
     scanScheduled = false;
     if (disposed) return;
+    dom.ensureUpdatedSortMode?.();
     const unresolvedByHost = new Map<string, Set<ReturnType<typeof hostThreadIdSchema.parse>>>();
     for (const row of dom.rows()) {
       if (!row.isConnected()) {

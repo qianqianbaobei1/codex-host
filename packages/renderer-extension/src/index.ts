@@ -154,6 +154,7 @@ export type {
   RendererComposerModelContractState,
 } from "./versioned-renderer-adapter.js";
 export {
+  ensureSidebarSortByUpdatedAt,
   inspectRendererSidebarContract,
   SIDEBAR_AGENT_ICON_ATTRIBUTE,
   SIDEBAR_THREAD_ROW_ATTRIBUTE,

@@ -104,6 +104,7 @@ describe("aggregated Thread list", () => {
 
     expect(page).toMatchObject({ data: [], nextCursor: null, backwardsCursor: null });
     expect(source.calls).toHaveLength(1);
+    expect(source.calls[0]?.sortKey).toBe("updated_at");
   });
 
   it("re-requests a partially consumed official batch for an exact cursor", async () => {

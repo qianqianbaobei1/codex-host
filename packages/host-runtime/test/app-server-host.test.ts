@@ -5255,8 +5255,16 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     const readResponse = await fixture.collector.waitFor((message) => requestId(message, 3));
     expect(readResponse).toMatchObject({
-      result: { thread: { turns: [{ status: "completed" }] } },
+      result: {
+        thread: {
+          updatedAt: expect.any(Number),
+          recencyAt: expect.any(Number),
+          turns: [{ status: "completed" }],
+        },
+      },
     });
+    const record = await fixture.mappingStore.getThread(hostThreadIdSchema.parse(threadId));
+    expect(record?.revision).toBeGreaterThan(1);
     await stopFixture(fixture);
   });
 
@@ -7488,6 +7496,102 @@ describe("AppServerHost HarnessAdapter projection", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(forwarded.join("")).not.toContain(questionRequest.id);
+    await stopFixture(fixture);
+  });
+
+  it("deletes an external Thread even when closing its Session fails", async () => {
+    const fixture = createFixture();
+    const threadId = await startPiThread(fixture);
+    const session = fixture.adapter.sessions[0];
+    if (!session) throw new Error("Fake Pi Session was not opened");
+    // By the time the native Session is torn down the Thread's record is already gone, so a
+    // failing teardown must not turn the delete into an error the Desktop cannot recover from.
+    vi.spyOn(session, "close").mockRejectedValue(new Error("native Session is wedged"));
+    const diagnostics: string[] = [];
+    fixture.diagnosticOutput.setEncoding("utf8");
+    fixture.diagnosticOutput.on("data", (chunk: string) => diagnostics.push(chunk));
+
+    writeRequest(fixture.desktopInput, {
+      id: 98,
+      method: "thread/delete",
+      params: { threadId },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 98))).resolves.toEqual({
+      id: 98,
+      result: {},
+    });
+    await vi.waitFor(async () => expect(await fixture.mappingStore.listThreads()).toEqual([]));
+    // The failure is not silent: it stays in the Host's own diagnostics.
+    expect(diagnostics.join("")).toContain("native Session is wedged");
+    await stopFixture(fixture);
+  });
+
+  it("succeeds when deleting an unbound Codex Thread", async () => {
+    const fixture = createFixture();
+    writeRequest(fixture.desktopInput, {
+      id: 99,
+      method: "thread/delete",
+      params: { threadId: "0b905374-c085-4400-8cae-280042e8207a" },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 99))).resolves.toEqual({
+      id: 99,
+      result: {},
+    });
+    await stopFixture(fixture);
+  });
+
+  it("succeeds and clears store when official runtime errors on thread/delete", async () => {
+    const fixture = createFixture();
+    await vi.waitFor(async () => expect(await fixture.mappingStore.listThreads()).toEqual([]));
+    await fixture.threadAccountStore.bind("official-missing-thread", "default");
+    writeRequest(fixture.desktopInput, {
+      id: 100,
+      method: "thread/delete",
+      params: { threadId: "official-missing-thread" },
+    });
+    const officialDelete = await readJsonLine(fixture.official.stdin);
+    expect(officialDelete).toMatchObject({
+      method: "thread/delete",
+      params: { threadId: "official-missing-thread" },
+    });
+    fixture.official.stdout.write(
+      `${JSON.stringify({ id: officialDelete.id, error: { code: -32000, message: "Thread not found" } })}\n`,
+    );
+    await expect(fixture.collector.waitFor((message) => requestId(message, 100))).resolves.toEqual({
+      id: 100,
+      result: {},
+    });
+    await expect(
+      fixture.threadAccountStore.getAccountId("official-missing-thread"),
+    ).resolves.toBeNull();
+    await stopFixture(fixture);
+  });
+
+  it("succeeds and removes metadata when deleting an external Thread with resolution error", async () => {
+    const fixture = createFixture();
+    await vi.waitFor(async () => expect(await fixture.mappingStore.listThreads()).toEqual([]));
+    const threadId = "dsh-missing-thread";
+    await fixture.mappingStore.createProvisional({
+      hostThreadId: hostThreadIdSchema.parse(threadId),
+      createRequestId: "test-delete-error-request",
+      harnessId: harnessIdSchema.parse("pi"),
+      cwd: "/synthetic",
+      ephemeral: false,
+      historyMode: "paginated",
+      transportModelId: "codexhost/pi-native",
+    });
+    writeRequest(fixture.desktopInput, {
+      id: 101,
+      method: "thread/delete",
+      params: { threadId },
+    });
+    await expect(fixture.collector.waitFor((message) => requestId(message, 101))).resolves.toEqual({
+      id: 101,
+      result: {},
+    });
+    await expect(
+      fixture.mappingStore.getThread(hostThreadIdSchema.parse(threadId)),
+    ).resolves.toBeNull();
     await stopFixture(fixture);
   });
 

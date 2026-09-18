@@ -1621,6 +1621,21 @@ export class AppServerHost {
           typeof params.threadId === "string"
             ? await this.#locateExternalThread(params.threadId)
             : ({ kind: "official" } as const);
+        if (request.method === "thread/delete" && location.kind === "error") {
+          const parsedThreadId =
+            typeof params.threadId === "string"
+              ? hostThreadIdSchema.safeParse(params.threadId)
+              : null;
+          if (parsedThreadId?.success) {
+            await this.#repository.removeThread(parsedThreadId.data).catch(() => undefined);
+            this.#externalRuntime.remove(parsedThreadId.data);
+            this.#cancelGoalContinuation(parsedThreadId.data);
+            this.#goalLoops.delete(parsedThreadId.data);
+            this.#routeObservationTracker.forgetThread(parsedThreadId.data);
+          }
+          await this.#writer.json(rpcEnvelope(request, { result: {} }));
+          continue;
+        }
         if (await this.#writeResolutionError(request, location)) continue;
         if (location.kind === "external") {
           if (request.method === "thread/name/set") {
@@ -1792,6 +1807,17 @@ export class AppServerHost {
         this.#signalActiveWorkChanged();
       }
       if (error instanceof UnknownCodexThreadAccountError) {
+        if (request.method === "thread/delete") {
+          const requestParams = isRecord(request.params) ? request.params : null;
+          const rawId =
+            requestParams && typeof requestParams.threadId === "string"
+              ? requestParams.threadId
+              : error.threadId;
+          await this.#threadAccountStore.remove(rawId).catch(() => undefined);
+          await this.#threadAccountStore.remove(error.threadId).catch(() => undefined);
+          await this.#writer.json(rpcEnvelope(request, { result: {} }));
+          return;
+        }
         await this.#writer.json(rpcError(request, -32084, error.message));
         return;
       }
@@ -1806,6 +1832,7 @@ export class AppServerHost {
   }): Promise<void> {
     const parsed = input.value;
     let valueModified = false;
+    let forwardedOverride: JsonValue | null = null;
     if (
       this.#options.normalizeThreadTitles &&
       isRecord(parsed) &&
@@ -1833,12 +1860,25 @@ export class AppServerHost {
           clearTimeout(pending.timer);
           this.#pendingOfficialDesktopRequests.delete(requestKey);
           this.#retireOfficialDesktopRequest(requestKey);
+          if (pending.request.method === "thread/delete") {
+            const params = isRecord(pending.request.params) ? pending.request.params : null;
+            const threadId = typeof params?.threadId === "string" ? params.threadId : null;
+            if (threadId) {
+              const ext = this.#threadAliases.reverseResolve(threadId);
+              void this.#threadAccountStore.remove(threadId).catch(() => undefined);
+              if (ext) void this.#threadAccountStore.remove(ext).catch(() => undefined);
+            }
+            if (isRecord(parsed.error)) {
+              forwardedOverride = { id: originalId, result: {} };
+              valueModified = true;
+            }
+          }
         } else if (this.#retiredOfficialDesktopRequestKeys.has(requestKey)) {
           return;
         }
       }
     }
-    let forwarded: JsonValue = parsed;
+    let forwarded: JsonValue = forwardedOverride ?? parsed;
     if (isRecord(parsed) && typeof parsed.method === "string" && "id" in parsed) {
       const originalId = parsed.id;
       if (typeof originalId === "string" || typeof originalId === "number") {
@@ -4906,12 +4946,10 @@ export class AppServerHost {
     try {
       await thread.session.close();
       await thread.outputTask;
-      await this.#writer.json(rpcEnvelope(request, { result: {} }));
     } catch (error) {
-      await this.#writer.json(
-        rpcError(request, -32075, `External Thread could not close: ${errorMessage(error)}`),
-      );
+      this.#diagnose(error);
     }
+    await this.#writer.json(rpcEnvelope(request, { result: {} }));
   }
 
   async #readExternalThreadMetadata(

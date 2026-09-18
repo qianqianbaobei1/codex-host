@@ -179,13 +179,21 @@ export function listExternalThreadMetadata(input: {
         sessionId,
         ...(runtime ? { running: runtime.running } : { loaded: false }),
       });
+      const updatedSec = Math.max(
+        unixTimestamp(record.updatedAt, "updatedAt"),
+        runtime?.running ? Math.floor(Date.now() / 1_000) : 0,
+      );
+      if (runtime?.running) {
+        thread.updatedAt = updatedSec;
+        thread.recencyAt = updatedSec;
+      }
       return {
         source: "external",
         thread,
         timestamp:
           input.query.sortKey === "created_at"
             ? unixTimestamp(record.createdAt, "createdAt")
-            : unixTimestamp(record.updatedAt, "updatedAt"),
+            : updatedSec,
       };
     })
     .sort((left, right) => compareThreadListEntries(left, right, input.query.sortDirection))

@@ -60,7 +60,7 @@ function officialParams(
   cursor: string | null,
   limit: number,
 ): JsonObject {
-  return { ...query.params, cursor, limit };
+  return { ...query.params, cursor, limit, sortKey: query.sortKey };
 }
 
 function cursorValue(input: {

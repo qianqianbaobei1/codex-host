@@ -10,6 +10,7 @@ import type { RendererAgent } from "../src/agent-selection-state.js";
 import type { RendererModelClient } from "../src/renderer-model-client.js";
 import { RendererMethodUnavailableError } from "../src/renderer-request-sender.js";
 import {
+  ensureSidebarSortByUpdatedAt,
   installRendererSidebarAgentIcons,
   draftIdFromSidebarRowElement,
   rendererAgentForThreadOwnership,
@@ -571,5 +572,57 @@ describe("Renderer sidebar Agent ownership", () => {
         harnessId: FUTURE_HARNESS_ID,
       }),
     ).toBeNull();
+  });
+
+  it("selects sort-updated_at when sidebar options are in manual mode", () => {
+    const onSelect = vi.fn();
+    const button = {
+      __reactFiber$test: {
+        memoizedProps: {
+          items: [
+            {
+              id: "sort-sidebar",
+              submenu: [
+                { id: "sort-priority", checked: false },
+                { id: "sort-updated_at", checked: false, onSelect },
+                { id: "sort-manual", checked: true },
+              ],
+            },
+          ],
+        },
+      },
+    } as unknown as HTMLElement;
+
+    const root = {
+      querySelector(selector: string) {
+        if (selector === 'button[aria-label="项目侧边栏选项"]') return button;
+        return null;
+      },
+    } as unknown as ParentNode;
+
+    expect(ensureSidebarSortByUpdatedAt(root)).toBe(true);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+
+    // If already not manual, do nothing
+    (button as unknown as Record<string, unknown>).__reactFiber$test = {
+      memoizedProps: {
+        items: [
+          {
+            id: "sort-sidebar",
+            submenu: [
+              { id: "sort-priority", checked: false },
+              { id: "sort-updated_at", checked: true, onSelect },
+              { id: "sort-manual", checked: false },
+            ],
+          },
+        ],
+      },
+    };
+    expect(ensureSidebarSortByUpdatedAt(root)).toBe(false);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+
+    // If button does not exist, return false
+    const emptyRoot = { querySelector: () => null } as unknown as ParentNode;
+    expect(ensureSidebarSortByUpdatedAt(emptyRoot)).toBe(false);
   });
 });

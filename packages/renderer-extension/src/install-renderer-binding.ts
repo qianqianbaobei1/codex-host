@@ -7,6 +7,7 @@ import {
   ensureRateLimitBannerSuppressionStyle,
   reconcileTurnErrorBannersAndCopy,
 } from "./renderer-composer-dom.js";
+import { ensureSidebarSortByUpdatedAt } from "./renderer-sidebar-agent-icons.js";
 import { installCurrentRendererAdapter } from "./versioned-renderer-adapter.js";
 
 export function installRendererBinding(
@@ -16,6 +17,7 @@ export function installRendererBinding(
   if (typeof document !== "undefined") {
     ensureRateLimitBannerSuppressionStyle(document);
     reconcileTurnErrorBannersAndCopy(document);
+    ensureSidebarSortByUpdatedAt(document);
   }
   window.__codexhostRendererBindingProbeV1?.dispose();
   const binding = installRendererBindingProbe({ enabledAgents, defaultAgent });
