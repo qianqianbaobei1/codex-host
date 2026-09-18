@@ -470,3 +470,76 @@ describe("Antigravity account id grammar", () => {
     for (const id of ["", "a b", "a/b", "..", ".", "账户"]) expect(pattern.test(id)).toBe(false);
   });
 });
+
+describe("account keychain self-heal", () => {
+  it("rebuilds an account keychain that can no longer be opened", async () => {
+    const realHome = await mkdtemp(path.join(os.tmpdir(), "codexhost-ag-kc-"));
+    try {
+      await mkdir(path.join(realHome, "Library", "Keychains"), { recursive: true });
+      await writeFile(path.join(realHome, "Library", "Keychains", "login.keychain-db"), "k");
+      const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+      const shadowHome = path.join(shadowRoot, "work", "home");
+      await mkdir(path.join(shadowHome, "Library", "Keychains"), { recursive: true });
+      const file = antigravityAccountKeychain(shadowHome);
+      await writeFile(file, "locked keychain");
+
+      const recreated: string[] = [];
+      const report = await ensureAntigravityShadowHome({
+        realHome,
+        shadowHome,
+        shadowRoot,
+        createKeychain: async () => undefined,
+        selectKeychain: async () => undefined,
+        // The keychain exists but its password is not the empty one AGY's credential write needs.
+        unlockKeychain: async () => false,
+        recreateKeychain: async (target) => {
+          recreated.push(target);
+          await writeFile(target, "fresh keychain");
+        },
+      });
+
+      expect(recreated).toEqual([file]);
+      expect(report.repaired).toEqual(["Library/Keychains/login.keychain-db"]);
+      expect(await readFile(file, "utf8")).toBe("fresh keychain");
+    } finally {
+      await rm(realHome, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a healthy account keychain untouched", async () => {
+    const realHome = await mkdtemp(path.join(os.tmpdir(), "codexhost-ag-kc-ok-"));
+    try {
+      await mkdir(path.join(realHome, "Library", "Keychains"), { recursive: true });
+      await writeFile(path.join(realHome, "Library", "Keychains", "login.keychain-db"), "k");
+      const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+      const shadowHome = path.join(shadowRoot, "work", "home");
+      await mkdir(path.join(shadowHome, "Library", "Keychains"), { recursive: true });
+      const file = antigravityAccountKeychain(shadowHome);
+      await writeFile(file, "healthy keychain");
+
+      let recreated = 0;
+      let unlocked = 0;
+      const report = await ensureAntigravityShadowHome({
+        realHome,
+        shadowHome,
+        shadowRoot,
+        createKeychain: async () => undefined,
+        selectKeychain: async () => undefined,
+        unlockKeychain: async () => {
+          unlocked += 1;
+          return true;
+        },
+        recreateKeychain: async () => {
+          recreated += 1;
+        },
+      });
+
+      expect(unlocked).toBe(1);
+      expect(recreated).toBe(0);
+      expect(report.repaired).toEqual([]);
+      expect(await readFile(file, "utf8")).toBe("healthy keychain");
+    } finally {
+      await rm(realHome, { recursive: true, force: true });
+    }
+  });
+});

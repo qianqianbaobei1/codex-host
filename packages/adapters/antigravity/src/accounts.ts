@@ -189,6 +189,8 @@ function invalid(message: string): AntigravityAccountsLoad {
 export interface ShadowHomeReport {
   linked: string[];
   skipped: string[];
+  /** Account keychains that existed but could not be opened, and were rebuilt. */
+  repaired: string[];
   /**
    * Session-domain entries that still hold data in this HOME, so they must be
    * migrated before this Account can see every conversation. Provisioning never
@@ -260,6 +262,37 @@ export function restoreDarwinUserKeychain(environment: NodeJS.ProcessEnv = proce
   }
 }
 
+/**
+ * True when this account keychain opens with the empty password it is created with.
+ *
+ * `-p ""` is passed explicitly so a keychain that has a *different* password fails immediately
+ * (errSecAuthFailed) instead of asking the user for one they cannot know. AGY reaches its
+ * credential through this keychain with `go-keyring`, i.e. by running `/usr/bin/security`, which is
+ * how a locked keychain turns into a recurring「unlock」dialog attributed to that CLI.
+ */
+async function darwinKeychainUnlocks(file: string, home: string): Promise<boolean> {
+  const environment = keychainEnvironment(home);
+  try {
+    await execFileAsync("security", ["unlock-keychain", "-p", "", file], { env: environment });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Replace an account keychain that can no longer be opened. Its content is AGY's per-account
+ * credential, which AGY also keeps in `<shadowHome>/.gemini/antigravity-cli/antigravity-oauth-token`,
+ * so a repair costs at most one account re-login — and never the user's real login keychain.
+ */
+async function recreateDarwinKeychain(file: string, home: string): Promise<void> {
+  const environment = keychainEnvironment(home);
+  await execFileAsync("security", ["delete-keychain", file], { env: environment }).catch(
+    () => undefined,
+  );
+  await createDarwinKeychain(file, home);
+}
+
 async function createDarwinKeychain(file: string, home: string): Promise<void> {
   const environment = keychainEnvironment(home);
   // `-p ""` creates the keychain unlocked; `unlock-keychain -p ""` rejects the
@@ -302,6 +335,10 @@ export async function ensureAntigravityShadowHome(input: {
   createKeychain?: (file: string, home: string) => Promise<void>;
   /** Test seam; defaults to `security list-keychains/default-keychain`. */
   selectKeychain?: (file: string, home: string) => Promise<void>;
+  /** Test seam; defaults to probing `security unlock-keychain -p ""` on macOS. */
+  unlockKeychain?: (file: string, home: string) => Promise<boolean>;
+  /** Test seam; defaults to `security delete-keychain` followed by a fresh create. */
+  recreateKeychain?: (file: string, home: string) => Promise<void>;
 }): Promise<ShadowHomeReport> {
   const realHome = path.resolve(input.realHome);
   const shadowHome = path.resolve(input.shadowHome);
@@ -322,6 +359,7 @@ export async function ensureAntigravityShadowHome(input: {
 
   const linked: string[] = [];
   const skipped: string[] = [];
+  const repaired: string[] = [];
   const linkChildren = async (
     source: string,
     destination: string,
@@ -417,6 +455,25 @@ export async function ensureAntigravityShadowHome(input: {
     } catch {
       skipped.push("Library/Keychains/login.keychain-db");
     }
+  } else {
+    // A keychain that exists but cannot be opened with its own (empty) password is unusable and
+    // asks the user for a password on every AGY credential call, forever. Rebuild it instead:
+    // silently leaving that state is what made the prompts look like an unrelated macOS problem.
+    const unlock =
+      input.unlockKeychain ?? (process.platform === "darwin" ? darwinKeychainUnlocks : null);
+    const recreate =
+      input.recreateKeychain ??
+      (process.platform === "darwin" && manageKeychain
+        ? recreateDarwinKeychain
+        : async () => undefined);
+    if (unlock && !(await unlock(keychainFile, shadowHome).catch(() => false))) {
+      try {
+        await recreate(keychainFile, shadowHome);
+        repaired.push("Library/Keychains/login.keychain-db");
+      } catch {
+        skipped.push("Library/Keychains/login.keychain-db");
+      }
+    }
   }
   if (manageKeychain) {
     const select = input.selectKeychain ?? selectDarwinKeychain;
@@ -441,6 +498,7 @@ export async function ensureAntigravityShadowHome(input: {
   return {
     linked,
     skipped,
+    repaired,
     ...(sessionStore.pending.length > 0 ? { sessionStorePending: sessionStore.pending } : {}),
   };
 }
