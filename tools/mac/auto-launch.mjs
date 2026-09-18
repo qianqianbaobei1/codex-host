@@ -329,9 +329,12 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
       dependencies,
     );
     await writeState(statePath, {
-      consecutiveLaunchFailures: state.consecutiveLaunchFailures + 1,
+      // The cooling-off window is the whole remedy, so the streak starts over after it: keeping the
+      // old streak (and its window anchor) would make every later attempt degrade again the moment
+      // `degradedUntil` passes — a Desktop restart every 15 minutes, forever.
+      consecutiveLaunchFailures: 0,
       degradedUntil: at + DEGRADED_RETRY_MS,
-      firstUnconfirmedAt: state.firstUnconfirmedAt,
+      firstUnconfirmedAt: 0,
     });
     return recovered ? "degraded" : "degraded-without-recovery";
   }

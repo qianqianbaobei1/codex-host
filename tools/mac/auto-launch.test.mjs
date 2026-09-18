@@ -240,6 +240,15 @@ describe("codexhost macOS auto-launch watcher", () => {
     // Inside the retry window the watcher must stay quiet, not restart the wedge loop.
     await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("degraded-idle");
     expect(recoveries).toBe(1);
+
+    // Once the window passes, injection gets a fresh streak: the persisted state must not carry
+    // the old one over, or the Desktop would be restarted again on the very next attempt — and
+    // then again every window, forever.
+    clock += 15 * 60_000 + 1;
+    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("launched");
+    expect(recoveries).toBe(1);
+    expect(state.consecutiveLaunchFailures).toBe(1);
+    expect(state.firstUnconfirmedAt).toBe(clock);
   });
 
   it("forgets the unconfirmed streak as soon as a launch is confirmed", async () => {
