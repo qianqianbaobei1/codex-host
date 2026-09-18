@@ -5,6 +5,7 @@ vi.mock("../../src/settings/icons.js", () => ({
 }));
 
 import {
+  creditResetLabel,
   renderAccountResetCredits,
   renderAccountUsage,
   resetCreditDetailLine,
@@ -86,6 +87,9 @@ describe("Account limit windows", () => {
   });
 
   it("shows native and other model quotas as two compact, named groups", () => {
+    // A compact Harness row must carry the same reset information as the Codex rows.
+    const reset = "2026-09-23T09:51:00.000Z";
+    const otherReset = "2026-09-25T01:36:00.000Z";
     const result = renderAccountUsage(
       document,
       {
@@ -93,10 +97,14 @@ describe("Account limit windows", () => {
         credits: {
           ...credits,
           productUsage: [
-            { product: "Gemini models · 5-hour window", usagePercent: 0 },
-            { product: "Gemini models · 7-day window", usagePercent: 25 },
+            { product: "Gemini models · 5-hour window", usagePercent: 0, resetsAt: reset },
+            { product: "Gemini models · 7-day window", usagePercent: 25, resetsAt: reset },
             { product: "Claude and GPT models · 5-hour window", usagePercent: 100 },
-            { product: "Claude and GPT models · 7-day window", usagePercent: 67.7 },
+            {
+              product: "Claude and GPT models · 7-day window",
+              usagePercent: 67.7,
+              resetsAt: otherReset,
+            },
           ],
         },
       },
@@ -111,6 +119,8 @@ describe("Account limit windows", () => {
     expect(text(result)).toContain("7 天 75%");
     expect(text(result)).toContain("5h 0%");
     expect(text(result)).toContain("7 天 32.3%");
+    expect(text(result)).toContain(creditResetLabel(reset, messages));
+    expect(text(result)).toContain(creditResetLabel(otherReset, messages));
     expect(
       elements(result).filter((el) =>
         el.className.includes("settings-account-usage__meter--group"),

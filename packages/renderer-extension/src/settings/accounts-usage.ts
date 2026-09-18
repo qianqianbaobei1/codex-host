@@ -11,6 +11,14 @@ export type AccountUsageViewState =
   | { readonly status: "error" }
   | { readonly status: "ready"; readonly credits: AccountCreditsSnapshot };
 
+/**
+ * "今天 17:51 重置" — one reset line, shared by the detailed and compact renderers so a
+ * Harness Account row shows the same information as a Codex one.
+ */
+export function creditResetLabel(resetsAt: string, messages: RendererSettingsMessages): string {
+  return `${formatAccountCreditsReset(resetsAt, messages.locale)} ${messages.accountCreditsReset}`;
+}
+
 export type AccountUsageDisplay = "used" | "remaining";
 
 export function creditsPeriodLabel(
@@ -186,11 +194,21 @@ function renderCompactAccountCredits(
       const value = display === "remaining" ? 100 - window.usedPercent : window.usedPercent;
       const tone = rendererCreditsTone(window.usedPercent);
       const item = document.createElement("span");
-      item.className = `settings-account-usage__group-value settings-account-usage__group-value--${tone}`;
+      item.className = "settings-account-usage__group-item";
+      const valueText = document.createElement("span");
+      valueText.className = `settings-account-usage__group-value settings-account-usage__group-value--${tone}`;
       const valuePrefix =
         display === "remaining" ? messages.accountCreditsRemaining : messages.accountCreditsUsed;
-      item.textContent = `${key} ${formatRendererCreditsPercent(value)}`;
-      item.title = `${window.label} · ${valuePrefix} ${formatRendererCreditsPercent(value)}`;
+      valueText.textContent = `${key} ${formatRendererCreditsPercent(value)}`;
+      valueText.title = `${window.label} · ${valuePrefix} ${formatRendererCreditsPercent(value)}`;
+      item.append(valueText);
+      // Same reset line the detailed renderer and the Codex Account rows show.
+      if (window.resetsAt) {
+        const reset = document.createElement("span");
+        reset.className = "settings-account-usage__group-reset";
+        reset.textContent = creditResetLabel(window.resetsAt, messages);
+        item.append(reset);
+      }
       values.append(item);
     }
     meter.append(label, values);
@@ -282,7 +300,7 @@ export function renderAccountUsage(
     if (window.resetsAt) {
       const reset = document.createElement("span");
       reset.className = "settings-account-usage__sub";
-      reset.textContent = `${formatAccountCreditsReset(window.resetsAt, messages.locale)} ${messages.accountCreditsReset}`;
+      reset.textContent = creditResetLabel(window.resetsAt, messages);
       meter.append(reset);
     }
     usage.append(meter);
