@@ -80,6 +80,33 @@ describe("Codex Thread list and management protocol boundary", () => {
     ).toBe(false);
   });
 
+  it("reserves section position sorting for transparent official lists", () => {
+    for (const sectionId of ["section-1", undefined, null]) {
+      for (const cursor of ["official-section-cursor", undefined, null]) {
+        const params = {
+          limit: 5,
+          sortDirection: "asc",
+          sortKey: "section_position",
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(sectionId === undefined ? {} : { sectionId }),
+        };
+        const decoded = decodeThreadListRequest({ id: 2, method: "thread/list", params });
+        expect(decoded?.sortKey).toBe("section_position");
+        expect(decoded?.supportsExternal).toBe(false);
+      }
+    }
+    expect(() =>
+      decodeThreadListRequest({
+        id: 3,
+        method: "thread/list",
+        params: {
+          cursor: "codexhost:thread-list:v1:host-cursor",
+          sortKey: "section_position",
+        },
+      }),
+    ).toThrow("Host cursor cannot be used with section_position");
+  });
+
   it("round-trips a bounded Host cursor and binds query plus direction", () => {
     const decoded = decodeThreadListRequest({
       id: 1,

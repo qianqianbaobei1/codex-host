@@ -56,6 +56,7 @@ export type {
   DecodedThreadMetadataUpdateRequest,
   HostThreadListCursor,
   OfficialThreadListPage,
+  OfficialThreadListSortKey,
   ThreadListExternalAnchor,
   ThreadListSortDirection,
   ThreadListSortKey,

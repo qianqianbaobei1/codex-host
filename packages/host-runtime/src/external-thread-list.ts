@@ -163,7 +163,9 @@ export function listExternalThreadMetadata(input: {
   anchor?: ThreadListExternalAnchor | null;
   limit?: number;
 }): ExternalThreadListPage {
-  if (!input.query.supportsExternal) return { data: [], hasMore: false };
+  if (!input.query.supportsExternal || input.query.sortKey === "section_position") {
+    return { data: [], hasMore: false };
+  }
   const sessionIds = resolveExternalSessionTreeIds(input.records);
   const entries = input.records
     .filter((record) => includesExternalRecord(record, input.query))
