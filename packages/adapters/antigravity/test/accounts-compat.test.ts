@@ -1,4 +1,14 @@
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -94,6 +104,24 @@ if [ "$1" = "--print=/usage" ]; then
   esac
   printf '{"event":"command_result","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":%s}]}]}}}\n' "$RF"
   exit 0
+fi
+printf 'gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n'
+`,
+    "utf8",
+  );
+  await chmod(file, 0o755);
+  return file;
+}
+
+/** A CLI whose `--print=/usage` fails, i.e. the account row cannot be refreshed. */
+async function writeFakeAgyWithUsageFailing(root: string): Promise<string> {
+  const file = path.join(root, "fake-agy-usage-failing.sh");
+  await writeFile(
+    file,
+    `#!/bin/bash
+if [ "$1" = "--print=/usage" ]; then
+  echo "Error: authentication required" >&2
+  exit 1
 fi
 printf 'gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n'
 `,
@@ -458,6 +486,104 @@ describe("Antigravity account settings surface", () => {
     }
   });
 
+  it("marks a row stale when the quota probe fails instead of passing old numbers off as current", async () => {
+    const root = await makeRoot("settings-stale");
+    const realHome = path.join(root, "home");
+    await mkdir(realHome, { recursive: true });
+    const value = accountsValue({
+      accounts: [
+        { id: "default", name: "本机", legacy: true, enabled: true },
+        { id: "work", name: "工作", enabled: true },
+      ],
+    });
+    const openStore = () =>
+      new AntigravityAccountStore({
+        file: path.join(realHome, ".agy-accounts", "accounts.json"),
+        realHome,
+        value,
+      });
+    const environment = {
+      ...process.env,
+      HOME: realHome,
+      CODEXHOST_DATA_DIR: path.join(realHome, "data"),
+    };
+    // First a working probe, so each Account has a persisted number to go stale.
+    const healthy = new AntigravityAdapter({
+      command: await writeFakeAgyWithUsage(root),
+      accounts: { mode: "multi", store: openStore() },
+      manageDarwinKeychain: false,
+      environment,
+    });
+    await healthy.refreshAccountCredits();
+    await healthy.close();
+
+    // Then a probe that cannot answer: the numbers must survive, but be flagged.
+    const adapter = new AntigravityAdapter({
+      command: await writeFakeAgyWithUsageFailing(root),
+      accounts: { mode: "multi", store: openStore() },
+      manageDarwinKeychain: false,
+      environment,
+    });
+    try {
+      await adapter.refreshAccountCredits();
+      const rows = await adapter.inspectAccounts();
+      const workRow = rows?.find((row) => row.accountId === "work");
+      expect(workRow?.credits).toMatchObject({ usedPercent: 90 });
+      expect(workRow?.creditsStale).toBe(true);
+      expect(workRow?.creditsError).toContain("authentication required");
+      // A stale row is still a row: identity and default flag are unaffected.
+      expect(workRow?.isDefault).toBe(false);
+
+      // A restart must not launder the failure: a fresh process that has not probed yet still
+      // reports the persisted mark (it used to come back looking freshly read).
+      const restarted = new AntigravityAdapter({
+        command: await writeFakeAgyWithUsageFailing(root),
+        accounts: { mode: "multi", store: openStore() },
+        manageDarwinKeychain: false,
+        environment,
+      });
+      try {
+        const afterRestart = (await restarted.inspectAccounts())?.find(
+          (row) => row.accountId === "work",
+        );
+        expect(afterRestart?.creditsStale).toBe(true);
+        expect(afterRestart?.creditsError).toContain("authentication required");
+        expect(afterRestart?.credits).toMatchObject({ usedPercent: 90 });
+      } finally {
+        await restarted.close();
+      }
+
+      // And one successful probe clears the mark, so it cannot become permanent.
+      const recovered = new AntigravityAdapter({
+        command: await writeFakeAgyWithUsage(root),
+        accounts: { mode: "multi", store: openStore() },
+        manageDarwinKeychain: false,
+        environment,
+      });
+      try {
+        await recovered.refreshAccountCredits();
+        const recoveredRow = (await recovered.inspectAccounts())?.find(
+          (row) => row.accountId === "work",
+        );
+        expect(recoveredRow?.creditsStale).toBeUndefined();
+        expect(recoveredRow?.creditsError).toBeUndefined();
+        expect(recoveredRow?.credits).toMatchObject({ usedPercent: 90 });
+        // The persisted file no longer carries the failure either.
+        const persisted = JSON.parse(
+          await readFile(
+            path.join(realHome, ".agy-accounts", "work", "quota-snapshot.json"),
+            "utf8",
+          ),
+        ) as Record<string, unknown>;
+        expect(persisted).not.toHaveProperty("probeFailure");
+      } finally {
+        await recovered.close();
+      }
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it("reports nothing when multi-account mode is not configured", async () => {
     const adapter = new AntigravityAdapter();
     expect(await adapter.inspectAccounts()).toBeNull();
@@ -495,14 +621,35 @@ describe("Antigravity account settings surface", () => {
       },
     );
     try {
+      // The terminal must start unauthenticated: AGY resumes whatever credential it finds, so a
+      // stored one makes "重新登录" open as that Account and never run the OAuth flow.
+      const workHome = path.join(realHome, ".agy-accounts", "work", "home");
+      const tokenFile = path.join(
+        workHome,
+        ".gemini",
+        "antigravity-cli",
+        "antigravity-oauth-token",
+      );
+      const tokenDir = path.dirname(tokenFile);
+      await mkdir(tokenDir, { recursive: true });
+      await writeFile(tokenFile, "stored credential", "utf8");
+
       await adapter.loginAccount("work");
       expect(scriptPath).toMatch(/work-[0-9a-f-]+\.command$/u);
       const script = await readFile(scriptPath, "utf8");
       expect(script).toContain('--prompt-interactive ""');
-      expect(script).toContain(
-        `export HOME='${path.join(realHome, ".agy-accounts", "work", "home")}'`,
-      );
+      expect(script).toContain(`export HOME='${workHome}'`);
       expect(store.get("work")?.state).toBe("needs_login");
+
+      // The stored credential is moved aside (kept, not destroyed) so OAuth has to run.
+      await expect(stat(tokenFile)).rejects.toThrow();
+      const cleared = (await readdir(tokenDir)).filter((name) =>
+        name.startsWith("antigravity-oauth-token.cleared-"),
+      );
+      expect(cleared).toHaveLength(1);
+      expect(await readFile(path.join(tokenDir, cleared[0] ?? ""), "utf8")).toBe(
+        "stored credential",
+      );
     } finally {
       await adapter.close();
     }

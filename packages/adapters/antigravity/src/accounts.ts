@@ -217,6 +217,16 @@ export const ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE = "agy-account.keychain-db";
 /** The name an earlier build used, which can never be opened. Removed when one is found. */
 const LEGACY_ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE = "login.keychain-db";
 
+/**
+ * macOS keeps the keychain *domain* — which keychain a process resolves credentials from — in
+ * `$HOME/Library/Preferences/com.apple.security.plist`. The shadow HOME must own that file, so it
+ * is the one preference that is never linked from the real HOME.
+ */
+const DARWIN_SECURITY_PREFERENCES_FILE = "com.apple.security.plist";
+
+/** macOS always keeps the system keychain in the user's search list. */
+const DARWIN_SYSTEM_KEYCHAIN = "/Library/Keychains/System.keychain";
+
 /** Path of the keychain that belongs to one account's shadow HOME. */
 export function antigravityAccountKeychain(shadowHome: string): string {
   return path.join(shadowHome, "Library", "Keychains", ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE);
@@ -224,16 +234,6 @@ export function antigravityAccountKeychain(shadowHome: string): string {
 
 export function legacyAntigravityAccountKeychain(shadowHome: string): string {
   return path.join(shadowHome, "Library", "Keychains", LEGACY_ANTIGRAVITY_ACCOUNT_KEYCHAIN_FILE);
-}
-
-/**
- * macOS shows a blocking「找不到钥匙串」dialog when a process tries to store a
- * credential and no keychain exists at `$HOME/Library/Keychains`. Creating a
- * dedicated, unlocked, empty-password keychain per account keeps agy working
- * without a prompt and without reaching the shared login keychain.
- */
-function darwinUserLoginKeychain(environment: NodeJS.ProcessEnv = process.env): string {
-  return path.join(antigravityRealHome(environment), "Library", "Keychains", "login.keychain-db");
 }
 
 /**
@@ -250,11 +250,15 @@ function keychainEnvironment(home: string): NodeJS.ProcessEnv {
  * keychain. Accounts now keep their keychain inside their own HOME, so nothing
  * installs one globally any more; this remains as a one-way repair for machines
  * that ran the previous build.
+ *
+ * Takes no environment on purpose: it always repairs the **real** user domain, read from
+ * `process.env`. A caller that passed the account's own environment resolved the shadow HOME and
+ * would have written the account keychain into the real user's settings.
  */
-export function restoreDarwinUserKeychain(environment: NodeJS.ProcessEnv = process.env): void {
+export function restoreDarwinUserKeychain(): void {
   if (process.platform !== "darwin") return;
   try {
-    const realHome = antigravityRealHome(process.env);
+    const realHome = antigravityRealHome();
     const realLogin = path.join(realHome, "Library", "Keychains", "login.keychain-db");
     if (!existsSync(realLogin)) return;
     let rawDefault = "";
@@ -279,7 +283,9 @@ export function restoreDarwinUserKeychain(environment: NodeJS.ProcessEnv = proce
       // Ignored
     }
     const filteredList = rawList.filter((p) => !p.includes(ANTIGRAVITY_ACCOUNTS_DIR));
-    const sanitizedList = filteredList.includes(realLogin) ? filteredList : [realLogin, ...filteredList];
+    const sanitizedList = filteredList.includes(realLogin)
+      ? filteredList
+      : [realLogin, ...filteredList];
     if (!rawDefault || rawDefault.includes(".agy-accounts") || !rawList.includes(realLogin)) {
       execFileSync("security", ["list-keychains", "-d", "user", "-s", ...sanitizedList], {
         stdio: ["pipe", "pipe", "ignore"],
@@ -336,12 +342,26 @@ async function createDarwinKeychain(file: string, home: string): Promise<void> {
 }
 
 /**
- * In Scheme A, we never overwrite the user domain's search list or default keychain.
- * Modifying `security default-keychain` or `list-keychains` has user-session-wide side
- * effects on macOS that corrupt the user's default keychain and break applications.
+ * Point an Account's HOME at its own keychain.
+ *
+ * `security` records the keychain *domain* in `$HOME/Library/Preferences/com.apple.security.plist`,
+ * so running these commands with the account's HOME keeps the change inside that HOME. The
+ * session-wide damage an earlier build saw came from the shadow HOME sharing the real
+ * `Library/Preferences`, which made every write land in the real user's file; that directory is now
+ * per account, so this stays scoped (measured: the real default keychain is unchanged). Skipping
+ * the selection instead leaves the account keychain present but unused, so AGY resolves credentials
+ * from the real login keychain and every Account reports the same quota.
  */
-async function selectDarwinKeychain(_file: string, _home: string): Promise<void> {
-  // Intentionally no-op to prevent corrupting the user's global keychain search list.
+async function selectDarwinKeychain(file: string, home: string): Promise<void> {
+  const environment = keychainEnvironment(home);
+  await execFileAsync(
+    "security",
+    ["list-keychains", "-d", "user", "-s", file, DARWIN_SYSTEM_KEYCHAIN],
+    { env: environment },
+  );
+  await execFileAsync("security", ["default-keychain", "-d", "user", "-s", file], {
+    env: environment,
+  });
 }
 
 /**
@@ -350,8 +370,12 @@ async function selectDarwinKeychain(_file: string, _home: string): Promise<void>
  *  - `.gemini`, which is rebuilt per account (config/skills shared by link),
  *  - `Library/Keychains`, which is created per account and selected as that
  *    HOME's keychain domain,
+ *  - `Library/Preferences/com.apple.security.plist`, which holds that keychain
+ *    domain and is therefore the only preference the shadow HOME keeps for
+ *    itself,
  *  - any entry that would place the shadow root inside its own link target.
- * Idempotent: existing entries are left untouched.
+ * Idempotent: existing entries are left untouched, apart from the explicit repairs called out
+ * above (an unusable legacy keychain, and a whole-directory `Library/Preferences` link).
  */
 export async function ensureAntigravityShadowHome(input: {
   realHome: string;
@@ -456,9 +480,32 @@ export async function ensureAntigravityShadowHome(input: {
   ]);
   // The macOS keychain is the credential agy actually reads, so it must stay
   // per account. It is intentionally not linked from the real HOME.
+  //
+  // `Library/Preferences` must be per account for the same reason: the keychain
+  // *domain* (which keychain a process resolves credentials from) lives in
+  // `Library/Preferences/com.apple.security.plist`. Sharing that file let the
+  // account keychain be selected into the real user's preferences and then be
+  // reverted by the restore step, so every Account fell back to the real login
+  // keychain and all of them reported the same credentials. Every other
+  // preference stays shared, one level down.
   await linkChildren(path.join(realHome, "Library"), path.join(shadowHome, "Library"), "Library/", [
     "Keychains",
+    "Preferences",
   ]);
+  const shadowPreferences = path.join(shadowHome, "Library", "Preferences");
+  if ((await lstat(shadowPreferences).catch(() => null))?.isSymbolicLink()) {
+    // Repair the whole-directory link an earlier build left behind; while it is
+    // in place the account keeps writing its keychain domain into the real HOME.
+    await rm(shadowPreferences, { force: true }).catch(() => undefined);
+    repaired.push("Library/Preferences");
+  }
+  await mkdir(shadowPreferences, { recursive: true, mode: 0o700 });
+  await linkChildren(
+    path.join(realHome, "Library", "Preferences"),
+    shadowPreferences,
+    "Library/Preferences/",
+    [DARWIN_SECURITY_PREFERENCES_FILE],
+  );
 
   // macOS shows a blocking「找不到钥匙串」dialog when agy stores a credential and
   // no keychain exists at `$HOME/Library/Keychains`. A dedicated per-account
@@ -568,7 +615,7 @@ export function loadAntigravityAccountsSync(
 ): AntigravityAccountsLoad {
   const environment = input.environment ?? process.env;
   if (process.platform === "darwin") {
-    restoreDarwinUserKeychain(environment);
+    restoreDarwinUserKeychain();
   }
   const realHome = antigravityRealHome(environment);
   const file = input.file ?? antigravityAccountsFile(environment);

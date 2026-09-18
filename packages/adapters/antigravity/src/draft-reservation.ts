@@ -4,7 +4,16 @@ import type { HarnessThinkingOptionId, HarnessPermissionModeId } from "@codexhos
 import type { AntigravityCliTransportLike } from "./antigravity-adapter.js";
 import type { AntigravityInitEvent, AntigravityTransportOptions } from "./transport.js";
 
-export const DEFAULT_DRAFT_RESERVATION_TTL_MS = 3 * 60 * 1000; // 3 minutes
+/**
+ * Bound on how long an unused prewarmed Session may keep its CLI process alive.
+ *
+ * This is a leak guard, not the draft's lifetime: the renderer releases the
+ * reservation when the draft is left or cleared. Expiring sooner than a person
+ * takes to write a first message threw away exactly the warm process the
+ * reservation exists to provide, so the Thread's `thread/start` fell back to a
+ * cold CLI start.
+ */
+export const DEFAULT_DRAFT_RESERVATION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export interface DraftReservationKeyParams {
   cwd: string;

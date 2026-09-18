@@ -21,7 +21,9 @@ import type {
   AntigravityInitEvent,
   AntigravityResultEvent,
   AntigravityStepUpdate,
+  AntigravityTransportOptions,
 } from "../src/transport.js";
+import { loadAntigravityAccountsSync, antigravityAccountsFile } from "../src/accounts.js";
 import { encodeAntigravityModelRef } from "../src/model-catalog.js";
 import { resolveAntigravityProxyEnvironment } from "../src/command.js";
 
@@ -1318,6 +1320,71 @@ describe("AntigravityAdapter", () => {
       expect(agentItems.length).toBeGreaterThan(0);
 
       await session.close();
+    } finally {
+      await adapter.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves the Account the new Thread will actually use, and starts it under that Account", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codexhost-antigravity-draft-account-"));
+    const environment = { HOME: root, CODEXHOST_DATA_DIR: root, PATH: "/synthetic" };
+    // The configured default cannot take a new Thread, so creation falls to the
+    // other Account. A reservation that still named the default produced a
+    // process the create could never claim: every new Thread then silently paid
+    // a cold CLI start on its own `thread/start`.
+    const accountsFile = antigravityAccountsFile({ HOME: root });
+    await mkdir(path.dirname(accountsFile), { recursive: true });
+    await writeFile(
+      accountsFile,
+      JSON.stringify({
+        formatVersion: 1,
+        defaultAccountId: "default",
+        accounts: [
+          { id: "default", name: "本机登录", enabled: false, legacy: true },
+          { id: "work", name: "工作", enabled: true },
+        ],
+      }),
+      "utf8",
+    );
+    const accounts = loadAntigravityAccountsSync({ environment });
+    expect(accounts.mode).toBe("multi");
+    const created: AntigravityTransportOptions[] = [];
+    const createTransport = (options: AntigravityTransportOptions): AntigravityCliTransportLike => {
+      created.push(options);
+      return fakeTransportFactory(`account-draft-${created.length}`).create();
+    };
+    const listModels = async (): Promise<AntigravityModelsResult> => {
+      return { stdout: `${MODEL}\t${MODEL_LABEL}\n`, stderr: "" };
+    };
+    const adapter = new AntigravityAdapter(
+      {
+        command: path.join(os.homedir(), ".local/bin/agy"),
+        environment,
+        accounts,
+        manageDarwinKeychain: false,
+      },
+      { createTransport, listModels },
+    );
+    try {
+      await adapter.reserveDraft({ cwd: root, model: encodeAntigravityModelRef(MODEL) });
+
+      expect(created).toHaveLength(1);
+      expect(created[0]?.environment?.HOME).toBe(path.join(root, ".agy-accounts", "work", "home"));
+
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: root,
+        model: encodeAntigravityModelRef(MODEL),
+        environment,
+      });
+
+      expect(opened.ok).toBe(true);
+      expect(created).toHaveLength(1);
+
+      if (opened.ok) {
+        await opened.value.close();
+      }
     } finally {
       await adapter.close();
       await rm(root, { recursive: true, force: true });

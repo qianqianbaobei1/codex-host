@@ -387,8 +387,9 @@ export function mountHarnessAccounts(
       if (!usage) continue;
       if (!usageCredits) {
         usage.className = "settings-account-usage__message";
-        usage.textContent =
-          account.authState === "needs_login"
+        usage.textContent = account.creditsStale
+          ? messages.accountCreditsFailed
+          : account.authState === "needs_login"
             ? messages.harnessAccountNeedsLogin
             : refreshing
               ? messages.accountCreditsLoading
@@ -398,6 +399,19 @@ export function mountHarnessAccounts(
       const usageContainer = document.createElement("div");
       usageContainer.className = "settings-harness-account__usage-container";
       usageContainer.append(usage);
+      if (account.creditsStale && usageCredits) {
+        // The numbers are the last good reading; say so instead of letting a
+        // failed probe look like the current state (two Accounts once showed the
+        // same figure because both probes had failed).
+        usage.classList.add("settings-account-usage--stale");
+        const note = document.createElement("span");
+        note.className = "settings-account-usage__message";
+        note.textContent = messages.accountCreditsFailed;
+        note.title = account.creditsError
+          ? `${messages.accountCreditsFailed}: ${account.creditsError}`
+          : messages.accountCreditsFailed;
+        usageContainer.append(note);
+      }
 
       if (hasSubProducts) {
         const toggleBtn = document.createElement("button");

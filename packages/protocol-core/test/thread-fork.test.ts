@@ -124,6 +124,36 @@ describe("Codex thread/fork protocol boundary", () => {
     ).toEqual({ code: -32080, message: "External Fork Checkpoint is unavailable" });
   });
 
+  it("keeps a failed Harness stage in the mapped message, bounded", () => {
+    const mapped = mapExternalThreadHarnessError(
+      {
+        code: "unavailable",
+        message: "Antigravity models listing timed out",
+        retryable: true,
+        stage: "unavailable",
+        durationMs: 30_001,
+      },
+      "create",
+    );
+    expect(mapped.code).toBe(-32077);
+    expect(mapped.message).toBe(
+      "External Harness is unavailable (stage=unavailable: after 30001ms)",
+    );
+
+    const noisy = mapExternalThreadHarnessError(
+      {
+        code: "nativeFailure",
+        message: "boom",
+        retryable: false,
+        diagnostic: `head ${"x".repeat(1000)}`,
+      },
+      "turn",
+    );
+    expect(noisy.message.startsWith("External Thread turn failed (head ")).toBe(true);
+    expect(noisy.message.length).toBeLessThan(440);
+    expect(noisy.message.endsWith("...)")).toBe(true);
+  });
+
   it("builds the paginated ThreadRevertResponse without embedding history", () => {
     expect(threadRevertResult({ id: "thread-1", turns: [{ id: "turn-1" }] })).toEqual({
       thread: { id: "thread-1", turns: [] },

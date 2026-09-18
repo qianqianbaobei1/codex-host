@@ -195,6 +195,22 @@ const antigravityHarnessId: HarnessId = harnessIdSchema.parse("antigravity");
 const execFileAsync = promisify(execFile);
 
 /**
+ * AGY's keyring coordinates: the credential is the item
+ * `security find-generic-password -s gemini -a antigravity`. A login terminal must remove it,
+ * otherwise AGY resumes that credential instead of running OAuth.
+ */
+const ANTIGRAVITY_KEYCHAIN_SERVICE = "gemini";
+const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
+
+/** `HHMMSS` plus a short suffix, matching the `.cleared-*` names earlier builds left behind. */
+function clearedSuffix(at: Date = new Date()): string {
+  const clock = [at.getHours(), at.getMinutes(), at.getSeconds()]
+    .map((part) => String(part).padStart(2, "0"))
+    .join("");
+  return `${clock}-${randomUUID().slice(0, 4)}`;
+}
+
+/**
  * Reject a local IO promise that never settles. Kept local to the adapter so it does not depend on
  * host-runtime (which depends on this package, not the other way around).
  */
@@ -350,6 +366,17 @@ function withAntigravityAccountMarker<T extends OpenSessionInput>(input: T, acco
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Quota-probe failures are carried to the Desktop and shown in a row tooltip, so they are
+ * bounded and flattened. The reason is kept — a bare "could not load limits" is what made a
+ * wrong number indistinguishable from a network failure.
+ */
+function truncateCreditsError(message: string): string {
+  const flattened = message.trim().replaceAll(/\s+/gu, " ");
+  if (flattened.length === 0) return "Antigravity quota probe failed";
+  return flattened.length > 200 ? `${flattened.slice(0, 197)}...` : flattened;
 }
 
 function shellQuote(value: string): string {
@@ -1618,6 +1645,8 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly #creditsByAccount = new Map<string, AccountCreditsSnapshot>();
   readonly #creditsRefreshByAccount = new Map<string, Promise<AccountCreditsSnapshot | null>>();
   readonly #creditsRefreshStartedAt = new Map<string, number>();
+  /** Why the most recent quota probe failed, per Account key. Cleared by the next success. */
+  readonly #creditsProbeFailures = new Map<string, string>();
   readonly #accountCooldownUntil = new Map<string, number>();
   readonly #loginMonitors = new Map<string, Promise<void>>();
   readonly #accountEmails = new Map<string, string>();
@@ -1659,6 +1688,13 @@ export class AntigravityAdapter implements HarnessAdapter {
           kind: "create" as const,
           cwd: params.cwd,
           model: encodeAntigravityModelRef(params.model),
+          // The reservation key names an Account, so the prewarmed process must
+          // run under that same Account. Without the marker `#transportOptions`
+          // re-derives one, and a process started for one Account could then be
+          // claimed by a Thread the Host binds to another.
+          ...(params.accountId
+            ? { environment: { [ANTIGRAVITY_ACCOUNT_ID_ENV]: params.accountId } }
+            : {}),
           ...(params.thinkingOptionId ? { thinkingOptionId: params.thinkingOptionId } : {}),
           ...(params.permissionModeId ? { permissionModeId: params.permissionModeId } : {}),
         };
@@ -1914,6 +1950,7 @@ export class AntigravityAdapter implements HarnessAdapter {
         .map(async (account): Promise<HarnessAccountSnapshot> => {
           const credits = this.#creditsFor(account.id);
           const email = this.#resolveAccountEmail(account);
+          const probeFailure = this.#creditsProbeFailures.get(account.id);
           return {
             accountId: account.id,
             label: account.name,
@@ -1922,6 +1959,8 @@ export class AntigravityAdapter implements HarnessAdapter {
             selectable: this.#isAccountUsable(account),
             authState: account.state ?? "ready",
             ...(credits ? { credits } : {}),
+            // A stale row keeps its numbers but must not present them as current.
+            ...(probeFailure ? { creditsStale: true, creditsError: probeFailure } : {}),
           };
         }),
     );
@@ -2016,6 +2055,10 @@ export class AntigravityAdapter implements HarnessAdapter {
       environment,
     });
     const tokenFile = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    // Start the terminal unauthenticated, or it opens as whoever the stored credential belongs to
+    // and never runs OAuth: clicking "重新登录" on one Account was observed opening a session already
+    // signed in as a different Account, which left the intended Account unreachable.
+    await this.#clearStoredLoginCredential(home, tokenFile);
     const before = await fileFingerprint(tokenFile);
     const loginDirectory = path.join(
       this.#accountsRealHome,
@@ -2063,6 +2106,31 @@ export class AntigravityAdapter implements HarnessAdapter {
     void monitor.finally(() => {
       if (this.#loginMonitors.get(accountId) === monitor) this.#loginMonitors.delete(accountId);
     });
+  }
+
+  /**
+   * Remove the credentials AGY would otherwise resume from, so this Account's login terminal starts
+   * at the OAuth prompt.
+   *
+   * AGY keeps the credential in the HOME's keychain and in `antigravity-oauth-token`, and the
+   * keychain copy wins, so both are cleared. The keychain domain follows HOME, so this only ever
+   * touches this Account's in that HOME. The file is moved aside rather than deleted, so the
+   * previous credential stays recoverable by hand.
+   */
+  async #clearStoredLoginCredential(home: string, tokenFile: string): Promise<void> {
+    await rename(tokenFile, `${tokenFile}.cleared-${clearedSuffix()}`).catch(() => undefined);
+    if (process.platform !== "darwin" || this.#options.manageDarwinKeychain === false) return;
+    await execFileAsync(
+      "security",
+      [
+        "delete-generic-password",
+        "-s",
+        ANTIGRAVITY_KEYCHAIN_SERVICE,
+        "-a",
+        ANTIGRAVITY_KEYCHAIN_ACCOUNT,
+      ],
+      { env: { ...process.env, HOME: home } },
+    ).catch(() => undefined);
   }
 
   async #monitorLogin(
@@ -2178,39 +2246,55 @@ export class AntigravityAdapter implements HarnessAdapter {
     return this.#resolveAccount(environment)?.id ?? LEGACY_ACCOUNT_KEY;
   }
 
+  /**
+   * Read one Account's persisted quota snapshot.
+   *
+   * The probe outcome travels with the numbers: a failure recorded here is what keeps a row marked
+   * as unverified after a Host restart, instead of the old numbers silently passing as current.
+   */
   #readAccountSnapshotSync(
     accountId: string,
     expectedEmail?: string,
-  ): AccountCreditsSnapshot | null {
+  ): { credits: AccountCreditsSnapshot | null; probeFailure: string | null } {
+    const empty = { credits: null, probeFailure: null };
     try {
       const snapshotPath = path.join(
         antigravityAccountsRoot({ HOME: this.#accountsRealHome }),
         accountId,
         "quota-snapshot.json",
       );
-      if (!existsSync(snapshotPath)) return null;
+      if (!existsSync(snapshotPath)) return empty;
       const text = readFileSync(snapshotPath, "utf8");
       const parsed = JSON.parse(text);
-      if (isRecord(parsed) && "credits" in parsed) {
-        if (parsed.accountId !== accountId) return null;
-        if (
-          expectedEmail &&
-          (typeof parsed.email !== "string" ||
-            parsed.email.trim().toLowerCase() !== expectedEmail.trim().toLowerCase())
-        ) {
-          return null;
-        }
-        const envelopeCredits = accountCreditsSnapshotSchema.safeParse(parsed.credits);
-        return envelopeCredits.success ? envelopeCredits.data : null;
+      if (!isRecord(parsed) || !("credits" in parsed || "probeFailure" in parsed)) {
+        // Older shape: the file was the Credits snapshot itself.
+        const bare = accountCreditsSnapshotSchema.safeParse(parsed);
+        return { credits: bare.success ? bare.data : null, probeFailure: null };
       }
-      const result = accountCreditsSnapshotSchema.safeParse(parsed);
-      return result.success ? result.data : null;
+      if (parsed.accountId !== accountId) return empty;
+      if (
+        expectedEmail &&
+        (typeof parsed.email !== "string" ||
+          parsed.email.trim().toLowerCase() !== expectedEmail.trim().toLowerCase())
+      ) {
+        return empty;
+      }
+      const envelopeCredits = accountCreditsSnapshotSchema.safeParse(parsed.credits);
+      const failure = isRecord(parsed.probeFailure) ? parsed.probeFailure.message : undefined;
+      return {
+        credits: envelopeCredits.success ? envelopeCredits.data : null,
+        probeFailure: typeof failure === "string" && failure.length > 0 ? failure : null,
+      };
     } catch {
-      return null;
+      return empty;
     }
   }
 
-  #writeAccountSnapshotSync(accountId: string, credits: AccountCreditsSnapshot): void {
+  #writeAccountSnapshotSync(
+    accountId: string,
+    credits: AccountCreditsSnapshot | null,
+    probeFailure?: string,
+  ): void {
     if (this.#accounts.mode !== "multi") return;
     try {
       const account = this.#accounts.store.get(accountId);
@@ -2229,7 +2313,11 @@ export class AntigravityAdapter implements HarnessAdapter {
           {
             accountId,
             ...(account.email ? { email: account.email } : {}),
-            credits,
+            ...(credits ? { credits } : {}),
+            // Absent on success, so a successful probe clears the mark by construction.
+            ...(probeFailure
+              ? { probeFailure: { at: new Date().toISOString(), message: probeFailure } }
+              : {}),
           },
           null,
           2,
@@ -2245,10 +2333,18 @@ export class AntigravityAdapter implements HarnessAdapter {
 
   #creditsFor(key: string): AccountCreditsSnapshot | null {
     let credits = this.#creditsByAccount.get(key) ?? null;
-    if (!credits && this.#accounts.mode === "multi") {
+    if (this.#accounts.mode === "multi") {
       const account = this.#accounts.store.get(key);
-      credits = this.#readAccountSnapshotSync(key, account?.email);
-      if (credits) this.#creditsByAccount.set(key, credits);
+      const snapshot = this.#readAccountSnapshotSync(key, account?.email);
+      if (snapshot.credits) {
+        credits = snapshot.credits;
+        this.#creditsByAccount.set(key, credits);
+      }
+      // A failure survives the process that recorded it, so a restart cannot make the
+      // row look freshly read again.
+      if (snapshot.probeFailure && !this.#creditsProbeFailures.has(key)) {
+        this.#creditsProbeFailures.set(key, snapshot.probeFailure);
+      }
     }
     // In multi-account mode the global /tmp files are intentionally never a
     // fallback: they have no stable account ownership and are overwritten by
@@ -2296,9 +2392,16 @@ export class AntigravityAdapter implements HarnessAdapter {
     // Fusion: the CLI's own `--print=/usage` is the primary quota source; the
     // local statusline/snapshot files stay as a fallback when it is unavailable.
     const resolvedEnvironment = environment ?? this.#environment();
+    let failure: string | null = null;
+    let probeError: unknown;
     try {
       const quota = await fetchAntigravityQuota((arguments_) =>
-        this.#runAntigravityCommand(arguments_, resolvedEnvironment),
+        this.#runAntigravityCommand(arguments_, resolvedEnvironment).catch((error: unknown) => {
+          // `fetchAntigravityQuota` reports unavailability as `null`; keep the
+          // real reason so the row can say why the numbers are stale.
+          probeError = error;
+          throw error;
+        }),
       );
       if (quota) {
         // The Host validates against the shared credits contract; project the
@@ -2313,12 +2416,21 @@ export class AntigravityAdapter implements HarnessAdapter {
         };
         this.#creditsByAccount.set(key, credits);
         this.#writeAccountSnapshotSync(key, credits);
+        this.#creditsProbeFailures.delete(key);
         return credits;
       }
-    } catch {
-      // Fall through to the filesystem-backed fallback below.
+      failure = probeError ? errorMessage(probeError) : "Antigravity CLI returned no usage data";
+    } catch (error) {
+      failure = errorMessage(error);
     }
-    return this.#creditsFor(key);
+    // The last known snapshot stays visible, but it must be reported as stale:
+    // silently returning it as a fresh reading is what made two Accounts look
+    // identical after a failed probe.
+    const message = truncateCreditsError(failure);
+    const credits = this.#creditsFor(key);
+    this.#creditsProbeFailures.set(key, message);
+    this.#writeAccountSnapshotSync(key, credits, message);
+    return credits;
   }
 
   /** Runs the Antigravity CLI once and resolves stdout (quota probes). */
@@ -3011,14 +3123,7 @@ export class AntigravityAdapter implements HarnessAdapter {
     accountId?: string;
   }): Promise<void> {
     if (this.#closePromise) return;
-    const account = input.accountId
-      ? this.#accounts.mode === "multi"
-        ? this.#accounts.store.get(input.accountId)
-        : undefined
-      : this.#accounts.mode === "multi"
-        ? this.#accounts.store.defaultAccount()
-        : undefined;
-    const accountId = account?.id;
+    const accountId = this.#draftAccountId(input);
     let modelSlug: string | undefined;
     if (input.model) {
       try {
@@ -3056,10 +3161,23 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#reservationPool.release({
       cwd: path.resolve(input.cwd),
       model: modelSlug ?? "gemini-3.8-flash",
-      accountId: input.accountId,
+      accountId: this.#draftAccountId(input),
       thinkingOptionId: input.thinkingOptionId,
       permissionModeId: input.permissionModeId,
     });
+  }
+
+  /**
+   * The Account a draft reservation names. `reserveDraft`, `releaseDraft` and
+   * Thread creation must all agree: the reservation key carries this Account, so
+   * any disagreement silently orphans the prewarmed process (and a release that
+   * keys differently can never clean it up).
+   */
+  #draftAccountId(input: { model?: HarnessModelRef; accountId?: string }): string | undefined {
+    if (input.accountId && this.#accounts.mode === "multi") {
+      return this.#accounts.store.get(input.accountId)?.id;
+    }
+    return this.#accountForNewThread(input.model)?.id;
   }
 
   #environment(explicit?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -3129,8 +3247,6 @@ export class AntigravityAdapter implements HarnessAdapter {
    */
   #resolveAccountForOpen(input: OpenSessionInput): AntigravityAccount | null {
     if (this.#accounts.mode !== "multi") return null;
-    const requestedModel =
-      input.kind === "create" ? this.#requestedModelSlug(input.model) : undefined;
     const marker = input.environment?.[ANTIGRAVITY_ACCOUNT_ID_ENV]?.trim();
     if (marker) return this.#accounts.store.get(marker);
     if (input.kind === "resume") {
@@ -3144,15 +3260,32 @@ export class AntigravityAdapter implements HarnessAdapter {
       if (threadId && this.#accounts.store.bindingForThread(threadId)) {
         return this.#resolveAccount(input.environment);
       }
-      const preferred = this.#accounts.store.defaultAccount();
-      const candidates = preferred
-        ? [preferred, ...this.#accounts.store.list()]
-        : this.#accounts.store.list();
-      return (
-        candidates.find((candidate) => this.#accountCanUseModel(candidate, requestedModel)) ?? null
-      );
+      return this.#accountForNewThread(input.model);
     }
     return this.#resolveAccount(input.environment);
+  }
+
+  /**
+   * The one rule for "which Account owns a brand-new Thread".
+   *
+   * Draft reservation and Thread creation must agree on it, because the
+   * reservation key names the Account. Two copies of this decision (reserve
+   * asked for the configured default, create asked for the first Account that
+   * can run the Model) silently stopped matching whenever the two disagreed,
+   * which turned the prewarm into an unclaimed process and left the Thread's
+   * own `thread/start` paying a cold CLI start on its critical path.
+   */
+  #accountForNewThread(model?: HarnessModelRef): AntigravityAccount | null {
+    if (this.#accounts.mode !== "multi") return null;
+    const preferred = this.#accounts.store.defaultAccount();
+    const candidates = preferred
+      ? [preferred, ...this.#accounts.store.list()]
+      : this.#accounts.store.list();
+    return (
+      candidates.find((candidate) =>
+        this.#accountCanUseModel(candidate, this.#requestedModelSlug(model)),
+      ) ?? null
+    );
   }
 
   #requestedModelSlug(model: HarnessModelRef | undefined): string | undefined {

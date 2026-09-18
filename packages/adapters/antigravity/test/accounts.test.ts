@@ -1,4 +1,14 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -187,6 +197,47 @@ describe("Antigravity shadow HOME", () => {
     expect(cli.isDirectory()).toBe(true);
     expect(cli.isSymbolicLink()).toBe(false);
     expect((await stat(shadowHome)).mode & 0o777).toBe(0o700);
+  });
+
+  it("keeps the keychain domain per account and repairs a shared Library/Preferences link", async () => {
+    const realHome = await makeRoot("shadow-preferences");
+    const realPreferences = path.join(realHome, "Library", "Preferences");
+    await mkdir(realPreferences, { recursive: true });
+    await writeFile(path.join(realPreferences, "com.apple.security.plist"), "real", "utf8");
+    await writeFile(path.join(realPreferences, "com.apple.finder.plist"), "shared", "utf8");
+    const shadowRoot = path.join(realHome, ANTIGRAVITY_ACCOUNTS_DIR);
+    const shadowHome = path.join(shadowRoot, "work", "home");
+    const shadowPreferences = path.join(shadowHome, "Library", "Preferences");
+    // The state an earlier build left behind: the whole directory linked, so the
+    // keychain *domain* the account wrote landed in the real user's file and every
+    // Account resolved credentials from the real login keychain.
+    await mkdir(path.dirname(shadowPreferences), { recursive: true });
+    await symlink(realPreferences, shadowPreferences);
+
+    const report = await ensureAntigravityShadowHome({
+      realHome,
+      shadowHome,
+      shadowRoot,
+      createKeychain: async (file) => {
+        await writeFile(file, "fake keychain", "utf8");
+      },
+      selectKeychain: async () => undefined,
+    });
+
+    expect(report.repaired).toContain("Library/Preferences");
+    expect(report.skipped).toContain("Library/Preferences");
+    const repaired = await lstat(shadowPreferences);
+    expect(repaired.isDirectory()).toBe(true);
+    expect(repaired.isSymbolicLink()).toBe(false);
+    // Everything else stays shared one level down.
+    expect(await readlink(path.join(shadowPreferences, "com.apple.finder.plist"))).toBe(
+      path.join(realPreferences, "com.apple.finder.plist"),
+    );
+    // The keychain domain must be the account's own file, so nothing is linked here.
+    await expect(lstat(path.join(shadowPreferences, "com.apple.security.plist"))).rejects.toThrow();
+    expect(await readFile(path.join(realPreferences, "com.apple.security.plist"), "utf8")).toBe(
+      "real",
+    );
   });
 
   it("tolerates a keychain that cannot be created", async () => {

@@ -140,31 +140,72 @@ function optionalField<Name extends string>(
   return value === undefined ? {} : ({ [name]: value } as Partial<Record<Name, string>>);
 }
 
+/**
+ * Harness failures reach the Desktop as the message the user sees, and the
+ * Desktop log is the only surviving record of a failed Thread start. Mapping
+ * away `stage`, `durationMs`, `diagnostic` and `stderrTail` is what left
+ * "External Harness is unavailable" as the entire evidence for a real failure
+ * that had already measured itself. Detail is truncated: this message is
+ * carried across a process boundary and shown in the UI.
+ */
+function harnessErrorDetail(error: HarnessError): string {
+  const detail = [error.diagnostic, error.stderrTail].find(
+    (text) => typeof text === "string" && text.trim().length > 0,
+  );
+  const parts = [
+    error.stage ? `stage=${error.stage}` : null,
+    error.durationMs !== undefined ? `after ${error.durationMs}ms` : null,
+    detail ? detail.trim().replaceAll(/\s+/gu, " ") : null,
+  ].filter((part): part is string => part !== null);
+  if (parts.length === 0) return "";
+  const joined = parts.join(": ");
+  return ` (${joined.length > 400 ? `${joined.slice(0, 397)}...` : joined})`;
+}
+
 export function mapExternalThreadHarnessError(
   error: HarnessError,
   operation: "create" | "read" | "resume" | "fork" | "turn",
 ): ExternalThreadRpcError {
+  const detail = harnessErrorDetail(error);
   switch (error.code) {
     case "invalidRequest":
-      return { code: -32602, message: `External Thread ${operation} request is invalid` };
+      return {
+        code: -32602,
+        message: `External Thread ${operation} request is invalid${detail}`,
+      };
     case "sessionBusy":
-      return { code: -32072, message: "External Thread has an active operation" };
+      return {
+        code: -32072,
+        message: `External Thread has an active operation${detail}`,
+      };
     case "unsupported":
-      return { code: -32076, message: `External Harness does not support ${operation}` };
+      return {
+        code: -32076,
+        message: `External Harness does not support ${operation}${detail}`,
+      };
     case "sessionNotFound":
-      return { code: -32079, message: "External Native Session is unavailable" };
+      return {
+        code: -32079,
+        message: `External Native Session is unavailable${detail}`,
+      };
     case "checkpointNotFound":
-      return { code: -32080, message: "External Fork Checkpoint is unavailable" };
+      return {
+        code: -32080,
+        message: `External Fork Checkpoint is unavailable${detail}`,
+      };
     case "notInstalled":
     case "unavailable":
     case "authenticationRequired":
-      return { code: -32077, message: "External Harness is unavailable" };
+      return { code: -32077, message: `External Harness is unavailable${detail}` };
     case "nativeFailure":
     case "protocolError":
     case "processExited":
     case "internalError":
     case "invalidState":
-      return { code: -32076, message: `External Thread ${operation} failed` };
+      return {
+        code: -32076,
+        message: `External Thread ${operation} failed${detail}`,
+      };
   }
 }
 

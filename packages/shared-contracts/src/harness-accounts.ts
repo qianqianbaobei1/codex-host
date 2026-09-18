@@ -10,6 +10,14 @@ export const harnessAccountSnapshotSchema = z
     plan: z.string().trim().min(1).max(128).optional(),
     credits: accountCreditsSnapshotSchema.optional(),
     /**
+     * The quota numbers are the last known snapshot rather than the current state: the most
+     * recent probe for this Account failed. The numbers are kept so a transient failure does
+     * not erase them, but they must not be presented as a fresh reading.
+     */
+    creditsStale: z.boolean().optional(),
+    /** Why the most recent probe failed, for the row's tooltip. Never a login record. */
+    creditsError: z.string().trim().min(1).max(200).optional(),
+    /**
      * Present only for Harnesses that expose more than one selectable native
      * account. `accountId` is opaque and owned by the adapter.
      */
