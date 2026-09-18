@@ -109,4 +109,21 @@ describe("read-only Harness accounts", () => {
     });
     expect(await inspectHarnessAccounts([empty], [])).toEqual({ accounts: [] });
   });
+
+  it("reports a row the shared contract rejects instead of dropping it silently", async () => {
+    // A Host Bundle whose inlined contract predates a plugin's new row field used
+    // to make the whole Account disappear with nothing written anywhere.
+    const invalidRow = { ...snapshot, creditsStale: "yes" } as unknown as HarnessAccountSnapshot;
+    const multi = Object.assign(adapter("future-agent"), {
+      inspectAccounts: vi.fn(async () => [invalidRow]),
+    });
+    const reported: string[] = [];
+    const result = await inspectHarnessAccounts([multi], [], 12_000, "none", (message) =>
+      reported.push(message),
+    );
+    expect(result).toEqual({ accounts: [] });
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toContain("future-agent");
+    expect(reported[0]).toContain("creditsStale");
+  });
 });

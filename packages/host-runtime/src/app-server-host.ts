@@ -196,6 +196,15 @@ import { aggregateOfficialAccountThreadListPage } from "./multi-account-thread-l
 import type { HostUpdateCoordinator } from "./update-coordinator.js";
 
 const SUBAGENT_TERMINAL_REFRESH_DELAYS_MS = [0, 50, 100, 150] as const;
+
+/**
+ * Delay before the one background quota refresh a Host start performs.
+ *
+ * Long enough not to compete with the Desktop's own startup work (each Account probe spawns a
+ * native CLI), short enough that the Account rows become accurate without the user opening
+ * Settings.
+ */
+const STARTUP_CREDITS_REFRESH_DELAY_MS = 15_000;
 const THREAD_USAGE_UPDATED_METHOD = "codexhost/thread/usage/updated";
 // Native Codex account quota is still pulled through its official API; keep
 // that reading briefly cached so concurrent Composer inspections coalesce.
@@ -908,6 +917,7 @@ export class AppServerHost {
       return this.#closeRequested ? 0 : 1;
     }
     if (this.#closeRequested) await this.#codexRuntimePool.close();
+    this.#scheduleStartupCreditsRefresh();
     try {
       const runtimeFailure = this.#codexRuntimePool.failure().then((error) => {
         throw error;
@@ -3562,12 +3572,15 @@ export class AppServerHost {
     if (creditRefresh !== "none") {
       // Keep the metadata result as a fallback. A quota probe is telemetry:
       // its timeout or an older plugin must never make a real account vanish.
+      // The same applies in the other direction: a row the Host's contract rejects is reported
+      // (see `onInvalidRow`) rather than silently dropped from both passes.
       const baseline = await this.#harnessAccountList();
       const refreshed = await inspectHarnessAccounts(
         this.#externalAdapters.values(),
         this.#pluginDescriptors,
         30_000,
         creditRefresh,
+        (message) => this.#diagnose(message),
       );
       const merged = new Map<string, HarnessAccountListResult["accounts"][number]>();
       for (const account of baseline.accounts) merged.set(harnessAccountKey(account), account);
@@ -3583,6 +3596,9 @@ export class AppServerHost {
     this.#accountInspection ??= inspectHarnessAccounts(
       this.#externalAdapters.values(),
       this.#pluginDescriptors,
+      undefined,
+      "none",
+      (message) => this.#diagnose(message),
     ).finally(() => {
       this.#accountInspection = null;
     });
@@ -3605,6 +3621,22 @@ export class AppServerHost {
         if (this.#accountCreditsRefresh === refresh) this.#accountCreditsRefresh = null;
       });
     this.#accountCreditsRefresh = refresh;
+  }
+
+  /**
+   * Probe every Account once per Host start, in the background.
+   *
+   * Quota is derived state: without this, a restart left the rows showing persisted numbers with no
+   * probe behind them, and a previously failed read stayed invisible until the user opened Settings
+   * or switched the default Account. `unref` keeps the timer from holding the process open; the
+   * adapter ignores a refresh that arrives after it closed.
+   */
+  #scheduleStartupCreditsRefresh(): void {
+    const timer = setTimeout(
+      () => this.#scheduleHarnessAccountCreditsRefresh(),
+      STARTUP_CREDITS_REFRESH_DELAY_MS,
+    );
+    timer.unref?.();
   }
 
   /**
