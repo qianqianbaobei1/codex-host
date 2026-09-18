@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  FUNCTIONAL_HEALTH_HISTORY_LIMIT,
   FUNCTIONAL_HEALTH_SCHEMA_VERSION,
   createFunctionalHealthTracker,
   functionalHealthPath,
@@ -143,10 +144,15 @@ describe("functional health record transport", () => {
         lastHealthyAt: null,
         lastProbeAt: 2,
         consecutiveFailures: 4,
+        history: [],
       };
       const file = functionalHealthPath(directory);
       writeFunctionalHealthRecord(file, record);
       expect(parseFunctionalHealthRecord(JSON.parse(readFileSync(file, "utf8")))).toEqual(record);
+      // A record written before transitions were recorded stays readable.
+      const legacy = { ...record } as Partial<typeof record>;
+      delete legacy.history;
+      expect(parseFunctionalHealthRecord(legacy)).toEqual(record);
       expect(statSync(file).mode & 0o777).toBe(0o600);
       // No temporary file is left behind by the rename.
       expect(statSync(directory).isDirectory()).toBe(true);
@@ -168,6 +174,7 @@ describe("functional health record transport", () => {
       lastHealthyAt: 0,
       lastProbeAt: 100,
       consecutiveFailures: 0,
+      history: [],
     };
     expect(
       isFunctionalHealthUsable(base, {
@@ -205,5 +212,59 @@ describe("functional health record transport", () => {
     ).toBe(false);
     expect(parseFunctionalHealthRecord({ ...base, schemaVersion: 99 })).toBeNull();
     expect(parseFunctionalHealthRecord({ ...base, state: "nonsense" })).toBeNull();
+  });
+});
+
+describe("functional health history", () => {
+  it("records each state transition, oldest first and bounded", () => {
+    let clock = 1_000;
+    const tracker = createFunctionalHealthTracker({
+      controllerPid: 1,
+      controllerGeneration: "gen",
+      sessionId: "s",
+      startedAt: 0,
+      codexhostVersion: "v",
+      now: () => clock,
+      thresholds: { gracePeriodMs: 0, failureThreshold: 1 },
+    });
+    // First read observes the initial state.
+    expect(tracker.current().history.map(({ state }) => state)).toEqual(["initializing"]);
+    tracker.recordSuccess();
+    clock += 10;
+    expect(tracker.current().history.map(({ state }) => state)).toEqual([
+      "initializing",
+      "healthy",
+    ]);
+    // Repeated reads of the same state must not grow the history.
+    clock += 10;
+    expect(tracker.current().history).toHaveLength(2);
+    clock += 10;
+    tracker.recordFailure();
+    expect(tracker.current().history.at(-1)).toEqual({
+      at: clock,
+      state: "degraded",
+      consecutiveFailures: 1,
+    });
+  });
+
+  it("keeps the history bounded so a long episode cannot grow the record", () => {
+    let clock = 0;
+    const tracker = createFunctionalHealthTracker({
+      controllerPid: 1,
+      controllerGeneration: "gen",
+      sessionId: "s",
+      startedAt: 0,
+      codexhostVersion: "v",
+      now: () => clock,
+      thresholds: { gracePeriodMs: 0, failureThreshold: 1 },
+    });
+    for (let index = 0; index < FUNCTIONAL_HEALTH_HISTORY_LIMIT * 3; index += 1) {
+      tracker.recordSuccess();
+      clock += 1;
+      tracker.recordFailure();
+      clock += 1;
+    }
+    const history = tracker.current().history;
+    expect(history).toHaveLength(FUNCTIONAL_HEALTH_HISTORY_LIMIT);
   });
 });

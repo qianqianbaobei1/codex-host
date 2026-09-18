@@ -14,6 +14,9 @@ mod desktop_launch;
 mod installation;
 #[cfg(target_os = "linux")]
 mod linux_installation;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_child_processes;
 mod macos_native_harness_broker;
 mod process;
 mod process_supervision;

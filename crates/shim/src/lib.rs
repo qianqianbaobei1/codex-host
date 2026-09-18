@@ -143,6 +143,11 @@ const PROCESS_TREE_REFRESH_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const PROCESS_TREE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// A live root still needs periodic process-tree observation: that is how a descendant which
+/// isolates its own process group is adopted into the ownership ledger *before* its parent exits,
+/// which is the only moment it is still attributable. The walk itself is what got cheap —
+/// `has_live_members` now reads only this tree's own processes instead of the whole system table,
+/// which is what made the 20 ms macOS cadence cost ~20% of a core for a whole session.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_tree_refresh_due(
     last_refresh: Option<Instant>,
@@ -175,11 +180,10 @@ fn wait_for_child(
         if root_status.is_none() {
             root_status = child.try_wait()?;
         }
-        // `has_live_processes` takes a full system process snapshot so escaped descendants can
-        // still be attributed to this launch. Preserve the responsive macOS observation needed
-        // for descendants that create a new process group; throttle Linux snapshots to avoid the
-        // measured idle CPU regression. Root exit and lifecycle signals still trigger immediate
-        // snapshots through this branch or the signal operations.
+        // `has_live_processes` keeps the ownership ledger current so escaped descendants can still
+        // be attributed to this launch. Its answers are consumed while the root is alive (adoption)
+        // and after it exits (cleanup); the cost lives behind the guard, which only walks this
+        // tree's processes. Root exit and lifecycle signals still force an immediate observation.
         let now = Instant::now();
         let refresh_process_tree =
             process_tree_refresh_due(last_process_tree_refresh, now, root_status.is_some());
@@ -624,6 +628,53 @@ fn host_runtime_paths_are_configured() -> bool {
     )
 }
 
+/**
+ * Heap ceiling for the Host Runtime process.
+ *
+ * Its steady footprint is a few hundred MB, so 2 GB is roughly an order of magnitude of headroom.
+ * The point is not to run closer to the limit: an unbounded allocation then aborts this process in
+ * minutes with a report, instead of growing until the whole machine is under pressure — the
+ * measured failure mode was a V8 out-of-memory abort 18-49 s after launch, with nothing in the
+ * logs to show where the memory went.
+ */
+const HOST_RUNTIME_MAX_OLD_SPACE_MB: u32 = 2048;
+
+/// Directory Node writes its fatal-error report (out-of-memory included) into. The report carries
+/// the JS stack the process aborted on, which is exactly what the system crash reports lack.
+fn host_runtime_fatal_report_directory() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("CODEXHOST_LOG_DIR") {
+        let trimmed = value.to_string_lossy().trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    let home = env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("Logs")
+            .join("codexhost"),
+    )
+}
+
+/// Node flags for the Host Runtime entrypoint: a bounded heap plus a fatal-error report, so an
+/// out-of-memory abort leaves behind the JS stack it died on.
+fn host_runtime_node_arguments(report_directory: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut arguments = vec![
+        std::ffi::OsString::from(format!(
+            "--max-old-space-size={HOST_RUNTIME_MAX_OLD_SPACE_MB}"
+        )),
+        std::ffi::OsString::from("--report-on-fatalerror"),
+    ];
+    if let Some(directory) = report_directory {
+        arguments.push(std::ffi::OsString::from(format!(
+            "--report-directory={}",
+            directory.display()
+        )));
+    }
+    arguments
+}
+
 fn child_command(
     arguments: &[OsString],
     current_executable: &Path,
@@ -661,6 +712,9 @@ fn child_command(
                 let runtime_path = canonical_existing_file(&PathBuf::from(runtime_path))?;
                 let mut command = Command::new(&node_path);
                 command
+                    .args(host_runtime_node_arguments(
+                        host_runtime_fatal_report_directory().as_deref(),
+                    ))
                     .arg(node_entrypoint_path(&runtime_path))
                     .args(arguments)
                     .env(STOCK_CODEX_PATH_ENV, stock_codex_path)
@@ -882,12 +936,13 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::time::{Duration, Instant};
 
+    use super::{
+        HOST_RUNTIME_MAX_OLD_SPACE_MB, app_server_subcommand_index, host_runtime_node_arguments,
+        is_default_remote_unix_listener, select_host_paths, should_start_host_runtime,
+    };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{PROCESS_TREE_REFRESH_INTERVAL, ShutdownSignals, process_tree_refresh_due};
-    use super::{
-        app_server_subcommand_index, is_default_remote_unix_listener, select_host_paths,
-        should_start_host_runtime,
-    };
+    use std::path::Path;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -940,6 +995,24 @@ mod tests {
             None
         );
         assert_eq!(app_server_subcommand_index(&arguments(&["-c"])), None);
+    }
+
+    #[test]
+    fn bounds_the_host_runtime_heap_and_requests_a_fatal_report() {
+        let arguments = host_runtime_node_arguments(Some(Path::new("/tmp/codexhost-logs")));
+        assert_eq!(
+            arguments[0],
+            OsString::from(format!(
+                "--max-old-space-size={HOST_RUNTIME_MAX_OLD_SPACE_MB}"
+            ))
+        );
+        assert_eq!(arguments[1], OsString::from("--report-on-fatalerror"));
+        assert_eq!(
+            arguments[2],
+            OsString::from("--report-directory=/tmp/codexhost-logs")
+        );
+        // An unresolvable log directory must not cost us the heap bound.
+        assert_eq!(host_runtime_node_arguments(None).len(), 2);
     }
 
     #[test]

@@ -14,7 +14,10 @@ describe("AntigravityDraftReservationPool", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = path.join(os.tmpdir(), `agy-draft-res-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    tmpDir = path.join(
+      os.tmpdir(),
+      `agy-draft-res-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
     mkdirSync(path.join(tmpDir, "conversations"), { recursive: true });
     mkdirSync(path.join(tmpDir, "brain"), { recursive: true });
     mkdirSync(path.join(tmpDir, "presence"), { recursive: true });
@@ -29,34 +32,31 @@ describe("AntigravityDraftReservationPool", () => {
     vi.useRealTimers();
   });
 
-  function createMockTransport(conversationId: string): AntigravityCliTransportLike {
-    let closed = false;
+  function createMockTransport(
+    conversationId: string,
+    onClose?: () => void,
+  ): AntigravityCliTransportLike {
     return {
       conversationId,
       logPath: null,
       async start(): Promise<AntigravityInitEvent> {
-        return {
-          type: "init",
-          conversationId,
-          model: "gemini-3.8-flash",
-          cwd: "/test",
-        };
+        return { conversationId, cwd: "/test", model: "gemini-3.8-flash" };
       },
       async setModel() {
-        return { type: "init", conversationId, model: "gemini-3.8-flash", cwd: "/test" };
+        return { conversationId, cwd: "/test", model: "gemini-3.8-flash" };
       },
       async setEffort() {
-        return { type: "init", conversationId, model: "gemini-3.8-flash", cwd: "/test" };
+        return { conversationId, cwd: "/test", model: "gemini-3.8-flash" };
       },
       async setPermissionMode() {
-        return { type: "init", conversationId, model: "gemini-3.8-flash", cwd: "/test" };
+        return { conversationId, cwd: "/test", model: "gemini-3.8-flash" };
       },
       async runTurn() {
-        return { type: "result", text: "done" };
+        return { conversationId, status: "success", response: "done", numTurns: 1 };
       },
       async cancel() {},
       async close() {
-        closed = true;
+        onClose?.();
       },
     };
   }
@@ -105,7 +105,8 @@ describe("AntigravityDraftReservationPool", () => {
     expect(pool.size).toBe(1);
     expect(pool.has(params)).toBe(true);
 
-    const init = await reservation!.startPromise;
+    if (!reservation) throw new Error("Draft Reservation was not created");
+    const init = await reservation.startPromise;
     expect(init.conversationId).toBe(convId);
 
     // Claim
@@ -148,14 +149,16 @@ describe("AntigravityDraftReservationPool", () => {
       model: "gemini-3.8-flash",
     };
     const res1 = pool.reserve(params1);
-    await res1!.startPromise;
+    if (!res1) throw new Error("First Draft Reservation was not created");
+    await res1.startPromise;
 
     const params2: DraftReservationKeyParams = {
       cwd: "/test",
       model: "gemini-3.8-pro",
     };
     const res2 = pool.reserve(params2);
-    await res2!.startPromise;
+    if (!res2) throw new Error("Second Draft Reservation was not created");
+    await res2.startPromise;
 
     expect(pool.size).toBe(1);
     expect(pool.has(params1)).toBe(false);
@@ -188,7 +191,8 @@ describe("AntigravityDraftReservationPool", () => {
     };
 
     const res = pool.reserve(params);
-    await res!.startPromise;
+    if (!res) throw new Error("Draft Reservation was not created");
+    await res.startPromise;
     expect(pool.size).toBe(1);
     expect(existsSync(dbFile)).toBe(true);
 

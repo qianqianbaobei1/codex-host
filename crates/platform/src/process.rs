@@ -332,6 +332,59 @@ impl ObservedProcessTree {
         self.observe_snapshots(&snapshots)
     }
 
+    /// Steady-state observation for the supervision loop.
+    ///
+    /// `observe` reads every process in the system, which is how ownership discovery stays
+    /// responsive enough to adopt a descendant before its parent exits — but at the 20 ms macOS
+    /// cadence that walk measured ~20% of a core for the whole session. This reads only the
+    /// processes that could belong to this tree (the root, the ownership ledger, this tree's
+    /// process group, and their children, recursively) and feeds the same ledger logic, so
+    /// discovery stays exactly as complete while the cost drops to O(owned).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn observe_owned(&mut self) -> Result<Vec<ProcessSnapshot>, PlatformError> {
+        // Supervision must not acquire a new failure mode: if the targeted walk cannot answer, fall
+        // back to reading the whole table rather than reporting an error up the poll loop.
+        match self.owned_candidate_snapshots() {
+            Ok(snapshots) => self.observe_snapshots(&snapshots),
+            Err(_) => self.observe(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn observe_owned(&mut self) -> Result<Vec<ProcessSnapshot>, PlatformError> {
+        self.observe()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn owned_candidate_snapshots(&self) -> Result<Vec<ProcessSnapshot>, PlatformError> {
+        use libproc::processes::{ProcFilter, pids_by_type};
+        use std::collections::HashSet;
+
+        let mut candidates: Vec<u32> = vec![self.root.id];
+        candidates.extend(self.known.iter().map(|process| process.id));
+        if let Some(process_group_id) = self.process_group_id {
+            candidates.extend(pids_by_type(ProcFilter::ByProgramGroup {
+                pgrpid: process_group_id,
+            })?);
+        }
+        // Descend from every anchor: a child that created its own process group is still adopted
+        // while its parent link ties it to this tree.
+        let mut seen: HashSet<u32> = candidates.iter().copied().collect();
+        let mut frontier = candidates.clone();
+        while let Some(parent) = frontier.pop() {
+            for child in super::macos_child_processes::child_process_ids(parent)? {
+                if seen.insert(child) {
+                    candidates.push(child);
+                    frontier.push(child);
+                }
+            }
+        }
+        Ok(candidates
+            .into_iter()
+            .filter_map(|process_id| unix_process_snapshot(process_id).ok())
+            .collect())
+    }
+
     fn observe_snapshots(
         &mut self,
         snapshots: &[ProcessSnapshot],

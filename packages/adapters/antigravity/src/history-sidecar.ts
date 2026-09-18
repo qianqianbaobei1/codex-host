@@ -155,7 +155,8 @@ function normalizeTurns(turns: AntigravityTurn[]): AntigravityTurn[] {
     );
     return {
       ...turn,
-      outcome: hasResponse && turn.outcome.status === "failed" ? { status: "succeeded" } : turn.outcome,
+      outcome:
+        hasResponse && turn.outcome.status === "failed" ? { status: "succeeded" } : turn.outcome,
       items: turn.items.map(normalizeItemSnapshot),
     };
   });

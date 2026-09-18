@@ -584,7 +584,9 @@ export const FALLBACK_COPY_BAR_CLASS = "codexhost-fallback-copy-bar";
 
 export function ensureRateLimitBannerSuppressionStyle(ownerDocument: Document): void {
   if (!ownerDocument || typeof ownerDocument.createElement !== "function") return;
-  let style = ownerDocument.querySelector<HTMLStyleElement>(`style[${RATE_LIMIT_BANNER_STYLE_ATTRIBUTE}]`);
+  let style = ownerDocument.querySelector<HTMLStyleElement>(
+    `style[${RATE_LIMIT_BANNER_STYLE_ATTRIBUTE}]`,
+  );
   if (!style) {
     style = ownerDocument.createElement("style");
     style.setAttribute(RATE_LIMIT_BANNER_STYLE_ATTRIBUTE, "true");
@@ -683,21 +685,41 @@ export function isSuppressedTurnErrorText(text: string): boolean {
   );
 }
 
-function fiberEntryForTurn(element: Element): any {
+/**
+ * The React Turn entry the Desktop attaches to a message node, read straight off the fiber tree.
+ * Both the fiber link and the entry are internal to the Desktop's bundle, so they are read as
+ * unknown values and narrowed here instead of cast.
+ */
+interface FiberTurnEntry {
+  turnId?: string;
+  onForkTurnMessage?: (turnId: string) => void;
+}
+
+interface ReactFiberLike {
+  memoizedProps?: { entry?: unknown };
+  return?: ReactFiberLike | null;
+}
+
+function isTurnEntry(value: unknown): value is FiberTurnEntry {
+  return typeof value === "object" && value !== null;
+}
+
+function fiberEntryForTurn(element: Element): FiberTurnEntry | null {
   try {
-    let cur: any = element;
-    const doc = (element as any).ownerDocument ?? (typeof document !== "undefined" ? document : null);
-    const body = doc?.body;
-    while (cur && cur !== body) {
-      const fiberKey = Object.keys(cur).find((k) => k.startsWith("__reactFiber$"));
-      let fiber = fiberKey ? cur[fiberKey] : null;
+    let current: Element | null = element;
+    const doc = element.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    const body = doc?.body ?? null;
+    while (current && current !== body) {
+      const fiberKey = Object.keys(current).find((key) => key.startsWith("__reactFiber$"));
+      let fiber: ReactFiberLike | null = fiberKey
+        ? ((current as unknown as Record<string, ReactFiberLike | undefined>)[fiberKey] ?? null)
+        : null;
       while (fiber) {
-        if (fiber.memoizedProps?.entry) {
-          return fiber.memoizedProps.entry;
-        }
-        fiber = fiber.return;
+        const entry = fiber.memoizedProps?.entry;
+        if (isTurnEntry(entry)) return entry;
+        fiber = fiber.return ?? null;
       }
-      cur = cur.parentElement;
+      current = current.parentElement;
     }
   } catch {}
   return null;
@@ -738,13 +760,18 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
     };
 
     const isMessageBody = (node: Element) => {
-      return Boolean(node.querySelector('[data-markdown-text-style="assistant-message"], ._MarkdownRoot_1qo8l_190'));
+      return Boolean(
+        node.querySelector(
+          '[data-markdown-text-style="assistant-message"], ._MarkdownRoot_1qo8l_190',
+        ),
+      );
     };
 
     const hasCls = (node: Element, cls: string): boolean => {
       return (
         Boolean(node.classList?.contains?.(cls)) ||
-        (typeof (node as any).className === "string" && (node as any).className.includes(cls))
+        (typeof (node as { className?: unknown }).className === "string" &&
+          (node as { className: string }).className.includes(cls))
       );
     };
 
@@ -759,7 +786,11 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
         suppressElement(container);
         suppressWrapper(container);
         let wrapper: HTMLElement | null = container.parentElement;
-        while (wrapper && wrapper !== rootNode && wrapper !== (container.ownerDocument?.body ?? null)) {
+        while (
+          wrapper &&
+          wrapper !== rootNode &&
+          wrapper !== (container.ownerDocument?.body ?? null)
+        ) {
           if (isMessageBody(wrapper)) break;
           if (
             hasCls(wrapper, "outline-none") ||
@@ -830,14 +861,13 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
 
       if (existingFallback) continue;
 
-      const doc = (msgRoot as any).ownerDocument ?? (typeof document !== "undefined" ? document : null);
+      const doc = msgRoot.ownerDocument ?? (typeof document !== "undefined" ? document : null);
       if (!doc || typeof doc.createElement !== "function") continue;
 
       const entry = fiberEntryForTurn(msgRoot);
 
       const toolbar = doc.createElement("div");
-      toolbar.className =
-        `mt-1.5 flex turn-action-controls h-5 items-center justify-start gap-0.5 browser:-ms-0.5 browser:mt-3 electron:-translate-x-1 extension:-translate-x-1.5 ${FALLBACK_COPY_BAR_CLASS}`;
+      toolbar.className = `mt-1.5 flex turn-action-controls h-5 items-center justify-start gap-0.5 browser:-ms-0.5 browser:mt-3 electron:-translate-x-1 extension:-translate-x-1.5 ${FALLBACK_COPY_BAR_CLASS}`;
       toolbar.setAttribute("data-codexhost-fallback-toolbar", "true");
 
       const innerFlex = doc.createElement("div");
@@ -855,8 +885,15 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
 
       copyBtn.onclick = (e: MouseEvent) => {
         e.stopPropagation?.();
-        const md = assistantGroup.querySelector<HTMLElement>('._MarkdownRoot_1qo8l_190, [data-markdown-text-style="assistant-message"]');
-        const textToCopy = (md as any)?.innerText ?? md?.textContent ?? (msgRoot as any)?.innerText ?? msgRoot.textContent ?? "";
+        const md = assistantGroup.querySelector<HTMLElement>(
+          '._MarkdownRoot_1qo8l_190, [data-markdown-text-style="assistant-message"]',
+        );
+        const textToCopy =
+          md?.innerText ??
+          md?.textContent ??
+          (msgRoot as HTMLElement).innerText ??
+          msgRoot.textContent ??
+          "";
         if (textToCopy && typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
           void navigator.clipboard.writeText(textToCopy);
         }
@@ -865,7 +902,9 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
       innerFlex.appendChild(copySpan);
 
       // 2. Fork button
-      if (entry?.onForkTurnMessage) {
+      const forkTurnMessage = entry?.onForkTurnMessage;
+      const entryTurnId = entry?.turnId;
+      if (forkTurnMessage && entryTurnId !== undefined) {
         const forkSpan = doc.createElement("span");
         forkSpan.className = "contents";
         const forkBtn = doc.createElement("button");
@@ -877,7 +916,7 @@ export function reconcileTurnErrorBannersAndCopy(rootNode: ParentNode = document
 
         forkBtn.onclick = (e: MouseEvent) => {
           e.stopPropagation?.();
-          entry.onForkTurnMessage(entry.turnId);
+          forkTurnMessage(entryTurnId);
         };
         forkSpan.appendChild(forkBtn);
         innerFlex.appendChild(forkSpan);
@@ -902,10 +941,7 @@ export function rateLimitBannerForComposer(composer: Element): HTMLElement | nul
   return null;
 }
 
-export function reconcileComposerRateLimitBanner(
-  composer: Element,
-  _hideBanner?: boolean,
-): void {
+export function reconcileComposerRateLimitBanner(composer: Element): void {
   if (composer.ownerDocument) {
     ensureRateLimitBannerSuppressionStyle(composer.ownerDocument);
   }
@@ -943,7 +979,7 @@ export function reconcileComposerNativeControls(
   // visible when the external Model control is substituted.
   setNativeControlHidden(control.nativeContextUsageControl, false);
   setNativeControlHidden(control.nativePermissionModeControl, hidePermissionMode);
-  reconcileComposerRateLimitBanner(control.composer, hideModel);
+  reconcileComposerRateLimitBanner(control.composer);
 }
 
 export function mountComposerAgentControl(

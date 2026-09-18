@@ -27,9 +27,13 @@ const DEFAULT_STATE_PATH = `${process.env.HOME ?? ""}/Library/Application Suppor
 const DEFAULT_HEALTH_PATH = `${process.env.HOME ?? ""}/Library/Logs/codexhost/functional-health.json`;
 /** How stale a health record may be before it stops being evidence about the current run. */
 const FUNCTIONAL_HEALTH_MAX_AGE_MS = 5 * 60_000;
-// A managed launch is only confirmed once the runtime descriptor names a live launcher. Two
-// unconfirmed attempts in a row mean injection is broken, not slow.
-const MAX_UNCONFIRMED_LAUNCHES = 2;
+// A managed launch is only confirmed once the runtime descriptor names a live launcher. One or two
+// unconfirmed attempts are normal on a cold machine — installing the Renderer is bounded at 90s —
+// so the circuit breaker needs a streak AND a window, not just a count. Restarting the user's
+// Desktop on a cold-start hiccup is worse than a slow retry: it closes their windows.
+export const MAX_UNCONFIRMED_LAUNCHES = 3;
+/** How long a streak of unconfirmed launches must span before the Desktop counts as wedged. */
+export const UNCONFIRMED_FAILURE_WINDOW_MS = 3 * 60_000;
 // While degraded the Desktop stays usable as a plain app; retry injection only occasionally.
 const DEGRADED_RETRY_MS = 15 * 60_000;
 
@@ -64,10 +68,13 @@ export function readAutoLaunchState(statePath) {
           ? parsed.consecutiveLaunchFailures
           : 0,
       degradedUntil: Number.isSafeInteger(parsed?.degradedUntil) ? parsed.degradedUntil : 0,
+      firstUnconfirmedAt: Number.isSafeInteger(parsed?.firstUnconfirmedAt)
+        ? parsed.firstUnconfirmedAt
+        : 0,
     };
   } catch {
     // A missing or corrupt state file must never block launching.
-    return { consecutiveLaunchFailures: 0, degradedUntil: 0 };
+    return { consecutiveLaunchFailures: 0, degradedUntil: 0, firstUnconfirmedAt: 0 };
   }
 }
 
@@ -267,6 +274,7 @@ export async function launchManagedCodex(options, dependencies = {}) {
 }
 
 export async function checkAndMaybeLaunch(options, dependencies = {}) {
+  const now = dependencies.now ?? Date.now;
   const readProcesses = dependencies.processTable ?? processTable;
   const entries = await readProcesses();
   if (!desktopRootRunning(entries, options.desktopExecutable)) return "desktop-not-running";
@@ -277,8 +285,16 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
   if (managedLauncherRunning(entries, descriptor, options.launcher)) {
     // Injection is confirmed. Forget earlier failures so the next one starts from scratch.
     const state = await readState(statePath);
-    if (state.consecutiveLaunchFailures !== 0 || state.degradedUntil !== 0) {
-      await writeState(statePath, { consecutiveLaunchFailures: 0, degradedUntil: 0 });
+    if (
+      state.consecutiveLaunchFailures !== 0 ||
+      state.degradedUntil !== 0 ||
+      state.firstUnconfirmedAt !== 0
+    ) {
+      await writeState(statePath, {
+        consecutiveLaunchFailures: 0,
+        degradedUntil: 0,
+        firstUnconfirmedAt: 0,
+      });
     }
     // A live launcher is not proof of a working integration. Report the Controller's own
     // functional verdict so "alive but broken" is visible instead of looking like all-clear.
@@ -295,12 +311,16 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
   if (options.dryRun) return "would-launch";
 
   const state = await readState(statePath);
-  const now = Date.now();
+  const at = now();
   // Degraded: the Desktop is already running as a plain app, which is the whole point. Stay
   // quiet until the retry window opens, so a broken bundle cannot restart the wedge loop.
-  if (state.degradedUntil > now) return "degraded-idle";
+  if (state.degradedUntil > at) return "degraded-idle";
 
-  if (state.consecutiveLaunchFailures >= MAX_UNCONFIRMED_LAUNCHES) {
+  const unconfirmedStreak =
+    state.consecutiveLaunchFailures >= MAX_UNCONFIRMED_LAUNCHES &&
+    state.firstUnconfirmedAt > 0 &&
+    at - state.firstUnconfirmedAt >= UNCONFIRMED_FAILURE_WINDOW_MS;
+  if (unconfirmedStreak) {
     // Circuit break. Repeated injection failures used to leave the Desktop wedged in a white
     // window while every tick relaunched codexhost into it. Give the user a working plain app.
     const recovered = await (dependencies.recoverDesktop ?? recoverUnmanagedDesktop)(
@@ -310,7 +330,8 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
     );
     await writeState(statePath, {
       consecutiveLaunchFailures: state.consecutiveLaunchFailures + 1,
-      degradedUntil: now + DEGRADED_RETRY_MS,
+      degradedUntil: at + DEGRADED_RETRY_MS,
+      firstUnconfirmedAt: state.firstUnconfirmedAt,
     });
     return recovered ? "degraded" : "degraded-without-recovery";
   }
@@ -319,6 +340,7 @@ export async function checkAndMaybeLaunch(options, dependencies = {}) {
   await writeState(statePath, {
     consecutiveLaunchFailures: state.consecutiveLaunchFailures + 1,
     degradedUntil: 0,
+    firstUnconfirmedAt: state.firstUnconfirmedAt || at,
   });
   return "launched";
 }
@@ -422,8 +444,11 @@ export async function run(options, dependencies = {}) {
     try {
       result = await checkAndMaybeLaunch(options, dependencies);
       if (result === "launched") {
-        consecutiveFailures = 0;
-        nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
+        // Unconfirmed, not failed: adopting a running Desktop restarts it, and installing the
+        // Renderer is bounded at 90s. Re-adopting on a flat 10s interval is what turned a cold
+        // start into repeated Desktop restarts, so the wait grows with the unconfirmed streak.
+        consecutiveFailures += 1;
+        nextAttemptAt = Date.now() + retryDelayForAttempt(consecutiveFailures);
         logger("detected an unmanaged Codex Desktop; started codexhost");
       } else if (result === "would-launch") {
         logger("dry run: an unmanaged Codex Desktop would start codexhost");
@@ -431,6 +456,7 @@ export async function run(options, dependencies = {}) {
         // A live Controller whose integration is broken. Announce the transition once rather than
         // every tick, and do not relaunch: health is published by the Controller itself, so
         // launching another one cannot be inferred to help.
+        consecutiveFailures = 0;
         if (lastReportedResult !== "managed-degraded") {
           errorLogger(
             "Codex Host controller is running but reports degraded functional health; external models may be unavailable in this window",
@@ -442,14 +468,17 @@ export async function run(options, dependencies = {}) {
         // also block recovery after an operator clears that state.
         nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
         errorLogger(
-          `Renderer injection failed ${MAX_UNCONFIRMED_LAUNCHES} times in a row; restarted Codex Desktop without codexhost and will retry injection in ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes`,
+          `Renderer injection stayed unconfirmed for ${Math.round(UNCONFIRMED_FAILURE_WINDOW_MS / 60_000)} minutes over ${MAX_UNCONFIRMED_LAUNCHES} attempts; restarted Codex Desktop without codexhost and will retry injection in ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes`,
         );
       } else if (result === "degraded-without-recovery") {
         consecutiveFailures = 0;
         nextAttemptAt = Date.now() + RETRY_INTERVAL_MS;
         errorLogger(
-          `Renderer injection failed ${MAX_UNCONFIRMED_LAUNCHES} times in a row and no .app bundle could be derived from '${options.desktopExecutable}'; pausing codexhost for ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes. Restart Codex Desktop manually if it is wedged.`,
+          `Renderer injection stayed unconfirmed for ${Math.round(UNCONFIRMED_FAILURE_WINDOW_MS / 60_000)} minutes and no .app bundle could be derived from '${options.desktopExecutable}'; pausing codexhost for ${Math.round(DEGRADED_RETRY_MS / 60_000)} minutes. Restart Codex Desktop manually if it is wedged.`,
         );
+      } else {
+        // Already managed, already launching, or the Desktop is not running: the streak is over.
+        consecutiveFailures = 0;
       }
     } catch (error) {
       result = "check-failed";

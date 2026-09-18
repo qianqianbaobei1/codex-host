@@ -37,7 +37,7 @@ impl ChildProcessGuard {
     }
 
     fn has_live_members(&self) -> Result<bool, PlatformError> {
-        self.with_tree(|tree| Ok(!tree.observe()?.is_empty()))
+        self.with_tree(|tree| Ok(!tree.observe_owned()?.is_empty()))
     }
 
     fn process_group_id(&self) -> Result<u32, PlatformError> {

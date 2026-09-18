@@ -10,8 +10,15 @@ import {
   reconcileTurnErrorBannersAndCopy,
 } from "../src/renderer-composer-dom.js";
 
+/** `style` carries both CSS properties and `setProperty`, exactly as the code under test uses it. */
+interface MockStyle {
+  display: string;
+  setProperty: (name: string, value: string) => void;
+  [property: string]: string | ((name: string, value: string) => void);
+}
+
 class MockElement {
-  style: Record<string, any> = { display: "" };
+  style: MockStyle = { display: "", setProperty: () => {} };
   className = "";
   type = "";
   innerHTML = "";
@@ -29,7 +36,7 @@ class MockElement {
   attributes: Record<string, string> = {};
   children: MockElement[] = [];
   parentElement: MockElement | null = null;
-  ownerDocument: any = null;
+  ownerDocument: MockElement | null = null;
 
   get classList() {
     return {
@@ -84,13 +91,21 @@ class MockElement {
       if (sel.includes("rounded-xl") && node.className.includes("rounded-xl")) return true;
       if (sel.includes("border") && node.className.includes("border")) return true;
       if (sel.includes('[role="alert"]') && node.getAttribute("role") === "alert") return true;
-      if (sel.includes("turn-action-controls") && node.className.includes("turn-action-controls")) return true;
-      if (sel.includes(FALLBACK_COPY_BAR_CLASS) && node.className.includes(FALLBACK_COPY_BAR_CLASS)) return true;
-      if (sel.includes("assistant-message") && node.getAttribute("data-markdown-text-style") === "assistant-message") return true;
+      if (sel.includes("turn-action-controls") && node.className.includes("turn-action-controls"))
+        return true;
+      if (sel.includes(FALLBACK_COPY_BAR_CLASS) && node.className.includes(FALLBACK_COPY_BAR_CLASS))
+        return true;
       if (
-        (sel.includes('button[aria-label="复制消息"]') || sel.includes('button[aria-label="复制"]')) &&
+        sel.includes("assistant-message") &&
+        node.getAttribute("data-markdown-text-style") === "assistant-message"
+      )
+        return true;
+      if (
+        (sel.includes('button[aria-label="复制消息"]') ||
+          sel.includes('button[aria-label="复制"]')) &&
         node.tagName.toLowerCase() === "button" &&
-        (node.getAttribute("aria-label") === "复制消息" || node.getAttribute("aria-label") === "复制")
+        (node.getAttribute("aria-label") === "复制消息" ||
+          node.getAttribute("aria-label") === "复制")
       ) {
         return true;
       }
@@ -131,10 +146,7 @@ class MockElement {
       ) {
         return curr;
       }
-      if (
-        selector === "[data-turn-key]" &&
-        curr.getAttribute("data-turn-key") !== null
-      ) {
+      if (selector === "[data-turn-key]" && curr.getAttribute("data-turn-key") !== null) {
         return curr;
       }
       curr = curr.parentElement;
@@ -143,13 +155,19 @@ class MockElement {
   }
 }
 
-function createMockDocument(): any {
+interface MockDocument {
+  head: MockElement;
+  createElement: (tag: string) => MockElement;
+  querySelector: (selector: string) => MockElement | null;
+}
+
+function createMockDocument(): MockDocument {
   const head = new MockElement("head");
-  const doc = {
+  const doc: MockDocument = {
     head,
     createElement: (tag: string) => {
       const el = new MockElement(tag);
-      el.ownerDocument = doc;
+      el.ownerDocument = doc as unknown as MockElement;
       return el;
     },
     querySelector: (selector: string) => {
@@ -165,7 +183,7 @@ function createMockDocument(): any {
       return null;
     },
   };
-  head.ownerDocument = doc;
+  head.ownerDocument = doc as unknown as MockElement;
   return doc;
 }
 
@@ -173,13 +191,17 @@ describe("ensureRateLimitBannerSuppressionStyle", () => {
   it("injects suppression stylesheet into head once", () => {
     const doc = createMockDocument();
 
-    ensureRateLimitBannerSuppressionStyle(doc as any);
+    ensureRateLimitBannerSuppressionStyle(
+      doc as unknown as Parameters<typeof ensureRateLimitBannerSuppressionStyle>[0],
+    );
     expect(doc.head.children.length).toBe(1);
-    expect(doc.head.children[0].tagName).toBe("style");
-    expect(doc.head.children[0].getAttribute(RATE_LIMIT_BANNER_STYLE_ATTRIBUTE)).toBe("true");
+    expect(doc.head.children[0]?.tagName).toBe("style");
+    expect(doc.head.children[0]?.getAttribute(RATE_LIMIT_BANNER_STYLE_ATTRIBUTE)).toBe("true");
 
     // Calling again does not duplicate
-    ensureRateLimitBannerSuppressionStyle(doc as any);
+    ensureRateLimitBannerSuppressionStyle(
+      doc as unknown as Parameters<typeof ensureRateLimitBannerSuppressionStyle>[0],
+    );
     expect(doc.head.children.length).toBe(1);
   });
 });
@@ -209,7 +231,7 @@ describe("reconcileComposerRateLimitBanner", () => {
   it("unconditionally hides the rate limit banner and parent container", () => {
     const { composer, aside, wrapper } = createComposerWithBanner();
 
-    reconcileComposerRateLimitBanner(composer as any, false);
+    reconcileComposerRateLimitBanner(composer as unknown as Element);
 
     expect(aside.style.display).toBe("none");
     expect(wrapper.style.display).toBe("none");
@@ -218,7 +240,7 @@ describe("reconcileComposerRateLimitBanner", () => {
   it("also hides when hideBanner is true", () => {
     const { composer, aside, wrapper } = createComposerWithBanner();
 
-    reconcileComposerRateLimitBanner(composer as any, true);
+    reconcileComposerRateLimitBanner(composer as unknown as Element);
 
     expect(aside.style.display).toBe("none");
     expect(wrapper.style.display).toBe("none");
@@ -228,7 +250,9 @@ describe("reconcileComposerRateLimitBanner", () => {
 describe("isSuppressedTurnErrorText", () => {
   it("matches FAILED_PRECONDITION and user location unsupported errors", () => {
     expect(
-      isSuppressedTurnErrorText("FAILED_PRECONDITION (code 400): User location is not supported for the API use."),
+      isSuppressedTurnErrorText(
+        "FAILED_PRECONDITION (code 400): User location is not supported for the API use.",
+      ),
     ).toBe(true);
     expect(isSuppressedTurnErrorText("User location is not supported")).toBe(true);
     expect(isSuppressedTurnErrorText("location is not supported")).toBe(true);
@@ -253,13 +277,14 @@ describe("reconcileTurnErrorBannersAndCopy", () => {
     outlineWrapper.className = "outline-none";
 
     const aside = doc.createElement("aside");
-    aside.textContent = "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
+    aside.textContent =
+      "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
 
     outlineWrapper.appendChild(aside);
     turn.appendChild(outlineWrapper);
     root.appendChild(turn);
 
-    reconcileTurnErrorBannersAndCopy(root as any);
+    reconcileTurnErrorBannersAndCopy(root as unknown as ParentNode);
 
     expect(aside.getAttribute(SUPPRESSED_ERROR_ATTRIBUTE)).toBe("true");
     expect(aside.style.display).toBe("none");
@@ -281,13 +306,14 @@ describe("reconcileTurnErrorBannersAndCopy", () => {
     const errorCard = doc.createElement("div");
     errorCard.className = "rounded-2xl border border-token-border-danger p-4";
     const errorText = doc.createElement("span");
-    errorText.textContent = "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
+    errorText.textContent =
+      "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
     errorCard.appendChild(errorText);
     turn.appendChild(errorCard);
 
     root.appendChild(turn);
 
-    reconcileTurnErrorBannersAndCopy(root as any);
+    reconcileTurnErrorBannersAndCopy(root as unknown as ParentNode);
 
     expect(errorCard.getAttribute(SUPPRESSED_WRAPPER_ATTRIBUTE)).toBe("true");
     expect(errorCard.style.display).toBe("none");
@@ -307,7 +333,7 @@ describe("reconcileTurnErrorBannersAndCopy", () => {
     turn.appendChild(msg);
     root.appendChild(turn);
 
-    reconcileTurnErrorBannersAndCopy(root as any);
+    reconcileTurnErrorBannersAndCopy(root as unknown as ParentNode);
 
     const fallbackBar = turn.querySelector(`.${FALLBACK_COPY_BAR_CLASS}`);
     expect(fallbackBar).not.toBeNull();
@@ -335,7 +361,7 @@ describe("reconcileTurnErrorBannersAndCopy", () => {
     turn.appendChild(nativeControls);
     root.appendChild(turn);
 
-    reconcileTurnErrorBannersAndCopy(root as any);
+    reconcileTurnErrorBannersAndCopy(root as unknown as ParentNode);
 
     const fallbackBar = turn.querySelector(`.${FALLBACK_COPY_BAR_CLASS}`);
     expect(fallbackBar).toBeNull();

@@ -42,7 +42,11 @@ export function purgeAntigravitySessionFiles(
   storeRoots: readonly string[],
   conversationId: string,
 ): void {
-  if (!conversationId || typeof conversationId !== "string" || !/^[A-Za-z0-9._~-]+$/u.test(conversationId)) {
+  if (
+    !conversationId ||
+    typeof conversationId !== "string" ||
+    !/^[A-Za-z0-9._~-]+$/u.test(conversationId)
+  ) {
     return;
   }
   for (const storeRoot of storeRoots) {
@@ -80,16 +84,16 @@ export interface AntigravityDraftReservationPoolOptions {
   ttlMs?: number;
   storeRoots?: readonly string[];
   createTransport: (options: AntigravityTransportOptions) => AntigravityCliTransportLike;
-  transportOptionsFactory: (
-    params: DraftReservationKeyParams,
-  ) => AntigravityTransportOptions;
+  transportOptionsFactory: (params: DraftReservationKeyParams) => AntigravityTransportOptions;
 }
 
 export class AntigravityDraftReservationPool {
   readonly #ttlMs: number;
   readonly #storeRoots: readonly string[];
   readonly #createTransport: (options: AntigravityTransportOptions) => AntigravityCliTransportLike;
-  readonly #transportOptionsFactory: (params: DraftReservationKeyParams) => AntigravityTransportOptions;
+  readonly #transportOptionsFactory: (
+    params: DraftReservationKeyParams,
+  ) => AntigravityTransportOptions;
   readonly #reservations = new Map<string, PreparedDraftReservation>();
   #disposed = false;
 

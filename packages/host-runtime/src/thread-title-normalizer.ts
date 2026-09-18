@@ -172,7 +172,10 @@ function removeTitleNoise(rawText: string): string {
     .replace(/(重写|改写|修复|排查|实现|设计|分析|审视|检查)(?:一下|下)/g, "$1")
     .replace(/(?:一下|下)[啊呀吧呢哦]+/g, "")
     .replace(/(?:谢谢|感谢|辛苦了)[啊呀吧呢哦]?$/g, "")
-    .replace(/(?:[，,、\s]+)?(?:请)?(?:帮我)?(?:查|看|排查|想知道|搞清楚)?(?:一下|下)?(?:是)?(?:为什么|为啥|怎么回事|是什么原因)[？?啊呀吧呢哦]*$/g, "")
+    .replace(
+      /(?:[，,、\s]+)?(?:请)?(?:帮我)?(?:查|看|排查|想知道|搞清楚)?(?:一下|下)?(?:是)?(?:为什么|为啥|怎么回事|是什么原因)[？?啊呀吧呢哦]*$/g,
+      "",
+    )
     .replace(/(?:这是)?(?:什么原因|为什么|为啥)(?:导致的|引起的)?[？?啊呀吧呢哦]*$/g, "")
     .replace(/(?:这是为啥|这是为什么|怎么回事)[？?啊呀吧呢哦]*$/g, "")
     .replace(/\[(?:图片|图片附件|附件)\]/gi, " ")
@@ -351,7 +354,19 @@ function formatTitle(topic: string | null, body: string): string {
   return `${prefix}${clipText(normalizedBody, MAX_TITLE_LENGTH - Array.from(prefix).length)}`;
 }
 
+/**
+ * Normalization must never erase a title entirely: the Desktop hides a Thread
+ * row whose name is empty, so a bare "?" (the Desktop's own fallback name for
+ * a Thread it could not title) would make the conversation unreachable. Fall
+ * back to the raw suggestion in that case.
+ */
 export function normalizeThreadTitle(rawTitle: string): string {
+  const normalized = normalizeTitleText(rawTitle);
+  if (normalized.length > 0) return normalized;
+  return firstLine(typeof rawTitle === "string" ? rawTitle : "", MAX_TITLE_LENGTH);
+}
+
+function normalizeTitleText(rawTitle: string): string {
   if (!rawTitle || typeof rawTitle !== "string") return rawTitle;
 
   const extracted = extractMeaningfulTitleText(rawTitle);
@@ -370,4 +385,33 @@ export function normalizeThreadTitle(rawTitle: string): string {
   const cleaned = removeTitleNoise(extracted);
   const topic = inferTitleTopic(cleaned);
   return formatTitle(topic, cleaned);
+}
+
+/**
+ * Harness titles are not always available: upstream title generation can fail
+ * while a provider is unreachable, and the Desktop hides a Thread row that has
+ * no name at all. Derive a durable name from the first user Turn instead, in
+ * the same `[主题] 动作对象` shape a generated title would take.
+ *
+ * Returns an empty string only when the input carries no text at all.
+ */
+export function deriveThreadTitleFromInput(rawInput: string): string {
+  if (typeof rawInput !== "string") return "";
+  // Desktop wraps an attached-file Turn in a preamble. Everything the user
+  // actually typed lives after `## My request:`.
+  const request = /##\s*My request:\s*([\s\S]*)$/iu.exec(rawInput);
+  const body = request?.[1] ?? rawInput;
+  const extracted = extractMeaningfulTitleText(body);
+  const normalized = extracted ? normalizeThreadTitle(extracted) : "";
+  if (normalized.length > 0) return normalized;
+
+  return firstLine(extracted, MAX_TITLE_LENGTH) || firstLine(body, MAX_TITLE_LENGTH);
+}
+
+function firstLine(text: string, limit: number): string {
+  const line = text
+    .split(/\r?\n/u)
+    .map((candidate) => candidate.trim())
+    .find((candidate) => candidate.length > 0);
+  return line ? Array.from(line).slice(0, limit).join("").trim() : "";
 }

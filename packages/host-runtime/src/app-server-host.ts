@@ -89,6 +89,7 @@ import {
   threadThinkingSelectParamsSchema,
   threadOwnershipListParamsSchema,
   threadOwnershipListResultSchema,
+  harnessModelRefSchema,
   permissionModeFixedAtCreate,
   updateCheckResultSchema,
   updateEmptyParamsSchema,
@@ -144,7 +145,7 @@ import {
   type ThreadGoalStatus,
 } from "./goal-loop.js";
 
-import { normalizeThreadTitle } from "./thread-title-normalizer.js";
+import { deriveThreadTitleFromInput, normalizeThreadTitle } from "./thread-title-normalizer.js";
 import {
   DELEGATION_CLI_PATH_ENV,
   DELEGATION_RUNTIME_ENDPOINT_ENV,
@@ -570,6 +571,30 @@ function requestText(params: JsonObject): Promise<string> {
     if (!text) throw new Error("turn/start must contain text input");
     return text;
   });
+}
+
+/**
+ * The earliest message the user actually sent in this Thread, in the shape the
+ * Desktop projects. A Thread whose Harness never reported a title is named from
+ * this message, so the name describes the conversation's start rather than
+ * whichever Turn happened to arrive first after the failure.
+ */
+function firstUserTurnText(turns: readonly JsonObject[]): string | null {
+  for (const turn of turns) {
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (const item of items) {
+      if (!isRecord(item) || item.type !== "userMessage") continue;
+      const content = Array.isArray(item.content) ? item.content : [];
+      const text = content
+        .map((part) =>
+          isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : "",
+        )
+        .join("\n")
+        .trim();
+      if (text.length > 0) return text;
+    }
+  }
+  return null;
 }
 
 function sandboxResult(params: JsonObject): JsonObject {
@@ -3843,7 +3868,8 @@ export class AppServerHost {
         // ignore decode errors
       }
     } else if (rawModel) {
-      model = { id: rawModel as any };
+      const parsedModel = harnessModelRefSchema.safeParse({ id: rawModel });
+      if (parsedModel.success) model = parsedModel.data;
     }
 
     if (!harnessId || !cwd) {
@@ -3915,7 +3941,8 @@ export class AppServerHost {
         // ignore decode errors
       }
     } else if (rawModel) {
-      model = { id: rawModel as any };
+      const parsedModel = harnessModelRefSchema.safeParse({ id: rawModel });
+      if (parsedModel.success) model = parsedModel.data;
     }
 
     if (harnessId && cwd) {
@@ -4649,6 +4676,30 @@ export class AppServerHost {
       return;
     }
     await this.#writer.json(rpcEnvelope(request, { result: threadRollbackResult(result.thread) }));
+  }
+
+  /**
+   * A Harness cannot always report a title: upstream title generation fails
+   * while the provider is unreachable, and the Desktop hides a Thread whose
+   * name is empty. Name the Thread from its first user Turn so the
+   * conversation stays listed and reachable after such a failure.
+   */
+  async #ensureExternalThreadTitle(thread: ExternalThread, firstText: string): Promise<void> {
+    if (thread.record.title.trim().length > 0) return;
+    const title = deriveThreadTitleFromInput(firstUserTurnText(thread.turns) ?? firstText);
+    if (title.length === 0) return;
+    try {
+      thread.record = await this.#repository.setTitle(thread.id, title);
+    } catch (error) {
+      this.#diagnose(error);
+      return;
+    }
+    thread.thread.name = title;
+    thread.thread.updatedAt = unixSeconds();
+    await this.#writer.json({
+      method: "thread/name/updated",
+      params: { threadId: thread.id, threadName: title },
+    });
   }
 
   async #setExternalThreadName(
@@ -5509,6 +5560,7 @@ export class AppServerHost {
       await this.#writer.json(rpcError(request, -32072, "External Thread is changing direction"));
       return;
     }
+    await this.#ensureExternalThreadTitle(thread, text);
     try {
       const started = await this.#beginExternalTurn(
         thread,

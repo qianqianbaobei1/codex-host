@@ -5,6 +5,19 @@ import { timestampedLogLine } from "./diagnostic-log.js";
 
 export const FUNCTIONAL_HEALTH_SCHEMA_VERSION = 1;
 
+/** How many state transitions are kept for post-mortem reading of a wake or restart episode. */
+export const FUNCTIONAL_HEALTH_HISTORY_LIMIT = 8;
+
+/**
+ * A recorded state change, so "it was broken after I woke the machine" has evidence afterwards.
+ * The record itself only describes the present; without this the previous episode is overwritten.
+ */
+export interface FunctionalHealthTransition {
+  at: number;
+  state: FunctionalHealthState;
+  consecutiveFailures: number;
+}
+
 /**
  * Functional health, deliberately separate from process liveness.
  *
@@ -33,6 +46,8 @@ export interface FunctionalHealthRecord {
   lastHealthyAt: number | null;
   lastProbeAt: number;
   consecutiveFailures: number;
+  /** Recent state transitions, oldest first. Bounded by `FUNCTIONAL_HEALTH_HISTORY_LIMIT`. */
+  history: FunctionalHealthTransition[];
 }
 
 export interface FunctionalHealthThresholds {
@@ -100,9 +115,22 @@ export function createFunctionalHealthTracker(
   let consecutiveFailures = 0;
   let lastHealthyAt: number | null = null;
   let lastProbeAt = input.startedAt;
+  const history: FunctionalHealthTransition[] = [];
 
   const snapshot = (): FunctionalHealthRecord => {
     const at = now();
+    const state = projectFunctionalHealthState({
+      everSucceeded,
+      consecutiveFailures,
+      startedAt: input.startedAt,
+      now: at,
+      thresholds,
+    });
+    const last = history.at(-1);
+    if (!last || last.state !== state) {
+      history.push({ at, state, consecutiveFailures });
+      while (history.length > FUNCTIONAL_HEALTH_HISTORY_LIMIT) history.shift();
+    }
     return {
       schemaVersion: FUNCTIONAL_HEALTH_SCHEMA_VERSION,
       controllerPid: input.controllerPid,
@@ -111,16 +139,11 @@ export function createFunctionalHealthTracker(
       startedAt: input.startedAt,
       codexhostVersion: input.codexhostVersion,
       chatGPTVersion: input.chatGPTVersion ?? null,
-      state: projectFunctionalHealthState({
-        everSucceeded,
-        consecutiveFailures,
-        startedAt: input.startedAt,
-        now: at,
-        thresholds,
-      }),
+      state,
       lastHealthyAt,
       lastProbeAt,
       consecutiveFailures,
+      history: [...history],
     };
   };
 
@@ -177,7 +200,26 @@ export function parseFunctionalHealthRecord(value: unknown): FunctionalHealthRec
   ) {
     return null;
   }
-  return record as FunctionalHealthRecord;
+  // A record written before transitions were recorded stays readable; the field is additive.
+  if (record.history !== undefined && !isFunctionalHealthHistory(record.history)) return null;
+  return { ...(record as FunctionalHealthRecord), history: record.history ?? [] };
+}
+
+function isFunctionalHealthHistory(value: unknown): value is FunctionalHealthTransition[] {
+  return (
+    Array.isArray(value) &&
+    value.every((entry) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const transition = entry as Partial<FunctionalHealthTransition>;
+      return (
+        typeof transition.at === "number" &&
+        Number.isInteger(transition.consecutiveFailures) &&
+        (transition.state === "initializing" ||
+          transition.state === "healthy" ||
+          transition.state === "degraded")
+      );
+    })
+  );
 }
 
 /**

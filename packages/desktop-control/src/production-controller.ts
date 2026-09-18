@@ -59,7 +59,13 @@ const TRANSIENT_INSTALL_ATTEMPTS = 3;
 import { timestampedLogLine } from "./diagnostic-log.js";
 
 const TRANSIENT_INSTALL_RETRY_MS = 250;
-const RECOVERY_RETRY_INITIAL_MS = 30_000;
+/**
+ * A failed recovery is retried quickly at first: after a wake the Renderer document is often still
+ * loading, so the first attempts are expected to fail and a 30s first delay turned that into
+ * minutes without codexhost integration. The doubling still reaches `RECOVERY_RETRY_MAX_MS` so a
+ * genuinely wedged Desktop is not re-probed in a tight loop.
+ */
+const RECOVERY_RETRY_INITIAL_MS = 2_000;
 const RECOVERY_RETRY_MAX_MS = 300_000;
 /**
  * A monitor gap this large means the process was not scheduled — system sleep, in practice. It sits

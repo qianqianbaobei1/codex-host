@@ -622,11 +622,16 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
           additionalDetails: null,
         }
       : null;
-  const error = hasAgentOutput ? null : rawError;
+  // Same rule as the live projector: a host-side failure is not hidden behind streamed output.
+  const hostFailure =
+    snapshot.outcome.status === "failed" && snapshot.outcome.error.code === "internalError";
+  const masked = hasAgentOutput && !hostFailure;
+  const error = masked ? null : rawError;
   const status =
-    hasAgentOutput && snapshot.outcome.status === "failed"
+    masked && snapshot.outcome.status === "failed"
       ? "completed"
       : historicalStatus(snapshot.outcome);
+  const failureText = abortedTurnText(snapshot.outcome, hasAgentOutput);
   return {
     id: turnId,
     status,
@@ -667,6 +672,17 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
             ]
           : [projectItem(item, outcome, cwd, true, "")];
       }),
+      ...(failureText
+        ? [
+            {
+              id: `${turnId}-failure`,
+              type: "agentMessage",
+              text: failureText,
+              phase: null,
+              memoryCitation: null,
+            },
+          ]
+        : []),
     ],
     error,
     startedAt: hasTiming ? Math.floor(startedAtMs / 1000) : null,
@@ -674,6 +690,29 @@ export function projectHistoricalTurn(input: HistoricalTurnProjectionInput): Jso
     durationMs: hasTiming ? completedAtMs - startedAtMs : null,
     itemsView: "full",
   };
+}
+
+/**
+ * A Turn that failed or was interrupted before the Harness said anything has only tool Items to
+ * show, and Desktop renders a Turn through its Items — so a failed Turn with no agent output is
+ * dropped from the conversation entirely, taking the user's own message with it. Give that case one
+ * visible message carrying the reason. (Verified against a real Thread: Turns that carry an agent
+ * message render, the two that do not are the two that disappear.)
+ */
+export function abortedTurnText(
+  outcome: HistoricalTurnOutcome,
+  hasAgentOutput: boolean,
+): string | null {
+  if (hasAgentOutput) return null;
+  if (outcome.status === "failed") {
+    const message = outcome.error.message.trim();
+    return message.length > 0 ? `Turn failed: ${message}` : "Turn failed";
+  }
+  if (outcome.status === "cancelled") {
+    const reason = (outcome.reason ?? "").trim();
+    return reason.length > 0 ? `Turn interrupted: ${reason}` : "Turn interrupted";
+  }
+  return null;
 }
 
 function applyUpdate(item: HostItem, update: HostItemUpdate): HostItem {
@@ -1284,16 +1323,20 @@ export class CodexTurnProjector {
     const hasAgentOutput = this.#wireItemOrder.some((itemId) => {
       const projected = this.#items.get(itemId);
       return (
-        projected?.item.type === "agentMessage" &&
-        (projected.item.text?.trim().length ?? 0) > 0
+        projected?.item.type === "agentMessage" && (projected.item.text?.trim().length ?? 0) > 0
       );
     });
     const rawError = turnError(event.outcome);
-    const error = hasAgentOutput ? null : rawError;
+    // A host-side failure — a Turn identity that could not be persisted, an answer that could not
+    // be displayed — is not a model answer that failed. Masking it behind already-streamed output
+    // hides it for good, because every later Turn on the Thread reports the same failure again.
+    // Harness failures stay masked so a partial answer does not turn into an error banner.
+    const hostFailure =
+      event.outcome.status === "failed" && event.outcome.error.code === "internalError";
+    const masked = hasAgentOutput && !hostFailure;
+    const error = masked ? null : rawError;
     const status =
-      hasAgentOutput && event.outcome.status === "failed"
-        ? "completed"
-        : turnStatus(event.outcome);
+      masked && event.outcome.status === "failed" ? "completed" : turnStatus(event.outcome);
     const turn: JsonObject = {
       id: this.#turnId,
       status,

@@ -82,7 +82,11 @@ export function installDraftPrewarmPolicyBridge(
     typeof value === "object" && value !== null && !Array.isArray(value);
   let lastKnownCwd: string | null = null;
   const observeParameters = (parameters: unknown): void => {
-    if (isRecord(parameters) && typeof parameters.cwd === "string" && parameters.cwd.trim().length > 0) {
+    if (
+      isRecord(parameters) &&
+      typeof parameters.cwd === "string" &&
+      parameters.cwd.trim().length > 0
+    ) {
       lastKnownCwd = parameters.cwd;
     }
   };

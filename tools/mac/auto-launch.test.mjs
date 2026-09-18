@@ -14,6 +14,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  MAX_UNCONFIRMED_LAUNCHES,
+  UNCONFIRMED_FAILURE_WINDOW_MS,
   checkAndMaybeLaunch,
   createAutoLaunchLogWriter,
   desktopAppFromExecutable,
@@ -190,11 +192,13 @@ describe("codexhost macOS auto-launch watcher", () => {
     expect(errors).toEqual(["process table unavailable (attempt 1, retrying in 10s)"]);
   });
 
-  it("degrades to a plain Desktop after repeated unconfirmed launches instead of wedging", async () => {
-    const state = { consecutiveLaunchFailures: 0, degradedUntil: 0 };
+  it("keeps adopting an unconfirmed Desktop until the streak spans the failure window", async () => {
+    let clock = 1_000_000;
+    const state = { consecutiveLaunchFailures: 0, degradedUntil: 0, firstUnconfirmedAt: 0 };
     let launches = 0;
     let recoveries = 0;
     const dependencies = {
+      now: () => clock,
       processTable: async () => [{ pid: 200, command: desktopExecutable }],
       readDescriptor: async () => null,
       readState: async () => ({ ...state }),
@@ -213,20 +217,58 @@ describe("codexhost macOS auto-launch watcher", () => {
       launcher: launcherExecutable,
     };
 
-    // A broken injection is not assumed from one attempt: it is retried once.
-    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("launched");
-    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("launched");
-    expect(launches).toBe(2);
+    // A cold start can lose two or three launches to a still-loading Renderer. None of those may
+    // close the user's Desktop: the streak has to span real time first.
+    for (let attempt = 0; attempt < MAX_UNCONFIRMED_LAUNCHES; attempt += 1) {
+      await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("launched");
+      clock += 30_000;
+    }
+    expect(launches).toBe(MAX_UNCONFIRMED_LAUNCHES);
+    expect(recoveries).toBe(0);
 
-    // Third pass: give the user a working app instead of relaunching into the wedge again.
+    // Still inside the window: keep retrying rather than restarting the Desktop.
+    clock += UNCONFIRMED_FAILURE_WINDOW_MS - 30_000 * MAX_UNCONFIRMED_LAUNCHES - 1;
+    await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("launched");
+    expect(recoveries).toBe(0);
+
+    // The window has now elapsed, so the Desktop counts as wedged and the user gets a plain app.
+    clock += 1;
     await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("degraded");
     expect(recoveries).toBe(1);
-    expect(launches).toBe(2);
+    expect(launches).toBe(MAX_UNCONFIRMED_LAUNCHES + 1);
 
     // Inside the retry window the watcher must stay quiet, not restart the wedge loop.
     await expect(checkAndMaybeLaunch(options, dependencies)).resolves.toBe("degraded-idle");
-    expect(launches).toBe(2);
     expect(recoveries).toBe(1);
+  });
+
+  it("forgets the unconfirmed streak as soon as a launch is confirmed", async () => {
+    const state = {
+      consecutiveLaunchFailures: MAX_UNCONFIRMED_LAUNCHES,
+      degradedUntil: 0,
+      firstUnconfirmedAt: 1,
+    };
+    const writes = [];
+    const options = {
+      desktopExecutable,
+      descriptorPath: "/tmp/runtime.json",
+      launcher: launcherExecutable,
+      statePath: "/tmp/state.json",
+    };
+    const result = await checkAndMaybeLaunch(options, {
+      now: () => 1_000,
+      processTable: async () => [
+        { pid: 200, command: desktopExecutable },
+        { pid: 201, command: `${launcherExecutable} launch` },
+      ],
+      readDescriptor: async () => ({ launcher_pid: 201 }),
+      readState: async () => ({ ...state }),
+      writeState: async (_path, next) => writes.push(next),
+    });
+    expect(result).toBe("already-managed");
+    expect(writes).toEqual([
+      { consecutiveLaunchFailures: 0, degradedUntil: 0, firstUnconfirmedAt: 0 },
+    ]);
   });
 
   it("clears the failure counter once a managed launch is confirmed", async () => {
@@ -249,7 +291,9 @@ describe("codexhost macOS auto-launch watcher", () => {
       },
     );
     expect(result).toBe("already-managed");
-    expect(writes).toEqual([{ consecutiveLaunchFailures: 0, degradedUntil: 0 }]);
+    expect(writes).toEqual([
+      { consecutiveLaunchFailures: 0, degradedUntil: 0, firstUnconfirmedAt: 0 },
+    ]);
   });
 
   it("recovers a wedged Desktop by restarting it as a plain app", async () => {

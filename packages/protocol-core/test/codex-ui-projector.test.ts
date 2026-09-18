@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type {
+  HistoricalTurnOutcome,
   HostCommandExecutionItem,
+  HostTurnSnapshot,
   HostFileChangeItem,
   HostQuestionInteraction,
   HostSubagentDelegationItem,
@@ -1572,5 +1574,83 @@ describe("Codex UI projector", () => {
         text: "Check [index.ts](/workspace/index.ts:5)",
       }),
     );
+  });
+});
+
+describe("projectHistoricalTurn aborted turns", () => {
+  const abortedSnapshot = (outcome: HistoricalTurnOutcome): HostTurnSnapshot => ({
+    nativeTurnRef: nativeTurnRefSchema.parse({
+      harnessId: "antigravity",
+      nativeSessionId: "native",
+      nativeTurnKey: "turn-2",
+      formatVersion: 1,
+    }),
+    outcome,
+    input: [{ type: "text", text: "在 Codex Host 下面需要增加 7 天额度的重置时间" }] as const,
+    items: [
+      {
+        item: {
+          type: "toolExecution",
+          itemId: itemId("aborted-tool"),
+          toolName: "view_file",
+          arguments: { AbsolutePath: "/tmp/shot.png" },
+        },
+        outcome: { status: "succeeded" },
+      },
+    ],
+  });
+
+  it("carries a visible failure message when a failed Turn has no agent output", () => {
+    // Desktop renders a Turn through its Items, so a failed Turn with only tool Items disappears
+    // from the conversation — together with the user's own message.
+    const turn = projectHistoricalTurn({
+      turnId,
+      cwd: "/workspace",
+      snapshot: abortedSnapshot({
+        status: "failed",
+        error: {
+          code: "nativeFailure",
+          message: "FAILED_PRECONDITION (code 400): User location is not supported",
+          retryable: false,
+        },
+      }),
+    });
+    const texts = (turn.items as { type: string; text?: string }[])
+      .filter((item) => item.type === "agentMessage")
+      .map((item) => item.text);
+    expect(texts).toEqual([
+      "Turn failed: FAILED_PRECONDITION (code 400): User location is not supported",
+    ]);
+    expect(turn.status).toBe("failed");
+  });
+
+  it("leaves a Turn that already answered alone", () => {
+    const snapshot = abortedSnapshot({ status: "succeeded" });
+    snapshot.items.push({
+      item: {
+        type: "agentMessage",
+        itemId: itemId("aborted-answer"),
+        text: "done",
+      },
+      outcome: { status: "succeeded" },
+    });
+    const turn = projectHistoricalTurn({ turnId, cwd: "/workspace", snapshot });
+    expect(
+      (turn.items as { type: string; text?: string }[]).filter(
+        (item) => item.type === "agentMessage",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("reports an interrupted Turn with its reason", () => {
+    const turn = projectHistoricalTurn({
+      turnId,
+      cwd: "/workspace",
+      snapshot: abortedSnapshot({ status: "cancelled", reason: "Cancelled by user" }),
+    });
+    const text = (turn.items as { type: string; text?: string }[]).find(
+      (item) => item.type === "agentMessage",
+    )?.text;
+    expect(text).toBe("Turn interrupted: Cancelled by user");
   });
 });

@@ -1,7 +1,6 @@
 import type {
   HistoricalTurnOutcome,
   HostAgentMessageItem,
-  HostItemOutcome,
   HostThreadSnapshot,
   HostTurnSnapshot,
   HarnessSessionState,
@@ -36,14 +35,6 @@ function outcomeForTurn(turn: AntigravityLedgerTurn): HistoricalTurnOutcome {
       retryable: false,
     },
   };
-}
-
-function itemOutcome(outcome: HistoricalTurnOutcome): HostItemOutcome {
-  if (outcome.status === "failed") return { status: "failed", error: outcome.error };
-  if (outcome.status === "cancelled") {
-    return { status: "cancelled", ...(outcome.reason ? { reason: outcome.reason } : {}) };
-  }
-  return { status: "succeeded" };
 }
 
 function turnSnapshot(sessionId: string, turn: AntigravityLedgerTurn): HostTurnSnapshot {

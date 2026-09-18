@@ -135,10 +135,7 @@ import {
   type AntigravityStepUpdate,
   type AntigravityTransportOptions,
 } from "./transport.js";
-import {
-  AntigravityDraftReservationPool,
-  type DraftReservationKeyParams,
-} from "./draft-reservation.js";
+import { AntigravityDraftReservationPool } from "./draft-reservation.js";
 import { sharedSessionStoreRoot, accountSessionStoreDirectory } from "./session-store.js";
 
 export interface AntigravityAdapterOptions {
@@ -861,9 +858,6 @@ class AntigravityHarnessSession implements HarnessSession {
       const hasResponse =
         (typeof result.response === "string" && result.response.trim().length > 0) ||
         active.agentText.trim().length > 0;
-      const isTransientNetErr =
-        typeof result.error === "string" && isTransientNetworkErrorMessage(result.error);
-
       let outcome: TurnOutcome;
       if (deniedEmptyTurn) {
         outcome = {
